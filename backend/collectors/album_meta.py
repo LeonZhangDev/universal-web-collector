@@ -31,10 +31,13 @@ Cloudflare 的两个坑(2026-09-18 实测, 都踩过)
 
 实测(2026-09-18, 相册 6a3654854fd25)
 ====================================
-页面里有三段可用线索::
+页面里有几段可用线索::
 
     <title>约啪172cm车模 完美肉体 主动求操 - 国模套图 - 各国其他套图 - 小黄书 xChina</title>
     <h1 class="hero-title-item">约啪172cm车模 完美肉体 主动求操（FENDSON）</h1>
+    <i class="fas fa-image"></i>…<div class="text">12P + 4V</div>      <- 站点自报数量
+    <i class="fas fa-file"></i>…<div class="text">FENDSON</div>        <- 厂牌
+    <div class="item tags-line">…<div class="tag">丝袜</div>…          <- 标签
     var domain = "https://img.xchina.io";
     var favOptions = {"enabled":true,"objMode":"photo","objId":"6a3654854fd25", ...};
     var videos = [{"url":"\\/photos\\/gid\\/00001.mp4","filename":"00001.mp4","filesize":"64M"}, ...];
@@ -42,8 +45,15 @@ Cloudflare 的两个坑(2026-09-18 实测, 都踩过)
 `<title>` 带站点尾巴(分类 + 站名), 默认按 `" - "` 截取第一段作目录名。
 `objId` 用来**确认拿到的确实是这个相册的页面**(不是登录页/拦截页) ——
 命名错比不命名更糟, 所以宁可校验失败后退回图集 ID。
-`var videos` 只当作"这个相册有没有视频"的线索, **不作为资源清单** ——
-页面结构会变, 序号枚举才是稳定路径。
+
+`videos[].filesize` 实测**精确可信**(2026-09-18 交叉核对):
+`"64M"` ↔ `Content-Range: bytes 0-0/67341834`、`"105M"` ↔ 109900697 字节。
+单位是 MiB 取整, 误差 <1MiB —— 用来做"视频体积过滤/预告"足够, 而且**零请求**
+(比再发一次 HEAD 探测更快更稳)。注意这只是**视频**的体积; 图片的尺寸档位
+没有等价信息, 只能靠 `probe()` 的 Content-Length。
+
+`var videos` 与 `12P + 4V` 都**不作为资源清单** —— 页面结构会变、自报值可能
+滞后, 序号枚举才是稳定路径。它们只用来做判定与预告。
 """
 
 import json
@@ -70,6 +80,25 @@ _VIDEOS_RE = re.compile(r"var\s+videos\s*=\s*(\[.*?\])", re.S)
 _DOMAIN_RE = re.compile(r'var\s+domain\s*=\s*"([^"]+)"')
 _OBJ_ID_RE = re.compile(r'"objId"\s*:\s*"([0-9A-Za-z_-]+)"')
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# 站点在相册页里自报的资源数量, 形如 `12P + 4V`(12 张图 + 4 段视频)。
+# 定位靠图标锚定(fa-image / fa-video-camera), 不靠 div 顺序 —— 顺序会变。
+# ⚠️ 它是**站点自报值**, 可能与实际枚举结果有出入, 只用于"创建前预告"与对照,
+# 绝不用它当资源清单(序号枚举才是权威)。
+_COUNT_RE = re.compile(
+    r'fa-image[^>]*>\s*</i>\s*</div>\s*<div class="text">\s*(\d+)\s*P'
+    r"(?:\s*\+\s*(\d+)\s*V)?\s*</div>",
+    re.S | re.I,
+)
+# 厂牌 / 制作方(如 "FENDSON"), 图标 fa-file
+_MAKER_RE = re.compile(
+    r'fa-file[^>]*>\s*</i>\s*</div>\s*<div class="text">\s*(.*?)\s*</div>',
+    re.S | re.I,
+)
+# 标签块: 整段取出来再逐个抽 <div class="tag">, 避免误抓页面别处的同名 class
+# `\s*` 而非紧贴: 真实页面是 `</div></div>`, 但换行/缩进一变就会整块抓不到
+_TAGLIST_RE = re.compile(r'class="[^"]*tags-line[^"]*"(.*?)</div>\s*</div>', re.S | re.I)
+_TAG_ITEM_RE = re.compile(r'<div class="tag">\s*([^<]{1,40}?)\s*</div>', re.I)
 
 # Cloudflare 拦截页的特征: 命中说明拿到的不是真实页面
 _CHALLENGE_HINTS = (
@@ -122,11 +151,19 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
         {
           "title":  完整 <title> 文本,
           "album":  去掉站点尾巴后的相册名(默认命名用它),
-          "h1":     页面主标题(往往比 <title> 更干净),
+          "h1":     页面主标题(往往比 <title> 更全, 如带 "(FENDSON)"),
           "obj_id": 页面自报的对象 ID(应与图集 ID 一致, 用于校验),
           "videos": [{"url": 绝对 URL, "size": 字节数或 None}, ...],
+          "photos": 站点自报图片数(页面上的 "12P"), 没有则 None,
+          "videos_declared": 站点自报视频数("12P + 4V" 里的 4),
+          "maker":  厂牌/制作方(页面上的 "FENDSON"),
+          "tags":   标签列表(["丝袜", "情趣内衣", ...]),
           "challenge": 是否拿到 Cloudflare 拦截页,
         }
+
+    ⚠️ `photos` / `videos_declared` 是**站点自报值**, 只用于"创建前预告"与交叉
+    对照, 绝不当资源清单 —— 序号枚举才是权威(页面改版/滞后都可能对不上)。
+    `videos[].size` 则实测精确(见下), 可直接用于体积过滤。
 
     页面结构不符合预期时**不猜**: 相应字段留空, 由调用方回退图集 ID。
     """
@@ -140,6 +177,25 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
     base = dm.group(1).strip() if dm else ""
     om = _OBJ_ID_RE.search(html)
     obj_id = om.group(1) if om else ""
+
+    # 站点自报数量: "12P + 4V" -> photos=12, videos=4(可能没有 "+nV" 段)
+    photos = videos_declared = None
+    cm = _COUNT_RE.search(html)
+    if cm:
+        photos = int(cm.group(1))
+        if cm.group(2):
+            videos_declared = int(cm.group(2))
+
+    mm = _MAKER_RE.search(html)
+    maker = _text(mm.group(1)) if mm else ""
+
+    tags = []
+    tm2 = _TAGLIST_RE.search(html)
+    if tm2:
+        for name in _TAG_ITEM_RE.findall(tm2.group(1)):
+            name = _text(name)
+            if name and name not in tags:
+                tags.append(name)
 
     videos = []
     vm = _VIDEOS_RE.search(html)
@@ -170,6 +226,10 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
         "h1": h1,
         "obj_id": obj_id,
         "videos": videos,
+        "photos": photos,               # 站点自报图片数(可能为 None)
+        "videos_declared": videos_declared,  # 站点自报视频数
+        "maker": maker,                 # 厂牌/制作方
+        "tags": tags,                   # 标签列表
         "challenge": _is_challenge(html),
     }
 

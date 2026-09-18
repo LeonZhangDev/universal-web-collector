@@ -38,6 +38,7 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | /tasks/create | 创建任务 `{"url": "...", "collector": "generic"}` |
+| POST | /tasks/preview | **创建前预告**: 只发现不下载不写库, 返回目录名/张数/视频体积/标签 |
 | GET | /collectors | 已注册采集器列表 |
 | GET | /tasks | 任务列表 |
 | GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
@@ -98,25 +99,60 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 `incremental: true` 时, 同一 URL 历史上已成功下载的资源直接复用磁盘文件,
 不再产生网络请求。
 
-只对图集类采集器(`xchina_gallery`)生效的三个选项:
+只对图集类采集器(`xchina_gallery`)生效的选项:
 
 | 选项 | 取值 | 说明 |
 | --- | --- | --- |
 | `quality` | `original` / `1200` / `800` / `600` | 图片主 URL 用哪一档; 未选中的档位自动作 mirrors |
 | `media` | `auto` / `image` / `video` / `both` | 采哪些媒体; `auto` = 相册里有什么采什么 |
-| `album_title` | `clean` / `full` / `id` | 输出目录名取法: 相册页 `<title>` 去站名尾巴 / 完整标题 / 图集 ID |
+| `album_title` | `clean` / `full` / `h1` / `id` | 输出目录名取法: 相册页 `<title>` 去站名尾巴 / 完整标题 / 页面 `<h1>` / 图集 ID |
+| `album_tags_dir` | `true` / `false` | 在相册名外再套一层站点标签目录(`丝袜-情趣内衣/相册名/...`, 取前 3 个标签) |
+
+`album_title=id` 不只是"不用标题", 而是**完全不开浏览器** —— 选它往往正因
+Cloudflare 或浏览器不可用, 此时 `media=auto` 会退回一次 HTTP 探测, 不会漏视频。
 
 ⚠️ 同一 gid 下图片与视频**可以同时存在**(实测 xchina `6a3654854fd25` 是
 12 张图 + 4 段 mp4, `00001.jpg` 与 `00001.mp4` 并存, 靠扩展名区分)。
 `auto` 会两者都采; 只要图片请显式传 `media=image`。
 
+### 创建前预告(推荐先看一眼)
+
+```bash
+curl -X POST localhost:8000/tasks/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://xchina.co/photo/id-6a3654854fd25.html","collector":"xchina_gallery"}'
+```
+
+相册页本身**自报**了资源数量与每段视频的体积(`12P + 4V`, `filesize` 实测精确),
+所以预告通常**一次页面读取即可, 零序号枚举**:
+
+```
+目录名 '约啪172cm车模 完美肉体 主动求操' | 12 图 / 4 视频 / 视频合计 251.0MB
+```
+
+页面拿不到(未装浏览器 / Cloudflare 失败 / `album_title=id`)时退回受限枚举,
+此时返回 `sampled: true`, 数量只能当**下限**读(界面显示为 `≥`)。
+
+自报数量**只用于预告**, 不当资源清单 —— 页面会改版、可能滞后, 序号枚举才是权威。
+
+预告里的 `photos` / `videos` / `video_bytes` **只统计本次实际要采的媒体**,
+与 `media` 严格一致: `media=image` 时 `videos` 为 `null`、`video_bytes` 为 0,
+不会出现"预告说会采 4 段视频、创建后一段没下"这种口径不一致。
+相册页自报的总量另用 `photos_declared` / `videos_declared` 原样带出,
+界面据此提示"另有 4 段视频未采", 用户能分清"站点没有"与"我没要"。
+
+体积前置还有一个隐性收益: 图集枚举的 `probe()` 本来就要读 `Content-Length`,
+把已拿到的值带进下载层后, 大小过滤(`max_size`)在**图集任务上是零额外请求**的,
+只有 size 未知的采集器才回退一次 HEAD。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (179 用例)
+make test           # pytest (200 用例)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
+python scripts/preview_probe.py <相册页URL或图集ID>   # 真实站点创建前预告
 ```
 
 配置: `config.yaml`, 环境变量 `UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` /
@@ -137,12 +173,16 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
     - 图片直链 `https://img.xchina.io/photos/6aa5136f606fe/00001.jpg`
     - 图集 ID 本身 `6aa5136f606fe`
     - 支持画质档 `quality`: original / 1200 / 800 / 600
+    - 支持媒体类型 `media`: 同一 gid 下图片与视频并存(见上文)
+    - 支持创建前预告 `POST /tasks/preview`: 零枚举给出目录名/张数/视频体积
     - 序号枚举型站点可继承 `collectors/gallery_base.py::SequenceGallerySpider`,
-      站点只声明 URL 模板、ID 正则与探测规则
+      站点只声明 URL 模板、ID 正则与探测规则; 媒体类型由 `MediaType` 声明
+      (自带 `ctype_prefix`: 图片看 `image/`、视频看 `video/`)
     - ⚠️ ID 解析不出来时**直接报错**, 绝不猜: 猜错会去枚举一个不存在的图集,
       表现为"任务成功但 0 个资源"(曾把相册页 URL 里的页码 `10` 当成 ID)
 - 资源类型: image / video / audio / doc / text, 对应下载器
-- 资源过滤: 类型/扩展名黑白名单/URL关键词/大小区间(HEAD 探测), 命中者标记 filtered 并记原因
+- 资源过滤: 类型/扩展名黑白名单/URL关键词/大小区间, 命中者标记 filtered 并记原因。
+  大小过滤优先复用**采集阶段已探测到的** size(图集任务因此零额外请求), 未知才补 HEAD
 - 输出组织: 任务级命名模板(默认保留 URL 原名), 落 `<download_dir>/<task_id>/` 下的
   任意层级; 任务结束(含取消/部分失败)都会产出 `manifest.json`, 记录来源 URL、
   实际生效的下载点、Content-Type、sha256、字节数、本地相对路径与过滤原因

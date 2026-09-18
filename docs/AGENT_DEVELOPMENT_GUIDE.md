@@ -938,3 +938,95 @@ A/B 实测: 带登录态 → 标题始终 `Just a moment...`; 不带 → 拿到�
 - 视频**没有**尺寸档位(只有 `.mp4` 一条), 所以 `mirrors` 为空、`quality` 对它无意义
 - 相册页里 `var videos` 目前只用于"有没有视频"的布尔判断, **不**当权威资源清单
   —— 序号枚举才是稳定路径
+
+# V18 相册页信息吃干榨净: 创建前预览 + 体积前置 + h1/标签命名 ✅ 已完成(2026-09-18 晚)
+
+起因是"这个采集器还有什么建议"。动手前先复测了站点, 结果**推翻了既有结论中的两条** ——
+按错的结论去优化, 做出来的东西一定错, 所以先记这两条。
+
+## 1. 先纠错: 两条既有结论是假的
+
+1. **"该站 HEAD 不返回任何响应头"是错的。** 实测 `requests` 的 HEAD 4/4 都正常:
+   存在 → `200 image/jpeg` / `200 video/mp4`(带 `Content-Length`), 越界 → `200 text/html`;
+   `probe_size('.../00001.mp4')` 当场拿到 67341834。
+   原结论来自 **curl 经系统代理时 `-I` 只回一行 `200 Connection Established`** 的假象。
+   危害: 会让人以为"每个序号要发两次请求"而去写无意义的优化。
+   流式 GET 回退仍然保留(对真的不吐 `Content-Type` 的站点有用), 但**本站不需要**。
+2. **六种输入形态解析全部正确**, 包括当初踩坑的 `/photo/id-XXX/10.html` ——
+   因为 `id_patterns` 先命中拿到 ID, `page_tail` 只在**退路**生效。别因为它是事故现场就再改一遍。
+
+## 2. 相册页白给的三样东西
+
+页面里除了 `<title>`, 还有站点自己写的元数据(都在 `collectors/album_meta.py` 解析):
+
+```
+<i class="fas fa-image"></i></div><div class="text">12P + 4V</div>   <- 资源数量
+<i class="fas fa-file"></i></div><div class="text">FENDSON</div>     <- 厂牌/制作方
+<div class="item tags-line">…<div class="tag">丝袜</div>…            <- 标签
+var videos = [{"url":"\\/photos\\/gid\\/00001.mp4","filesize":"64M"}, …]
+```
+
+- `filesize` 实测**精确**: `"64M"` ↔ `67341834`、`"105M"` ↔ `109900697`(MiB 取整, 误差 <1MiB)。
+  而它**零请求** —— 比为了知道体积再发一次 HEAD 又快又稳。
+- 定位一律靠**图标锚定**(`fa-image` / `fa-file`)或 class(`tags-line` / `tag`), 不靠 div 顺序。
+- 数量/体积仍**只用于预告**, 不当资源清单(页面会改版、自报值可能滞后)。
+
+## 3. `POST /tasks/preview`: 创建前预告
+
+一个相册可能是"12 张图 + 4 段视频共 251MB", 而 `media=auto` 会照单全采 ——
+用户应当在**点创建之前**就知道, 而不是等它慢慢拖完。
+
+- 有页面数据 → **零序号枚举**一次返回: `目录名 / 12 图 / 4 视频 / 251.0MB / 标签`
+- 页面拿不到(没浏览器 / Cloudflare 拦住 / `album_title=id`)→ 退回受限枚举,
+  返回 `sampled: true`, 数量只能当**下限**读(前端显示成 `≥4 张图`)
+- 什么都没枚举到时也会给出**预测的** `sample_files`(`相册名/00001.jpg`) ——
+  命名是最容易出错的一环, 让用户先看一眼文件名
+- `max_items`(默认 12, 上限 50)是必须的: 预览接口不能因为"想看全"被拖成几分钟
+- 与创建**共用** `_gallery_options()`, 否则会出现"预览通过、创建却被拒"这种最难查的不一致
+- ⚠️ `photos` / `videos` / `video_bytes` **只统计本次真要采的媒体**, 必须与 `media` 一致:
+  `media=image` 时 `videos` 是 `null`、`video_bytes` 是 0。
+  回归表现是"预告说会采 4 段视频、创建后一段没下" —— 预告与行为不一致比不预告更糟,
+  用户会以为任务漏下了东西。相册页自报的总量另外用 `photos_declared` /
+  `videos_declared` 带出, 界面据此提示"另有 4 段视频未采", 让用户能分清
+  "站点没有"和"我没要"。
+
+## 4. 体积前置: 把已拿到的 size 一路带下去
+
+`discover()` 的 `probe()` 本来就要读 `Content-Length`(判断存在性顺带就拿到了),
+相册页又直接给出每段视频体积。所以资源的 `size` 在采集阶段就是已知的, 一路带到下载层:
+
+```python
+size = r["size"]                    # 采集阶段已知 -> 零额外请求
+if size is None:
+    size = probe_size(r["url"], headers)   # 只有真未知才补一次 HEAD
+```
+
+⚠️ 两个易错点: `size` 经 JSON/DB 往返可能是**字符串**, 要 `isdigit()` 后再转 int,
+不能因为类型不对就当成"未知"去重探; 反过来也不能把非数字字符串硬塞进比较。
+回归表现是"每个资源平白多一次 HEAD", 所以 `tests/test_gallery_preview.py` 里
+直接把 `probe_size` 换成 `pytest.fail` —— size 已知时一旦被调用就炸。
+
+## 5. 命名: `h1` 与标签分层
+
+- `album_title` 增加 `h1` 档: 页面 `<h1>` 往往比 `<title>` 更全
+  (`…（FENDSON）` vs `…`), 取不到依次退让 `h1 → album → gid`。
+- 新增 `album_tags_dir`: 在相册名外再套一层标签目录(`丝袜-情趣内衣/相册名/…`),
+  标签逐段过 `clean_segment()` 且**只取前 3 个** —— 再多只是把路径撑长, 信息量递减。
+- `discover(album=...)` 允许带 `/` 分层: 逐段清洗但保留层级; 含 `..` / 绝对路径时
+  `safe_relative()` 返回 None, 退回整串当一段清洗, 所以标题里写什么字符都逃不出任务目录。
+
+## 6. 有意识不做的三件事
+
+1. 拿 `var videos` / `12P + 4V` 当资源清单 —— 序号枚举才是稳定路径。
+2. 为视频做档位或 HLS —— 实测 `.m3u8`、`_600x0.mp4` 都不存在; 视频只有一条线路,
+   `mirrors` 为空是事实而非缺陷。
+3. `{date}` 占位符 —— 页面里的日期疑似来自"推荐位"(一次抓到 5 个不同日期),
+   **归属未验证**, 当发布日用会命名错。
+
+## 7. 验证(2026-09-18 晚)
+
+- `pytest` -> **205 用例**(V17 的 200 + 预告口径与 `media` 一致性 5 项)
+- 真实站点预览(相册页 URL): `12 图 / 4 视频 / 251.0MB`, `page=true sampled=false`, 零枚举
+- 同一相册 `album_title=id`: `sampled=true`、`page=false`, 退回探测到 `00001.mp4`, 仍判出含视频
+- 真实页面解析复核: `photos=12 videos_declared=4 maker=FENDSON`, 6 个标签, 4 段视频体积
+- 前端 `vite build` -> 72 modules, 新增「预览」按钮与预告面板

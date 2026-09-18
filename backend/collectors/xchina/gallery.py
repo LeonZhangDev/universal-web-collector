@@ -30,10 +30,14 @@ text/html::
 因此**只能用 Content-Type 判定存在性, 绝不能用状态码**。
 若按 404/403 判定, 枚举会永不停止或第一张就误停。
 
-⚠️ 2026-09-18 补充: 该站 **HEAD 对本站资源不返回任何响应头**(只有一行
-`HTTP/1.1 200 OK`), 图片与视频都是如此。所以每个序号的判定实际都会走
-"HEAD -> 无 Content-Type -> 流式 GET 只读响应头"两步, 这是站点特性而非浪费。
-`gallery_base._head_status_headers` 承担这段回退。
+⚠️ 2026-09-18 复测: **HEAD 是可靠的**。存在/越界分别返回
+`200 image/jpeg|video/mp4`(带 Content-Length) 与 `200 text/html`, requests 连测 4/4
+全部正常, `probe_size()` 也直接拿到 64.2MB。
+曾把它记成"该站 HEAD 不返回任何响应头(只有一行 200 OK)" —— 那是 **curl 经系统
+代理时 `-I` 只回 `200 Connection Established`** 造成的假象。若据此以为"每个序号
+都要发两次请求", 会去做毫无意义的优化。
+`gallery_base._head_status_headers` 的流式 GET 回退作为兜底保留(对真的不返回
+Content-Type 的站点有用), 但**本站不需要它兜底**。
 
 URL 形态与 ID 提取 —— 第二个大坑
 --------------------------------

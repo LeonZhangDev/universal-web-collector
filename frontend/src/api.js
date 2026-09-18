@@ -5,6 +5,10 @@ const api = axios.create({ baseURL: "/" });
 export function createTask(url, collector = "generic", options = {}) {
   return api.post("/tasks/create", { url, collector, ...options }).then((r) => r.data);
 }
+// 创建前预告: 只发现不下载, 不写库。返回目录名/张数/视频体积等。
+export function previewTask(payload) {
+  return api.post("/tasks/preview", payload).then((r) => r.data);
+}
 export function listTasks() {
   return api.get("/tasks").then((r) => r.data);
 }

@@ -25,7 +25,7 @@ collectors/gallery_base.py        SequenceGallerySpider + GallerySite + MediaTyp
 collectors/album_meta.py          相册页 <title> / var videos（headless Chromium，带 TTL 缓存）
 downloaders/ratelimit.py          站点级并发+间隔
 scripts/verify_output.py / verify_hls.py   两个验证台（33 / 18 项断言）
-tests/                            18 个文件，179 个用例
+tests/                            19 个文件，200 个用例
 ```
 
 ## 状态机
@@ -100,14 +100,22 @@ URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含
 ## ⚠️ img.xchina.io 站点特征（改动前必须重新验证）
 1. **不返回 404**：存在 → `200 image/jpeg`；越界 → `200 text/html`。存在性**只能看 Content-Type**。
    `gallery.probe` 返三态 ok/missing/error，5xx 与网络异常归 error（不与 missing 混同）。
-2. **HEAD 可能不返回 Content-Type** → 退回流式 GET 只读响应头再断开（`_head_status_headers`）。
-   否则会得出"整个图集是空的"。
+2. ⚠️ **HEAD 是可靠的**（2026-09-18 复测：requests 4/4 都返回 `Content-Type`+`Content-Length`，
+   `probe_size('.../00001.mp4')` 拿到 67341834）。曾记成"HEAD 不返回响应头"，
+   那是 **curl 走系统代理时 `-I` 只回 `200 Connection Established`** 的假象。
+   `_head_status_headers` 的 GET 回退作为兜底保留，但本站用不上——别据此做多余优化。
 3. **WAF 校验 Accept**：无 Accept 或 `*/*` → **403**；含 `image/*` → 200。
    常量 `core/config.py::DEFAULT_ACCEPT` / `IMAGE_ACCEPT`，下载器与 `filters.probe_size` 都要带。
 4. 直连可用。`xchina.co` 的 HTML 页对普通请求 **403**（Cloudflare），
    **不要**指望"抓相册页 HTML 提取图片列表"。
 5. 一图 4 个下载点：`.jpg` 原图 + `_1200x0/_800x0/_600x0.webp` → 天然备用线路，塞进 `mirrors`。
 6. 相册 `6aa5136f606fe` 实测：**1~142 连续无空洞**，143 起越界（`miss_stop=3` 安全）。
+7. 相册页（headless 读，`collectors/album_meta.py`）里**已解析但对采集无影响、尚未利用**的信息：
+   `var videos[].filesize`（"64M" ↔ 实测 67341834B，**体积可信且零请求**）、
+   `h1.hero-title-item`（比 `<title>` 多 `（FENDSON）` 这类信息）、tag 列表（丝袜/情趣内衣…）。
+   另有 `class="…date…"` 日期，但可能是推荐位的，**归属未验证，别当发布日用**。
+8. 视频无任何档位/预览变体（`.m3u8`、`_600x0.mp4` 均 404 或 text/html），
+   `.mp4` 只有一条线路 → `mirrors` 为空；单个相册视频可达 105MB。`quality` 对视频无意义。
 
 ## 相册采集器 `xchina_gallery`
 - 三种输入**都必须能解析**：相册页 `https://xchina.co/photo/id-{id}/10.html`、
@@ -133,7 +141,9 @@ URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含
 `options.media`：`auto`(默认)/`image`/`video`/`both`；auto **两条线索都问**
 （相册页 `var videos` + 探一次 `00001.mp4`），只信页面会静默漏采。
 ⚠️ `.mp4` 对任何 Accept（含不带头）都返回 206，别据此推断别的路径。
-`options.album_title`：`clean`/`full`/`id`，**`id` = 完全不开浏览器**。
+`options.album_title`：`clean`/`full`/`h1`/`id`，**`id` = 完全不开浏览器**。
+`h1` 档比 `<title>` 多 `（FENDSON）` 这类信息；`album_tags_dir=true` 再套一层标签目录
+（`丝袜-情趣内衣/相册名/…`，**只取前 3 个标签**，逐段过 `clean_segment()`）。
 目录名 = `<title>` 截掉 `" - 分类 - 站名"`，取不到回退 gid（**绝不让任务失败**）。
 
 ⚠️ 相册页 `xchina.co` 是 Cloudflare 挑战页，三个坑：
@@ -144,6 +154,26 @@ URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含
    `var videos`/`objId` 标记；
 3. **先匿名、失败再带登录态**：陈旧的 `cf_clearance` 会让 CF 直接回
    `Attention Required!`（永久拒绝），匿名反而能过 —— 与 `collectors/browser.py` 相反。
+
+## 相册页自报数据 → 创建前预览（`POST /tasks/preview`）
+页面白给三样：`12P + 4V`(数量)、`filesize`(每段视频体积，实测精确："64M"↔67341834B)、
+标签与厂牌。定位靠**图标/class 锚定**（`fa-image`/`fa-file`/`tags-line`），不靠 div 顺序
+（`_TAGLIST_RE` 用 `</div>\s*</div>`，换行缩进一变就会整块抓不到）。
+`preview()` 有页面数据时**零序号枚举**返回目录名/张数/体积/标签；页面拿不到才退回受限枚举，
+此时 `sampled=true`，数量只能算**下限**（前端显示 `≥`）。`max_items`(默认12/上限50) 必须有。
+⚠️ 自报数量与 `var videos` **不当资源清单**，序号枚举才是权威。
+⚠️ 预览与创建**共用** `_gallery_options()`，否则会出现"预览通过、创建被拒"。
+⚠️ `photos`/`videos`/`video_bytes` **只统计本次真要采的媒体**，必须与 `media` 一致
+（`media=image` → `videos=null`、`video_bytes=0`）。曾直接回自报总量，导致预告写
+"12 图 + 4 视频 251MiB" 而创建后一段视频没下 —— **预告与行为不一致比不预告更糟**。
+相册页自报总量另用 `photos_declared`/`videos_declared` 带出，界面提示"另有 N 段视频未采"。
+
+## 体积前置：`size` 从采集一路带到下载层
+`discover()` 的 `probe()` 本就要读 Content-Length，页面又直接给视频体积 →
+资源的 `size` 在采集阶段就已知。`task_manager._download_one` 的大小过滤**优先用 `r["size"]`**，
+只有真未知才补 `probe_size()` ⇒ 图集任务的大小过滤**零额外请求**。
+⚠️ `size` 经 JSON/DB 往返可能是**字符串**，要 `isdigit()` 再转 int；类型不对就当"未知"重探是错的。
+回归表现是"每个资源平白多一次 HEAD" → 用例里把 `probe_size` 换成 `pytest.fail` 兜着。
 
 ## 测试隔离
 `TaskManager.shutdown(wait=True)`：测试/脚本必须等 worker 真退出，否则上个用例没跑完的
@@ -165,6 +195,13 @@ worker 会在**下一个用例**里继续写库（DB 连接是模块级、被 mo
 ⚠️ 用户的项目 `.venv` 是 **WSL 里的 Linux venv**（输出目录形如 `/mnt/c/...`），Windows 侧跑不了；
 本机验证用隔离环境 `~/.workbuddy/binaries/python/envs/uwc-verify`。
 ⚠️ 同一文件的多处 Edit **别并行发**：会静默丢改动（已踩 2 次），改完立刻 grep 核对。
+⚠️ 本机 bash 的 PATH 偶发失效（`ls`/`head`/`dirname`: command not found）→ 命令前加
+`export PATH="/usr/bin:/bin:$PATH"`。
+⚠️ Bash 工具的后台进程随该次调用结束被回收 → 起服务/长任务必须 `run_in_background: true`，
+否则下一次调用 curl 直接 **000**。
+⚠️ 验证台 `scripts/verify_output.py` 起点要**整个清掉 `data/_verify_output`**：只删 DB 会留下
+下载产物，续传逻辑拿着上一轮的文件跑 → **偶发失败且无法复现**。断言失败要打印期望/实际值
+（`check_eq`），只打标签的门禁排不了错。
 
 ## 常用命令
 ```bash

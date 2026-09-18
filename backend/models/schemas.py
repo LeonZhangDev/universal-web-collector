@@ -52,8 +52,11 @@ class TaskCreateIn(BaseModel):
     quality: Optional[str] = None  # 图集采集器画质档: original / 1200 / 800 / 600
     # 图集采集器采哪些媒体: auto(相册里有什么采什么) / image / video / both
     media: Optional[str] = None
-    # 输出目录名的取值: clean(去掉站点尾巴的 <title>) / full(完整标题) / id(图集 ID)
+    # 输出目录名的取值: clean(去掉站点尾巴的 <title>) / full(完整标题) /
+    # h1(页面 <h1>, 信息通常更全) / id(图集 ID, 且完全不开浏览器)
     album_title: Optional[str] = None
+    # 在相册名之外再套一层站点标签目录(如 丝袜-情趣内衣/相册名/...)
+    album_tags_dir: Optional[bool] = None
 
 
 class TaskCreateOut(BaseModel):

@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from collectors import COLLECTORS
+from collectors import COLLECTORS, get_collector
 from collectors.gallery_base import (
     ALBUM_TITLE_MODES,
     DEFAULT_ALBUM_TITLE,
@@ -70,16 +70,16 @@ def _validate_download_dir(value):
     return str(p)
 
 
-@router.post("/tasks/create", response_model=TaskCreateOut)
-def create(payload: TaskCreateIn):
-    if payload.collector not in COLLECTORS:
-        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
-    download_dir = _validate_download_dir(payload.download_dir)
+def _gallery_options(filters=None, quality=None, media=None, album_title=None,
+                     album_tags_dir=None):
+    """收集并校验采集器相关 options(**创建任务与预览共用**)。
 
-    # options 平铺: 过滤条件与采集器参数同层存放, Filters 只读它认识的键
+    共用是有意的: 否则"预览通过、创建却被拒"(或反过来)这种不一致
+    会非常难排查。options 平铺存放, Filters 只读它认识的键。
+    """
     options = {}
-    if payload.filters:
-        options = payload.filters.model_dump(exclude_none=True)
+    if filters is not None:
+        options = filters.model_dump(exclude_none=True)
         for key in ("min_size", "max_size"):
             v = options.get(key)
             if v is not None and parse_size(v) is None:
@@ -87,32 +87,96 @@ def create(payload: TaskCreateIn):
                     status_code=400,
                     detail=f"{key} 格式非法: {v}. 示例: 500KB / 2MB / 1048576",
                 )
-    if payload.quality:
-        if payload.quality not in QUALITY_KEYS:
+    if quality:
+        if quality not in QUALITY_KEYS:
             raise HTTPException(
                 status_code=400,
-                detail=f"quality 非法: {payload.quality}. 可选: {', '.join(QUALITY_KEYS)}",
+                detail=f"quality 非法: {quality}. 可选: {', '.join(QUALITY_KEYS)}",
             )
-        options["quality"] = payload.quality
-    if payload.media:
-        if payload.media not in MEDIA_KEYS:
+        options["quality"] = quality
+    if media:
+        if media not in MEDIA_KEYS:
             raise HTTPException(
                 status_code=400,
-                detail=f"media 非法: {payload.media}. 可选: {', '.join(MEDIA_KEYS)}",
+                detail=f"media 非法: {media}. 可选: {', '.join(MEDIA_KEYS)}",
             )
-        options["media"] = payload.media
-    if payload.album_title:
-        if payload.album_title not in ALBUM_TITLE_MODES:
+        options["media"] = media
+    if album_title:
+        if album_title not in ALBUM_TITLE_MODES:
             raise HTTPException(
                 status_code=400,
-                detail=f"album_title 非法: {payload.album_title}. "
+                detail=f"album_title 非法: {album_title}. "
                        f"可选: {', '.join(ALBUM_TITLE_MODES)}",
             )
-        options["album_title"] = payload.album_title
+        options["album_title"] = album_title
+    if album_tags_dir is not None:
+        options["album_tags_dir"] = bool(album_tags_dir)
+    return options
+
+
+@router.post("/tasks/create", response_model=TaskCreateOut)
+def create(payload: TaskCreateIn):
+    if payload.collector not in COLLECTORS:
+        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
+    download_dir = _validate_download_dir(payload.download_dir)
+    options = _gallery_options(
+        filters=payload.filters,
+        quality=payload.quality,
+        media=payload.media,
+        album_title=payload.album_title,
+        album_tags_dir=payload.album_tags_dir,
+    )
 
     task_id = db.create_task(payload.url, payload.collector, download_dir, options)
     task_manager.submit(task_id)
     return TaskCreateOut(task_id=task_id, status="pending")
+
+
+class PreviewIn(BaseModel):
+    url: str
+    collector: str = "generic"
+    quality: Optional[str] = None
+    media: Optional[str] = None
+    album_title: Optional[str] = None
+    album_tags_dir: Optional[bool] = None
+    # 抽样上限: 预览不该因为"想看全"把接口拖成几分钟
+    max_items: int = 12
+
+
+@router.post("/tasks/preview")
+def preview(payload: PreviewIn):
+    """创建前预告: **只发现、不下载、不写库**, 告诉用户这次会采到什么。
+
+    图集类采集器优先用相册页的站点自报数据(张数 + 每段视频体积), 通常一次
+    页面读取就能返回; 页面拿不到(没装浏览器 / Cloudflare 拦住)才退化成受限
+    枚举, 此时 `sampled=true`, 数量只是下限。
+
+    存在的意义: 一个相册可能是"12 张图 + 4 段视频共 260MB", 让用户在**创建
+    之前**就看到体积, 而不是等它默默下完(见 media / max_size 选项)。
+    """
+    if payload.collector not in COLLECTORS:
+        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
+    spider = get_collector(payload.collector)
+    fn = getattr(spider, "preview", None)
+    if not callable(fn):
+        raise HTTPException(
+            status_code=400,
+            detail=f"采集器 {payload.collector} 不支持预览(仅图集类采集器支持)",
+        )
+    options = _gallery_options(
+        quality=payload.quality,
+        media=payload.media,
+        album_title=payload.album_title,
+        album_tags_dir=payload.album_tags_dir,
+    )
+    limit = max(1, min(int(payload.max_items or 12), 50))
+    logs = []
+    try:
+        data = fn(payload.url, options=options, log=logs.append, max_items=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    data["logs"] = logs
+    return data
 
 
 @router.get("/collectors")

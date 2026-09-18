@@ -55,7 +55,8 @@ from urllib.parse import urlparse
 import requests
 
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings
-from core.naming import clean_segment
+from core.filters import fmt_size
+from core.naming import clean_segment, safe_relative
 
 PROBE_OK = "ok"            # 资源存在
 PROBE_MISSING = "missing"  # 序号越界(服务器仍未返回 404, 但内容不是媒体)
@@ -69,9 +70,14 @@ MEDIA_KEYS = ("auto", "image", "video", "both")
 DEFAULT_MEDIA = "auto"
 
 # 输出目录名的取值方式
-ALBUM_TITLE_MODES = ("clean", "full", "id")
+#   clean  <title> 去掉站点尾巴(默认)
+#   full   完整 <title>
+#   h1    页面 <h1>(信息往往比 <title> 更全, 如带 "(FENDSON)")
+#   id     直接图集 ID —— 并且**完全不开浏览器**
+ALBUM_TITLE_MODES = ("clean", "full", "h1", "id")
 DEFAULT_ALBUM_TITLE = "clean"
 # 说明: "id" 不只是"不用标题", 而是**完全不开浏览器**(见 crawl)。
+# 目录名前加一层标签(如 "丝袜-情趣内衣/相册名/...")由 options.album_tags_dir 控制。
 
 DEFAULT_START = 1
 DEFAULT_MAX = 1000         # 硬上限, 防止判定失效时无限枚举
@@ -79,6 +85,34 @@ DEFAULT_MISS_STOP = 3      # 连续多少次判定为不存在就停止
 
 _ID_CHARS = re.compile(r"[0-9A-Za-z_-]{6,}")
 _THUMB_NAME = re.compile(r"\d{3,}_[0-9x]+")
+
+
+def _truthy(value):
+    """把 options 里五花八门的"真"统一成 bool。
+
+    任务 options 来自 JSON / 前端表单, 可能是 True、"true"、"1"、1。
+    只认这些, 其余(含 "false"/"0"/None)一律 False。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _pick(value, allowed, default, name, log=None):
+    """校验枚举型 option: 非法值回退默认并留日志(不抛错, 采集不该因此中断)。"""
+    v = str(value if value is not None else default).strip().lower()
+    if v in allowed:
+        return v
+    if log:
+        log(f"{name}={value!r} 非法, 回退 {default}; 可选 {', '.join(allowed)}")
+    return default
+
+
+def _human_bytes(n):
+    """字节数 -> 人类可读; 拿不到(0/None)时返回空串。"""
+    return fmt_size(n) if n else ""
 
 
 @dataclass
@@ -262,11 +296,11 @@ def _head_status_headers(session, url, headers, timeout):
     前缀"判为不存在, 整个图集会被误判成空。此时退回**流式 GET** —— 只读响应头
     就断开, 正文一个字节都不读。
 
-    ⚠️ 该站实测(head 无任何响应头):
-        00001.jpg -> HEAD: 仅 "HTTP/1.1 200 OK"
-        00001.mp4 -> 同上
-        00001.mp4 越界 -> 流式 GET 才看得到 200 + text/html
-    也就是说**每个序号的判定实际都要走两次请求**, 这是该站特性, 不是浪费。
+    ⚠️ 2026-09-18 复测修正: 目标站点(img.xchina.io)的 HEAD **是可靠的**, 存在
+    与越界分别返回 `200 image/jpeg|video/mp4`(带 Content-Length) 与
+    `200 text/html`, 无需回退。此前记的"head 无任何响应头"是 **curl 经系统代理
+    时 `-I` 只回一行 `200 Connection Established`** 的假象, 别据此去优化。
+    这段回退只为"真的不返回 Content-Type 的站点"保留。
     """
     resp = session.head(url, headers=headers, allow_redirects=True, timeout=timeout)
     if (resp.headers.get("Content-Type") or "").strip() or resp.status_code != 200:
@@ -362,13 +396,19 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
     避免把"缺一个尺寸"误判成"这张图不存在"。
 
     media  决定枚举哪种媒体(见 MEDIA_KEYS); 视频没有尺寸档位, 只有一条主 URL。
-    album  输出目录名(相册标题); 留空回退 gid, 保证文件名始终带一层分组目录。
+    album  输出目录名(相册标题); **可含 `/` 分层**(如 "标签/相册名")。
+           留空回退 gid, 保证文件名始终带一层分组目录。
     """
     mtype = site.media(media)
     if mtype is None:
         raise ValueError(f"站点 {site.name} 未声明 {media} 资源, 无法枚举")
+    # max_count=None 表示"用默认硬上限"; 调用方(预览)会用小的值限时
+    limit = int(max_count or DEFAULT_MAX)
     gid = (gid or "").strip()
-    group = clean_segment(album) or gid
+    # album 允许带 `/` 分层(如 "标签/相册名"): 逐段清洗但**保留层级**。
+    # 含 `..` 或绝对路径时 safe_relative 返回 None, 退回"整串当一段清洗",
+    # 因此无论相册标题里出现什么字符都逃不出任务目录。
+    group = safe_relative(album) or clean_segment(album) or gid
     default_variant = mtype.variant_of(quality)
     top_variant = mtype.variants[0]
     sess = session or _session(proxy)
@@ -377,7 +417,7 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
     try:
         miss_run = 0
         seq = start
-        while seq < start + max_count:
+        while seq < start + limit:
             use = default_variant
             main = mtype.url_for(site, gid, seq, use)
             state, size, ctype = probe(sess, main, ctype_prefix=mtype.ctype_prefix,
@@ -425,7 +465,7 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
                     break
 
             seq += 1
-            if seq < start + max_count:
+            if seq < start + limit:
                 _pause(min_interval, max_interval)
     finally:
         if own:
@@ -490,7 +530,88 @@ class SequenceGallerySpider:
             return ["image", "video"]
         return ["image"]
 
-    def crawl(self, url, options=None, log=None):
+    # ---- 相册页与命名 ----
+
+    def album_page_url(self, site, gid, title_mode):
+        """本次需要读的相册页 URL; 空串表示不需要开浏览器。"""
+        return site.album_url(gid) if title_mode != "id" else ""
+
+    def read_album_meta(self, site, gid, title_mode, log=None, use_cache=True):
+        """读相册页元信息(带 TTL 缓存)。
+
+        `album_title=id` 是用户"不要浏览器"的明确表态, 此时**整个跳过**相册页:
+        选它的人往往正是因为 Cloudflare/浏览器慢或不可用。
+        """
+        page_url = self.album_page_url(site, gid, title_mode)
+        if not page_url:
+            return None
+        return fetch_album_meta(page_url, site=site, log=log, gid=gid,
+                                use_cache=use_cache)
+
+    def album_name(self, meta, title_mode, gid):
+        """按 album_title 取目录名; 任何一环取不到都回退图集 ID。"""
+        if not meta or title_mode == "id":
+            return gid
+        if title_mode == "full":
+            return meta.get("title") or gid
+        if title_mode == "h1":
+            # h1 往往比 <title> 更全(带厂牌括注), 但页面可能没有 -> 依次退让
+            return meta.get("h1") or meta.get("album") or gid
+        return meta.get("album") or gid
+
+    def group_name(self, meta, album, opts, gid=""):
+        """输出分组目录: 可选在相册名外再套一层标签目录。
+
+        如 `丝袜-情趣内衣/相册名/00001.jpg`。只取前 3 个标签 —— 再多会把路径
+        撑得过长, 而信息量递减。
+        """
+        if not _truthy(opts.get("album_tags_dir")):
+            return self.normalize_group(album, gid)
+        tags = [clean_segment(t) for t in ((meta or {}).get("tags") or [])]
+        tags = [t for t in tags if t][:3]
+        group = f"{'-'.join(tags)}/{album}" if tags else album
+        return self.normalize_group(group, gid)
+
+    @staticmethod
+    def normalize_group(group, gid=""):
+        """把分组目录名规范化成 `discover()` 真正会用的形态。
+
+        预览显示的文件名示例必须与真实落盘的路径一致 —— 否则用户照预览去别处
+        找文件会找不到。所以规范化只做一次, 两边共用。
+        """
+        return safe_relative(group) or clean_segment(group) or gid
+
+    def plan_log(self, log, gid, group, medias, meta):
+        """把"这次采什么"一次说清: 目录、媒体、相册页自报的数量与视频体积。"""
+        if not log:
+            return
+        if not meta:
+            log(f"图集 {gid} -> 目录 {group!r}; 采集媒体: {', '.join(medias)}"
+                "; 未取到相册标题, 用图集 ID 命名")
+            return
+        bits = []
+        if meta.get("photos") is not None:
+            bits.append(f"{meta['photos']} 张图")
+        if meta.get("videos_declared") is not None:
+            bits.append(f"{meta['videos_declared']} 段视频")
+        extra = f"; 相册页自报 {' + '.join(bits)}" if bits else ""
+        log(f"图集 {gid} -> 目录 {group!r}; 采集媒体: {', '.join(medias)}{extra}")
+        total = sum(v.get("size") or 0 for v in (meta.get("videos") or []))
+        if total:
+            hint = ""
+            if "video" in medias:
+                hint = "(零请求; 想只要图片可设 media=image, 想卡体积可设 max_size)"
+            else:
+                hint = "(零请求; 本次已不含视频, 这部分不会被下载)"
+            log(f"相册页给出视频体积合计 {_human_bytes(total)}{hint}")
+
+    # ---- 采集 ----
+
+    def crawl(self, url, options=None, log=None, max_count=None):
+        """枚举全部资源(**不下载**)。
+
+        max_count: 本次最多枚举几个序号; 供"预览"这类需要限时的调用方使用。
+        """
         site = self.site
         if site is None:
             raise RuntimeError(f"{type(self).__name__} 未声明 site")
@@ -503,57 +624,142 @@ class SequenceGallerySpider:
             )
 
         quality = opts.get("quality")
-        media_opt = str(opts.get("media") or DEFAULT_MEDIA).lower()
-        if media_opt not in MEDIA_KEYS:
-            if log:
-                log(f"media={media_opt!r} 非法, 回退 {DEFAULT_MEDIA}; 可选 {', '.join(MEDIA_KEYS)}")
-            media_opt = DEFAULT_MEDIA
-        title_mode = str(opts.get("album_title") or DEFAULT_ALBUM_TITLE).lower()
-        if title_mode not in ALBUM_TITLE_MODES:
-            title_mode = DEFAULT_ALBUM_TITLE
+        media_opt = _pick(opts.get("media"), MEDIA_KEYS, DEFAULT_MEDIA, "media", log)
+        title_mode = _pick(opts.get("album_title"), ALBUM_TITLE_MODES,
+                           DEFAULT_ALBUM_TITLE, "album_title", log)
 
-        # 相册页只用于两件事: 拿 <title> 当目录名、判断有无视频。
-        # 取不到页面不会让任务失败 —— 它只是命名与判定的优化。
-        #
-        # `album_title=id` 是"不要浏览器命名"的明确表态, 此时**整个跳过**相册页:
-        # 用户选它往往正是因为 Cloudflare/浏览器慢或不可用。代价是 media=auto
-        # 失去页面线索, 但会自动退回一次 HTTP 探测(`_video_at_first_seq`),
-        # 不会漏视频。
-        meta = None
-        page_url = site.album_url(gid) if title_mode != "id" else ""
-        if page_url:
-            meta = fetch_album_meta(page_url, site=site, log=log, gid=gid)
-        album = gid
-        if meta and title_mode != "id":
-            album = meta["title"] if title_mode == "full" else meta["album"]
+        # 相册页只用于三件事: 目录名、判断有无视频、给出数量与视频体积。
+        # 取不到页面不会让任务失败 —— 它只是命名与判定上的优化。
+        meta = self.read_album_meta(site, gid, title_mode, log=log)
+        album = self.album_name(meta, title_mode, gid)
+        group = self.group_name(meta, album, opts, gid)
 
         medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log)
-        if log:
-            label = meta["album"] if meta else gid
-            log(f"图集 {gid} -> 目录 {album!r}; 采集媒体: {', '.join(medias)}"
-                + (f"; 相册标题: {label}" if meta else "; 未取到相册标题, 用图集 ID 命名"))
+        self.plan_log(log, gid, group, medias, meta)
 
         items = []
         for name in medias:
             for it in discover(site, gid, quality=quality, media=name,
-                               album=album, log=log):
+                               album=group, log=log, max_count=max_count):
                 items.append({
                     "type": it["type"],
                     "url": it["url"],
                     "headers": None,
                     "mirrors": it["mirrors"],
+                    # 采集阶段的 probe 已经拿到 Content-Length, 带出去后下载层
+                    # 就不必为"大小过滤"再发一次 HEAD(见 task_manager 的体积预检)
                     "size": it["size"],
                     "filename": it.get("filename"),
                     "album": album,
                 })
         return items
 
+    # ---- 创建前预览 ----
 
-def fetch_album_meta(page_url, site=None, log=None, gid=None):
-    """取相册页的 <title> 与视频线索。实现见 collectors.album_meta。
+    def preview(self, url, options=None, log=None, max_items=12):
+        """只"看"不采: 这次会采到什么、大概多大。
 
-    这里只做一次延迟导入并兜底: 该模块依赖 Playwright, 采集器本身不依赖
-    (没有浏览器时照样能按序号枚举, 只是拿不到相册名)。
+        优先用相册页的**站点自报数据**(张数 + 每段视频体积) —— 一次页面读取就
+        够, 不必枚举任何序号; 相册页拿不到(没装浏览器/Cloudflare 失败)才退回
+        "受限枚举", 此时 `sampled=True`, 数量只是下限。
+
+        ⚠️ 自报数量与体积**只用于预告**, 不是资源清单; 真正采集仍走序号枚举。
+        """
+        site = self.site
+        if site is None:
+            raise RuntimeError(f"{type(self).__name__} 未声明 site")
+        opts = dict(options or {})
+        gid = parse_gid(site, url)
+        if not gid:
+            forms = getattr(site, "input_forms", None) or ["图集 ID", "资源直链 URL", "相册页 URL"]
+            raise ValueError(
+                f"无法从 {url!r} 解析出图集 ID。可接受的输入: " + " / ".join(forms)
+            )
+
+        title_mode = _pick(opts.get("album_title"), ALBUM_TITLE_MODES,
+                           DEFAULT_ALBUM_TITLE, "album_title", log)
+        media_opt = _pick(opts.get("media"), MEDIA_KEYS, DEFAULT_MEDIA, "media", log)
+
+        meta = self.read_album_meta(site, gid, title_mode, log=log,
+                                    use_cache=not _truthy(opts.get("refresh")))
+        album = self.album_name(meta, title_mode, gid)
+        group = self.group_name(meta, album, opts, gid)
+        medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log)
+
+        video_items = list((meta or {}).get("videos") or [])
+        photos = (meta or {}).get("photos")
+        videos_n = (meta or {}).get("videos_declared")
+        if videos_n is None and video_items:
+            videos_n = len(video_items)
+
+        # 只报"这次真要采的媒体"。用户选了 media=image 却看到"4 段视频 / 251MiB",
+        # 会以为视频也会被下下来 —— 预告必须与创建后的实际行为一致。
+        # 相册页自报的总量仍然原样带出(videos_declared), 供用户对照"少采了什么"。
+        declared_photos, declared_videos = photos, videos_n
+        if "video" not in medias:
+            videos_n, video_items = None, []
+        if "image" not in medias:
+            photos = None
+
+        sampled = False
+        sample_files = []
+        counts = {}
+        # 页面没给出可用数量 -> 退化成受限枚举; 拿不到页面时这是唯一的办法
+        if photos is None and not video_items:
+            sampled = True
+            for name in medias:
+                got = list(discover(site, gid, quality=opts.get("quality"),
+                                    media=name, album=group, log=log,
+                                    max_count=max_items))
+                counts[name] = len(got)
+                for it in got[:3]:
+                    if it.get("filename"):
+                        sample_files.append(it["filename"])
+            photos = counts.get("image")
+            if videos_n is None and "video" in counts:
+                videos_n = counts["video"]
+
+        if not sample_files:
+            # 没枚举也要让用户先看到"文件会长什么样"(命名是最容易出错的一环)
+            for name in medias[:1]:
+                mtype = site.media(name)
+                if not mtype:
+                    continue
+                ext = mtype.default_ext
+                sample_files = [f"{group}/{i:05d}{ext}" for i in (1, 2)]
+
+        return {
+            "collector": site.name,
+            "gid": gid,
+            "album": album,
+            "group": group,
+            "album_source": title_mode if meta else "id",
+            "media": medias,
+            "photos": photos,
+            "videos": videos_n,
+            # 相册页自报的总量(未按 media 过滤): 用户拿它对照"我少采了什么"
+            "photos_declared": declared_photos,
+            "videos_declared": declared_videos,
+            "video_items": [
+                {"name": v["url"].rsplit("/", 1)[-1],
+                 "url": v["url"], "size": v.get("size")} for v in video_items
+            ],
+            "video_bytes": sum(v.get("size") or 0 for v in video_items),
+            "tags": (meta or {}).get("tags") or [],
+            "maker": (meta or {}).get("maker") or "",
+            "h1": (meta or {}).get("h1") or "",
+            "page": meta is not None,
+            "sampled": sampled,
+            "sample_files": sample_files,
+        }
+
+
+def fetch_album_meta(page_url, site=None, log=None, gid=None, use_cache=True):
+    """取相册页元信息: 目录名、有无视频、数量、视频体积、标签、厂牌。
+
+    实现见 collectors.album_meta。这里只做一次延迟导入并兜底: 该模块依赖
+    Playwright, 采集器本身不依赖(没有浏览器时照样能按序号枚举, 只是拿不到
+    这些优化信息)。
     """
     try:
         from .album_meta import fetch_album_meta as _fetch
@@ -563,7 +769,7 @@ def fetch_album_meta(page_url, site=None, log=None, gid=None):
         return None
     try:
         return _fetch(page_url, split=(site.title_split if site else None),
-                      log=log, gid=gid)
+                      log=log, gid=gid, use_cache=use_cache)
     except Exception as e:
         if log:
             log(f"取相册页失败({type(e).__name__}: {e}), 用图集 ID 命名")

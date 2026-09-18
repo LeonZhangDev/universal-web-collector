@@ -10,6 +10,7 @@ task_manager、downloader、filesystem 三层才生效。
 
 import json
 import io
+import shutil
 import sys
 import threading
 import time
@@ -42,6 +43,22 @@ def check(cond, label):
         FAILURES.append(label)
 
 
+def check_eq(got, want, label):
+    """断言相等并在失败时打印两边取值。
+
+    只打印标签的话, 失败信息对排错毫无帮助 —— 比如 manifest 里某个字段
+    偶尔为空, 看不出是""还是 None 还是别的 URL。
+    """
+    CHECKS[0] += 1
+    if got == want:
+        print(f"  ok   {label}")
+        return
+    got_s = json.dumps(got, ensure_ascii=False) if isinstance(got, (dict, list)) else repr(got)
+    want_s = json.dumps(want, ensure_ascii=False) if isinstance(want, (dict, list)) else repr(want)
+    print(f"  FAIL {label}\n         期望: {want_s}\n         实际: {got_s}")
+    FAILURES.append(f"{label} (期望 {want_s}, 实际 {got_s})")
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         name = self.path.rsplit("/", 1)[-1]
@@ -70,12 +87,13 @@ def start_server():
 
 
 def main():
+    # 每次从零开始: 连上一轮的下载产物一起清掉。
+    # 只删 DB 是不够的 —— 残留的 downloads/1/gid01/0001.jpg 会让续传逻辑
+    # 拿着"上一轮的文件"去跑这一轮, 断言看到的是混合状态, 偶发失败且无法复现。
     tmp = ROOT / "data" / "_verify_output"
+    shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True, exist_ok=True)
     db_path = tmp / "verify.db"
-    db_path.unlink(missing_ok=True)
-    for stale in db_path.parent.glob(db_path.name + "*"):
-        stale.unlink(missing_ok=True)
 
     db.DB_PATH = db_path
     db._conn = None
@@ -135,13 +153,13 @@ def main():
         print("  ok   manifest.json 存在")
         items = data["resources"]
         first = items[0]
-        check(first["file"] == "gid01/0001.jpg", "file 是相对路径")
-        check(bool(first["sha256"]) and len(first["sha256"]) == 64, "sha256 已记录")
+        check_eq(first["file"], "gid01/0001.jpg", "file 是相对路径")
+        check(len(first["sha256"] or "") == 64, "sha256 已记录")
         expect_size = len(JPEG) + len("<!--00001.jpg-->")
-        check(first["size"] == expect_size, f"size 正确 ({first['size']})")
-        check(first["resolved_url"] == urls[0], "resolved_url = 实际下载的 URL")
-        check(first["content_type"] == "image/jpeg", "content_type 已回填")
-        check(data["counts"].get("done") == PAGES, "counts.done 正确")
+        check_eq(first["size"], expect_size, "size 正确")
+        check_eq(first["resolved_url"], urls[0], "resolved_url = 实际下载的 URL")
+        check_eq(first["content_type"], "image/jpeg", "content_type 已回填")
+        check_eq(data["counts"].get("done"), PAGES, "counts.done 正确")
 
     print("[3] 打包导出")
     rows = [r for r in db.get_resources(task_id) if r["status"] == "done"]

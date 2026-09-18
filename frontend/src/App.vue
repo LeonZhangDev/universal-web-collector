@@ -17,6 +17,7 @@ import {
   listSessions,
   listTasks,
   listWatches,
+  previewTask,
   runWatch,
   startLogin,
   stopLogin,
@@ -76,13 +77,17 @@ const mediaLabel = {
 };
 // 输出目录名: 相册页 <title> 就是相册名。默认去掉 " - 分类 - 站名" 的尾巴,
 // 想保留原样选"完整标题", 老行为选"图集 ID"。
-const albumTitles = ref(["clean", "full", "id"]);
+const albumTitles = ref(["clean", "full", "h1", "id"]);
 const albumTitle = ref("clean");
 const albumTitleLabel = {
   clean: "相册名 (取 <title>, 去掉站点后缀)",
   full: "完整 <title>",
-  id: "图集 ID",
+  h1: "页面 <h1> (信息更全)",
+  id: "图集 ID (不开浏览器)",
 };
+// 相册名外面再套一层站点标签目录: 丝袜-情趣内衣/相册名/00001.jpg。
+// 标签来自相册页(实测该类站每册 3~6 个), 只取前 3 个 —— 再多只会把路径撑长。
+const albumTagsDir = ref(false);
 
 // ---- 过滤条件 ----
 const resourceTypes = ref(["image", "video", "audio", "doc", "text"]);
@@ -150,6 +155,7 @@ function savePrefs() {
         quality: quality.value,
         media: media.value,
         albumTitle: albumTitle.value,
+        albumTagsDir: albumTagsDir.value,
         selTypes: selTypes.value,
         exts: exts.value,
         excludeExts: excludeExts.value,
@@ -176,6 +182,7 @@ function loadPrefs() {
     if (p.albumTitle && albumTitles.value.includes(p.albumTitle)) {
       albumTitle.value = p.albumTitle;
     }
+    albumTagsDir.value = !!p.albumTagsDir;
     selTypes.value = Array.isArray(p.selTypes) ? p.selTypes : [];
     exts.value = p.exts || "";
     excludeExts.value = p.excludeExts || "";
@@ -224,6 +231,7 @@ async function submit() {
       quality: isGallery.value ? quality.value : null,
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
+      album_tags_dir: isGallery.value ? albumTagsDir.value : null,
     });
     url.value = "";
     savePrefs();
@@ -234,6 +242,64 @@ async function submit() {
     creating.value = false;
   }
 }
+
+// ---- 创建前预览 ----
+// 一个相册可能是"12 张图 + 4 段视频共 251MiB"。让用户在**创建之前**就看见
+// 体积与命名, 而不是等它默默下完 —— 想只要图片就改"采集媒体", 想卡体积就设
+// "最大体积"。预览只发现不下载、不写库, 所以随便点。
+const preview = ref(null);
+const previewError = ref("");
+const previewing = ref(false);
+
+async function runPreview() {
+  if (!url.value.trim()) {
+    previewError.value = "请先填写 URL 或图集 ID";
+    return;
+  }
+  previewing.value = true;
+  preview.value = null;
+  previewError.value = "";
+  try {
+    preview.value = await previewTask({
+      url: url.value.trim(),
+      collector: collector.value,
+      quality: isGallery.value ? quality.value : null,
+      media: isGallery.value ? media.value : null,
+      album_title: isGallery.value ? albumTitle.value : null,
+      album_tags_dir: isGallery.value ? albumTagsDir.value : null,
+    });
+  } catch (e) {
+    previewError.value = e.response?.data?.detail || String(e);
+  } finally {
+    previewing.value = false;
+  }
+}
+
+// sampled=true 表示数量来自抽样枚举, 只能说"至少这么多"
+const previewSummary = computed(() => {
+  const p = preview.value;
+  if (!p) return "";
+  const mark = p.sampled ? "≥" : "";
+  const bits = [];
+  if (p.photos != null) bits.push(`${mark}${p.photos} 张图`);
+  if (p.videos != null) bits.push(`${mark}${p.videos} 段视频`);
+  return bits.join(" + ") || "数量未知";
+});
+
+// 被"采集媒体"挡在外面的部分要说出来 —— 预告里少了 4 段视频却不解释,
+// 用户会以为站点漏给了, 或者以为任务下漏了。
+const skippedByMedia = computed(() => {
+  const p = preview.value;
+  if (!p) return "";
+  const bits = [];
+  if (p.photos == null && p.photos_declared != null) {
+    bits.push(`${p.photos_declared} 张图`);
+  }
+  if (p.videos == null && p.videos_declared != null) {
+    bits.push(`${p.videos_declared} 段视频`);
+  }
+  return bits.join(" + ");
+});
 
 function select(id) {
   selectedId.value = selectedId.value === id ? null : id;
@@ -354,6 +420,7 @@ async function addWatch() {
       quality: isGallery.value ? quality.value : null,
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
+      album_tags_dir: isGallery.value ? albumTagsDir.value : null,
     });
     watchUrl.value = "";
     await loadWatches();
@@ -505,6 +572,15 @@ onUnmounted(() => {
       <button type="submit" :disabled="creating || !url.trim()">
         {{ creating ? "创建中..." : "创建任务" }}
       </button>
+      <button
+        type="button"
+        class="ghost"
+        v-if="isGallery"
+        :disabled="previewing || !url.trim()"
+        @click="runPreview"
+      >
+        {{ previewing ? "读取中..." : "预览" }}
+      </button>
     </form>
 
     <div class="dir-row">
@@ -555,6 +631,61 @@ onUnmounted(() => {
         </option>
       </select>
       <span class="tip">相册名取自相册页 &lt;title&gt;; 取不到时回退图集 ID</span>
+    </div>
+
+    <div class="dir-row" v-if="isGallery">
+      <span class="lbl">标签分层</span>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+        <input type="checkbox" v-model="albumTagsDir" @change="savePrefs" />
+        在相册名外再套一层站点标签目录
+      </label>
+      <span class="tip" v-if="albumTagsDir">
+        如 丝袜-情趣内衣/相册名/00001.jpg（取前 3 个标签）
+      </span>
+      <span class="tip" v-else>关闭时直接用相册名当目录</span>
+    </div>
+
+    <div
+      v-if="isGallery && (previewing || preview || previewError)"
+      style="display:flex;flex-direction:column;gap:5px;font-size:13px;line-height:1.6;
+             padding:10px 12px;margin-top:10px;border-radius:8px;
+             border:1px solid rgba(127,127,127,0.35)"
+    >
+      <div v-if="previewing">正在读取相册页…</div>
+      <div v-else-if="previewError" style="color:#c0392b">
+        预览失败: {{ previewError }}
+      </div>
+      <template v-else>
+        <div>
+          <b>将保存到</b>
+          <code>{{ preview.group }}</code>
+          <span class="tip">
+            （命名方式: {{ albumTitleLabel[preview.album_source] || preview.album_source }}）
+          </span>
+        </div>
+        <div>
+          <b>本次将采集</b> {{ previewSummary }}
+          <span v-if="preview.video_bytes">
+            · 视频合计 {{ fmtSize(preview.video_bytes) }}
+          </span>
+          <span v-if="preview.video_bytes && media === 'auto'" class="tip">
+            · 只想留图片就把「采集媒体」改成「仅图片」
+          </span>
+        </div>
+        <div v-if="skippedByMedia" class="tip">
+          相册页还有 {{ skippedByMedia }}，当前设置不会采集
+        </div>
+        <div v-if="preview.tags && preview.tags.length">
+          <b>标签</b> {{ preview.tags.join(" / ") }}
+          <span v-if="preview.maker" class="tip">· 厂牌 {{ preview.maker }}</span>
+        </div>
+        <div v-if="preview.sample_files && preview.sample_files.length">
+          <b>文件名示例</b> <code>{{ preview.sample_files.join("  ,  ") }}</code>
+        </div>
+        <div v-if="preview.sampled" class="tip">
+          数量来自抽样枚举（相册页读不到），实际可能更多
+        </div>
+      </template>
     </div>
 
     <div class="filter-toggle">

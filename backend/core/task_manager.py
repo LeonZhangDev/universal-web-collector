@@ -690,9 +690,18 @@ class TaskManager:
             # 备用下载点由采集器给出(如同一张图的多个尺寸变体), 主 URL 失败时切换
             mirrors = db.get_mirrors(r)
 
-            # 大小预检: HEAD 取 Content-Length, 超限直接跳过, 不浪费带宽下载大文件
+            # 大小预检: 超限直接跳过, 不浪费带宽下载大文件。
+            # 优先用**采集阶段已经拿到的** size —— 图集枚举的 probe 顺带返回了
+            # Content-Length, 相册页又直接给出每段视频的体积, 所以图集任务在
+            # 这条规则上是零额外请求的; 只有 size 未知时才补一次 HEAD。
             if filters.need_size:
-                size = probe_size(r["url"], headers)
+                size = r["size"]
+                if isinstance(size, str) and size.strip().isdigit():
+                    size = int(size)
+                elif not isinstance(size, int):
+                    size = None
+                if size is None:
+                    size = probe_size(r["url"], headers)
                 reason = filters.match_size(size)
                 if reason:
                     db.update_resource(rid, status="filtered", note=reason, size=size)

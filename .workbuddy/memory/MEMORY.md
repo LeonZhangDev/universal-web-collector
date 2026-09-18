@@ -2,8 +2,10 @@
 
 ## 项目定位
 通用网页资源采集平台（非简单爬虫），目标是可扩展的 Resource Extraction Agent 基础设施。
-目录名是 `universal_web_collector_v9`，但 README/文档已推进到 **V14** 阶段
-（V10 任务系统/DB、V11 插件化、V12 过滤与自定义目录、V13 相册枚举、V14 视频链路/画质档/基类/健壮性）。
+目录名是 `universal_web_collector_v9`，但 README/文档已推进到 **V16** 阶段
+（V10 任务系统/DB、V11 插件化、V12 过滤与自定义目录、V13 相册枚举、
+V14 视频链路/画质档/基类/健壮性、V15 ffmpeg 双引擎、V16 产出可交付化）。
+V16 = 命名模板 + manifest + 停止 + 增量续采/订阅巡检 + ZIP 导出/图库 + 登录态 UI。
 
 技术栈：uv + Makefile + FastAPI + Vue3/Vite + Playwright + SQLite(WAL)
 
@@ -20,11 +22,16 @@ URL → Browser → Extractor → Resource → Downloader → Storage
 ```
 backend/
   main.py              FastAPI 入口
-  api/tasks.py         HTTP 接口 + /events SSE
+  api/tasks.py         HTTP 接口 + /events SSE（含 cancel / archive / watches / manifest）
+  api/sessions.py      登录态管理接口
   core/
-    task_manager.py    状态机/线程池/看门狗/资源级重试
-    database.py        SQLite(WAL) → data/collector.db
+    task_manager.py    状态机/线程池/看门狗/资源级重试/is_active
+    database.py        SQLite(WAL) → data/collector.db（tasks/resources/task_logs/watches）
     config.py          config.yaml + UWC_* 环境变量覆盖
+    cancel.py          ★TaskCancelled（单独成模块打破 downloaders↔task_manager 循环依赖）
+    naming.py          ★命名模板（{site}/{album}/{seq4}/{ext}…；含 .. 整体拒绝）
+    manifest.py        ★产出清单 manifest.json（含取消/部分失败也写）
+    sessions.py        ★headful 登录 + 周期快照 storage_state
     events.py          SSE 事件总线
     filters.py         资源过滤规则(类型/扩展名/关键词/大小)
     ffmpeg.py          ★ffmpeg 定位(不依赖 PATH; 成功永久缓存, 失败 30s TTL)
@@ -44,13 +51,33 @@ backend/
 frontend/              Vue3 + Vite + axios，构建产物 frontend/dist 由后端托管
 scripts/probe.py       站点解析探针
 scripts/verify_hls.py  ★HLS 双引擎验证台(ffmpeg 生成真实素材 + 解码级校验)
-tests/                 11 个测试文件，78 个用例
+scripts/verify_output.py ★端到端产出验证台(命名/manifest/ZIP/增量/订阅/停止, 33 项断言)
+tests/                 16 个测试文件，127 个用例
 ```
 
 ## 关键机制备忘
 - **状态机**：pending→running→extracting→downloading→success / **partial** / failed；failed/partial→retry(/tasks/{id}/retry)；支持 cancelled。迁移靠 TRANSITIONS 表 + 乐观锁（update where status=expected）
   - `partial`（2026-09-17 新增）：`_final_status()` 按资源分布判定 —— 全成功(或仅 filtered/skipped)→success，
     有成功也有失败→partial，全部失败→failed。此前 56 张全失败任务仍报 success，用户看不出问题
+- **取消/停止**（V16）：
+  - `POST /tasks/{id}/cancel`（保留记录与已下载文件）与 `DELETE`（删记录）语义分开
+  - ⚠️ **`except Exception` 会吞掉取消信号**：被当普通失败后会退避重睡(2s/4s)再重试
+    注定被放弃的请求，资源卡 `downloading`、半成品留盘。所有 `except Exception`
+    前必须加 `except TaskCancelled: raise`（base.py 两处、video.py 三处）
+  - ⚠️ 回归用例断言**耗时 < 1s**，不是"能抛出"——只断言异常类型这个 bug 照样过
+  - ⚠️ `cancel()` **立刻**把 DB 状态写 cancelled（界面秒响应），worker 还要收拾现场；
+    断言"收拾干净"要等 `TaskManager.is_active()` 落下去，不能看 status
+  - `TaskCancelled` 定义在 `core/cancel.py`（避免 downloaders↔task_manager 循环依赖）
+- **产出组织**（V16）：`options.name_template` 占位符 `{site}{host}{album}{seq}{seq4}{ext}{type}{id}`，
+  支持 `/` 分层；含 `..`/绝对路径**整体拒绝**（不静默改写）；任务结束(含取消/部分失败)
+  写 `manifest.json`（rel path / sha256 / size / **resolved_url 实际生效下载点** / content_type / note）
+- **增量与订阅**（V16）：`incremental: true` → `find_done_resource(url)` 命中即复用不发请求；
+  表 `watches`(url/interval/next_run_time/enabled/hits/last_task_id)，`due_watches()` +
+  `claim_watch()` 先抢占再执行；调度线程随 TaskManager 起，间隔 `settings.watch_interval`(60s)
+- **导出**（V16）：`POST /tasks/{id}/archive` **流式** ZIP（生成器逐条 writestr；
+  首版攒 BytesIO 等于整包压内存，已重写）
+- **登录态**（V16）：`core/sessions.py` 起 headful Playwright，**周期快照** storage_state
+  （用户关掉浏览器后 context 就没了），落 `browser_state/{domain}.json`
 - **线程模型**：ThreadPoolExecutor(max_workers=2)，Playwright 同步 API 跑在工作线程
   - ⚠️ `delete()` **不能提前 pop `_active`**：`_cancelled()` 是查 `_active` 的，
     pop 掉就读不到取消标志，运行中的 worker 会把剩余资源全下完才释放槽位
@@ -141,27 +168,25 @@ tests/                 11 个测试文件，78 个用例
 （URL 模板 / 变体列表 / 画质映射 / 探测规则）。
 开工前先按 skill `gallery-site-probe` 做站点特征探测。
 
-## API 缺口（已知，未处理）
-- **没有 HTTP 取消端点**：`task_manager.cancel()` 存在，但没有路由暴露
-  （路由只有 `/tasks/{id}/retry`、`DELETE /tasks/{id}`）。
-  前端只能删任务，不能"取消但保留记录"。
+## 前台冒烟要点（V16 实测）
+- 后端启动需 `--app-dir backend`（`main.py` 用 `from api.x import y`，依赖 backend 在 sys.path；
+  `scripts/start.py` 是靠 `sys.path.insert` 做的同一件事）
+- 本机有代理时 `curl 127.0.0.1` 会走代理返回 **502** → 必须 `--noproxy '*'`
 
 ## 常用命令
 ```bash
 make install / make backend / make frontend / make build / make test / make docker
 uv run python scripts/probe.py <url>
+python scripts/verify_output.py    # 33 项断言
+python scripts/verify_hls.py       # 18 项断言
 ```
 环境变量：`UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` / `UWC_BROWSER_STATE_DIR` / `UWC_PROXY`
 
-## ⚠️ 重要：Git 仓库结构异常（2026-09-17 发现）
-**本项目目录不是独立 git 仓库。** `git rev-parse --show-toplevel` 返回 `C:/Users/admin`
-——整个用户主目录被当作一个仓库，远程 `https://github.com/LeonZhangDev/Myproject.git`。
-
-后果：
-- `universal_web_collector_v9` 整个目录处于未跟踪状态（`??`）
-- 仓库中混杂 Desktop 上大量无关文件（.obsidian、AI_interview、demo-python、
-  fastapi-task-demo、个人文档/图片等），且当前有大量 `D` 删除标记
-- 在该仓库根执行任何 commit/push/add 都可能误提交或误删大量个人文件
-
-**做 git 操作前必须先跟用户确认，切勿在仓库根批量 add/commit。**
-若要正规管理本项目，建议在 `universal_web_collector_v9` 内单独 `git init`。
+## ⚠️ Git：本项目已独立建仓（2026-09-18 处理完毕）
+- **在 `universal_web_collector_v9/` 内执行 git 命令**（`git rev-parse --show-toplevel`
+  现在返回项目目录本身），分支 `main`，初始提交 `6d5c63c`，81 个文件在跟踪。
+- `.gitignore` 覆盖 downloads / data / node_modules / `__pycache__` / browser_state / dist
+  —— 已核对提交里 **0 条**产物路径。
+- 上级 `C:\Users\admin` 那个仓库**仍然存在且仍然不能碰**：它的根是整个用户主目录，
+  混着 Desktop 上大量无关文件与个人资料，远程是 `github.com/LeonZhangDev/Myproject.git`。
+  **绝不要在 `C:\Users\admin` 下 add/commit/push。**

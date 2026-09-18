@@ -17,8 +17,20 @@ export function getLogs(id) {
 export function retryTask(id) {
   return api.post(`/tasks/${id}/retry`).then((r) => r.data);
 }
-export function deleteTask(id) {
-  return api.delete(`/tasks/${id}`).then((r) => r.data);
+// withFiles=true 时连磁盘上的下载文件一起删(默认只删任务记录)
+export function deleteTask(id, withFiles = false) {
+  return api
+    .delete(`/tasks/${id}`, { params: { with_files: withFiles } })
+    .then((r) => r.data);
+}
+// 批量清理: 按状态删除已结束的任务
+export function bulkDeleteTasks(statuses, withFiles = false) {
+  return api
+    .post("/tasks/bulk-delete", { statuses, with_files: withFiles })
+    .then((r) => r.data);
+}
+export function getStorageOverview() {
+  return api.get("/tasks/storage").then((r) => r.data);
 }
 export function retryResource(taskId, resourceId) {
   return api.post(`/tasks/${taskId}/resources/${resourceId}/retry`).then((r) => r.data);

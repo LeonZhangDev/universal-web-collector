@@ -38,7 +38,11 @@ defineEmits(["select", "remove"]);
         <td>{{ t.retry_count }}</td>
         <td>{{ t.created_time }}</td>
         <td>
-          <button class="ghost danger" title="删除任务" @click.stop="$emit('remove', t.id)">✕</button>
+          <button
+            class="ghost danger"
+            title="删除任务(可选择是否同时删除已下载的文件)"
+            @click.stop="$emit('remove', t.id)"
+          >✕</button>
         </td>
       </tr>
     </tbody>

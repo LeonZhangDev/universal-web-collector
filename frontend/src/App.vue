@@ -4,6 +4,7 @@ import FolderPicker from "./components/FolderPicker.vue";
 import TaskDetail from "./components/TaskDetail.vue";
 import TaskTable from "./components/TaskTable.vue";
 import {
+  bulkDeleteTasks,
   createTask,
   createWatch,
   deleteSession,
@@ -12,6 +13,7 @@ import {
   getCollectors,
   getConfig,
   getLoginJob,
+  getStorageOverview,
   listSessions,
   listTasks,
   listWatches,
@@ -30,12 +32,12 @@ const collectors = ref(["generic"]);
 const collectorLabel = {
   generic: "通用网页(浏览器抓取)",
   xchina: "XChina 页面(浏览器抓取)",
-  xchina_gallery: "XChina 相册(按 ID 枚举全图)",
+  xchina_gallery: "XChina 相册(相册 ID / 相册页 URL 均可)",
 };
 // 不同采集器对输入的要求不同, 提示语跟着切换
 const urlPlaceholder = computed(() =>
   collector.value === "xchina_gallery"
-    ? "输入相册 ID(如 6aa113208a506)或该相册任意一张图片 URL"
+    ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX/1.html) / 任意一张图片 URL 都行"
     : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
 );
 const creating = ref(false);
@@ -208,14 +210,84 @@ function select(id) {
   selectedId.value = selectedId.value === id ? null : id;
 }
 
-async function remove(id) {
-  if (!confirm(`删除任务 #${id}?(磁盘文件会保留)`)) return;
+// ---- 删除任务 / 清理 ----
+// "删记录"和"删文件"是两件不同的事, 所以不合并成一个确认框。
+// 默认只删记录(磁盘文件保留) —— 去重机制下别的任务可能正引用着这些文件;
+// 想连文件一起删必须显式再点一次。用 confirm() 的"确定/取消"表达三态
+// (删哪个?) 很容易点错, 所以用一个弹层把两种后果摊开写清楚。
+const pending = ref(null); // { mode: "one", id } | { mode: "bulk" }
+const busy = ref(false);
+const flash = ref("");
+const storage = ref(null);
+
+const FINISHED = ["success", "partial", "failed", "cancelled"];
+
+function fmtSize(n) {
+  if (n === null || n === undefined) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = Number(n);
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${i === 0 ? v : v.toFixed(1)}${u[i]}`;
+}
+
+function say(text) {
+  flash.value = text;
+  setTimeout(() => {
+    if (flash.value === text) flash.value = "";
+  }, 6000);
+}
+
+async function refreshStorage() {
   try {
-    await deleteTask(id);
-    tasks.value = tasks.value.filter((t) => t.id !== id);
-    if (selectedId.value === id) selectedId.value = null;
+    storage.value = await getStorageOverview();
+  } catch (e) {
+    /* 后端不可达时保持原值 */
+  }
+}
+
+function askRemove(id) {
+  pending.value = { mode: "one", id };
+}
+
+function askCleanup() {
+  pending.value = { mode: "bulk" };
+}
+
+async function doDelete(withFiles) {
+  const p = pending.value;
+  if (!p) return;
+  busy.value = true;
+  try {
+    if (p.mode === "one") {
+      const info = await deleteTask(p.id, withFiles);
+      tasks.value = tasks.value.filter((t) => t.id !== p.id);
+      if (selectedId.value === p.id) selectedId.value = null;
+      say(
+        withFiles
+          ? `已删除任务 #${p.id}, 同时删除 ${info.files} 个文件`
+          : `已删除任务 #${p.id}, 磁盘文件保留`
+      );
+    } else {
+      const r = await bulkDeleteTasks(FINISHED, withFiles);
+      r.deleted.forEach((id) => {
+        if (selectedId.value === id) selectedId.value = null;
+      });
+      await refresh();
+      say(
+        `已清理 ${r.deleted.length} 个任务` +
+          (withFiles ? `, 删除 ${r.files} 个文件 / ${fmtSize(r.bytes)}` : ", 文件保留")
+      );
+    }
+    pending.value = null;
+    await refreshStorage();
   } catch (e) {
     alert(e.response?.data?.detail || String(e));
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -364,6 +436,7 @@ onMounted(async () => {
   }
   loadWatches();
   loadSessions();
+  refreshStorage();
 });
 onUnmounted(() => {
   if (es) es.close();
@@ -490,10 +563,62 @@ onUnmounted(() => {
   </div>
 
   <div class="card">
-    <TaskTable :tasks="tasks" :selected-id="selectedId" @select="select" @remove="remove" />
+    <div class="list-bar">
+      <span class="lbl">任务列表</span>
+      <span class="summary muted" v-if="storage">
+        共 {{ storage.tasks }} 个 · 已下载资源 {{ storage.done_resources }} 个 ·
+        记录体积 {{ fmtSize(storage.recorded_bytes) }}
+      </span>
+      <span class="grow"></span>
+      <button
+        type="button"
+        class="ghost"
+        :disabled="!storage || !storage.finished_tasks"
+        @click="askCleanup"
+      >
+        清理已结束{{ storage && storage.finished_tasks ? ` (${storage.finished_tasks})` : "" }}
+      </button>
+    </div>
+    <div v-if="flash" class="flash">{{ flash }}</div>
+    <TaskTable
+      :tasks="tasks"
+      :selected-id="selectedId"
+      @select="select"
+      @remove="askRemove"
+    />
   </div>
 
   <TaskDetail v-if="selectedId" :task-id="selectedId" @close="selectedId = null" />
+
+  <div v-if="pending" class="modal-mask" @click.self="pending = null">
+    <div class="modal">
+      <h3 v-if="pending.mode === 'one'">删除任务 #{{ pending.id }}</h3>
+      <h3 v-else>清理已结束的任务</h3>
+
+      <p class="muted" v-if="pending.mode === 'one'">
+        任务记录会从列表里移除。<b>磁盘上已下载的文件默认保留</b>。
+      </p>
+      <p class="muted" v-else>
+        将删除 <b>{{ storage ? storage.finished_tasks : 0 }}</b> 个已结束的任务
+        (成功 / 部分失败 / 失败 / 已取消)。正在运行的任务不受影响。
+      </p>
+
+      <div class="modal-note">
+        「连文件一起删除」会清掉这些任务目录下已下载的内容, 且<b>不可恢复</b>。
+        内容相同的文件可能被其他任务复用, 删掉后那些任务的产出清单会指向空文件。
+      </div>
+
+      <div class="modal-actions">
+        <button class="ghost" :disabled="busy" @click="pending = null">取消</button>
+        <button class="ghost" :disabled="busy" @click="doDelete(false)">
+          仅删除记录(保留文件)
+        </button>
+        <button class="ghost danger" :disabled="busy" @click="doDelete(true)">
+          连文件一起删除
+        </button>
+      </div>
+    </div>
+  </div>
 
   <div class="card">
     <div class="panel-toggle">
@@ -592,6 +717,69 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* ---- 任务列表工具条 ---- */
+.list-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.list-bar .lbl {
+  color: var(--muted);
+  font-size: 13px;
+}
+.list-bar .summary {
+  color: var(--muted);
+  font-size: 12px;
+}
+.list-bar .grow {
+  flex: 1;
+}
+.flash {
+  margin: -2px 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--ok);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* ---- 删除确认弹层 ---- */
+.modal h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.modal p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.modal p b {
+  color: var(--text);
+}
+.modal-note {
+  padding: 8px 10px;
+  border: 1px solid #5a3a3a;
+  border-radius: 8px;
+  background: rgba(224, 92, 92, 0.08);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.modal-note b {
+  color: var(--err);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .panel-toggle {
   display: flex;
   align-items: center;

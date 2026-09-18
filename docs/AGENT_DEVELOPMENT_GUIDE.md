@@ -738,3 +738,72 @@ ffmpeg 路径与当前引擎行为; 未找到时提示产物为 .ts 及安装命
 - 后端真实启动冒烟: /healthz /collectors /tasks /watches /sessions 均 200,
   不存在的任务返回 404(启动需 `--app-dir backend`, 见 §start.py 的 sys.path 注入)
 - ⚠️ 本机有代理时 `curl 127.0.0.1` 会走代理返回 502, 冒烟要加 `--noproxy '*'`
+
+---
+
+## 8. 相册页 URL 解析事故 + 删除语义 (2026-09-18 晚)
+
+### 事故现象
+输入 `https://xchina.co/photo/id-6aa5136f606fe/10.html`, 日志显示
+
+```
+seq 00001 不存在(text/html; charset=utf-8), 连续缺失 1/3
+...
+extracted 0 resources
+no resource to download (all filtered out)
+task success          <- 最误导的一句
+```
+
+### 根因
+`parse_gid` 的 `id_in_path` 只写了 `/photos/([0-9A-Za-z_-]{6,})`(图片直链形态),
+相册页 URL 匹配不上 → 走"取路径末段"退路 → 拿到**页码 `10`** 当图集 ID
+→ 去枚举 `https://img.xchina.io/photos/10/00001.jpg`。
+该站对不存在的图集同样返回 `200 + text/html`, 于是 3 个序号全判"不存在",
+枚举立即停止, **任务报 success 而 0 个资源**。
+
+验证过的对照(HEAD + `Accept: image/*`):
+
+```
+photos/10/00001.jpg            -> 200 text/html; charset=UTF-8   <- 猜出来的假图集
+photos/6aa5136f606fe/00001.jpg -> 200 image/jpeg  Content-Length: 382383
+photos/6aa5136f606fe/00142.jpg -> 200 image/jpeg                 <- 最后一张
+photos/6aa5136f606fe/00143.jpg -> 200 text/html                  <- 越界
+```
+
+密集扫描 1..200 确认: **1~142 连续无空洞**, 143 起全缺失。没有内部空洞,
+所以 `miss_stop=3` 在这个站是安全的。
+
+### 修法(三层)
+1. `GallerySite.id_patterns` 支持多条正则并按顺序尝试(直链 / 相册页 / query);
+   新增 `page_tail` 把"末段是纯数字"识别为页码, 直接放弃解析
+2. 退路只在末段**看起来确实像 ID**(`[0-9A-Za-z_-]{6,}`)时才兜底。
+   **宁可返回 None 让采集器报错, 也绝不猜** —— 猜错的表现("成功但 0 资源")
+   比报错难查得多
+3. `_run` 里采集器返回空列表即 `raise`, 任务判 `failed` 并给出可读原因
+
+### 顺手修掉的两个 bug
+- **文件名双后缀** `00001_.jpg.jpg`: 判断"是否最高画质档"时拿**变体后缀**
+  (`".jpg"`)去和**画质档名**(`"original"`)比较, 永不相等, 原图也被贴标记,
+  再拼上从 URL 取的扩展名就成了 `_.jpg.jpg`。改为 `_quality_tag(site, variant)`
+- **看门狗误杀别的实例的任务**: `_watchdog_pass` 只看自己的 `self._active`,
+  于是**只要进程里存在第二个 TaskManager**(测试、诊断脚本), 单例的看门狗就会
+  把那个实例正在跑的任务判成"服务重启遗留"标 failed。已在模块级登记所有存活
+  实例(`_LIVE_MANAGERS`), 判断前先问一遍。
+  ⚠️ 只解决单进程内多实例; `uvicorn --workers N` 多进程部署仍需给 tasks 加
+  worker_id 列来区分归属。
+
+### 删除语义
+- `DELETE /tasks/{id}` —— 只删记录, **磁盘文件保留**(默认)
+- `DELETE /tasks/{id}?with_files=true` —— 连 `<下载根目录>/<task_id>/` 一起删;
+  双重越界校验(必须是 base 直接子目录 + 解析后仍在 base 内), 只删这一层
+- `POST /tasks/bulk-delete` —— 按状态批量清理已结束任务, 运行中的不动
+- 为什么默认不删文件: 内容 hash 去重下别的任务可能引用本任务目录里的文件,
+  删了会让那些任务的 manifest 指向不存在的文件
+
+### 验证
+- `pytest` -> **149 用例**(新增 test_delete.py 11 项 + test_gallery.py 11 项)
+- 真实站点端到端(单例 `tm.task_manager`, 枚举上限压到 3~5 张以控制时长):
+  `task success` / 资源全 done / 魔数 `ffd8ffe0` 真 JPEG /
+  original 落 `00001.jpg`(382KB)、`quality=1200` 落 `00001_1200.webp`(28KB)
+- ⚠️ 验证脚本里 `gb.DEFAULT_MAX = 3` **不生效**: `discover(..., max_count=DEFAULT_MAX)`
+  的默认值在函数定义时就绑定了, 改模块全局不影响。要限流得显式传参或包一层采集器

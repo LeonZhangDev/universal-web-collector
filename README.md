@@ -40,11 +40,13 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | POST | /tasks/create | 创建任务 `{"url": "...", "collector": "generic"}` |
 | GET | /collectors | 已注册采集器列表 |
 | GET | /tasks | 任务列表 |
+| GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
 | GET | /tasks/{id} | 任务详情 + 资源 |
 | GET | /tasks/{id}/logs | 任务日志 |
 | POST | /tasks/{id}/resources/{rid}/retry | 资源级重试(强制下载, 跳过过滤规则) |
 | POST | /tasks/{id}/cancel | 停止任务: 保留已下载文件, 未完成资源置 skipped |
-| DELETE | /tasks/{id} | 删除任务(删除记录, 保留磁盘文件) |
+| DELETE | /tasks/{id}?with_files=true | 删除任务。**默认只删记录, 磁盘文件保留**; `with_files=true` 连任务目录一起删 |
+| POST | /tasks/bulk-delete | 批量清理 `{"statuses":[...], "with_files":false}`; 运行中的任务不会被删 |
 | POST | /tasks/{id}/archive | 打包导出该任务的产出(ZIP 流式, 可按状态过滤) |
 | GET | /files/{task_id}/manifest | 产出清单 manifest.json(JSON) |
 | GET | /watches | 订阅源列表 |
@@ -96,7 +98,7 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (127 用例)
+make test           # pytest (149 用例)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -115,10 +117,15 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
 - 采集器插件化: `@register("name")` 注册
   - `generic` 任意站点(浏览器四解析器)
   - `xchina` XChina 页面(浏览器抓取)
-  - `xchina_gallery` XChina 相册: 输入相册 ID 即枚举全图, 纯 HTTP 无需浏览器
+  - `xchina_gallery` XChina 相册: 纯 HTTP 序号枚举, 无需浏览器。以下输入**都**可用:
+    - 相册页 URL `https://xchina.co/photo/id-6aa5136f606fe/10.html`
+    - 图片直链 `https://img.xchina.io/photos/6aa5136f606fe/00001.jpg`
+    - 图集 ID 本身 `6aa5136f606fe`
     - 支持画质档 `quality`: original / 1200 / 800 / 600
     - 序号枚举型站点可继承 `collectors/gallery_base.py::SequenceGallerySpider`,
-      站点只声明 URL 模板与探测规则
+      站点只声明 URL 模板、ID 正则与探测规则
+    - ⚠️ ID 解析不出来时**直接报错**, 绝不猜: 猜错会去枚举一个不存在的图集,
+      表现为"任务成功但 0 个资源"(曾把相册页 URL 里的页码 `10` 当成 ID)
 - 资源类型: image / video / audio / doc / text, 对应下载器
 - 资源过滤: 类型/扩展名黑白名单/URL关键词/大小区间(HEAD 探测), 命中者标记 filtered 并记原因
 - 输出组织: 任务级命名模板(默认保留 URL 原名), 落 `<download_dir>/<task_id>/` 下的
@@ -130,6 +137,12 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
   与状态筛选(成功/过滤/失败)、清单表格
 - 停止: `POST /tasks/{id}/cancel` 立刻落 cancelled 状态, 下载循环在每个数据块
   检查取消标志(不是资源边界), 半成品即时清理, 已下载文件保留
+- 删除: **记录与文件分开决定**。默认 `DELETE /tasks/{id}` 只删记录, 磁盘文件
+  保留(去重机制下别的任务可能正引用它们); 要连文件删需显式
+  `?with_files=true`, 只会删 `<下载根目录>/<task_id>/` 这一层并做双重越界校验。
+  `POST /tasks/bulk-delete` 一键清理已结束任务(按状态筛选, 运行中的不动)
+- 空结果即失败: 采集器一个资源都没发现时任务判 `failed` 并给出原因,
+  不再出现"任务成功但什么都没下到"
 - 登录态: `POST /sessions/login` 起 headful 浏览器手动登录, 定期快照
   storage_state, 落 `browser_state/{domain}.json`
 - 输出目录: 支持任务级自定义目录, 文件服务按任务目录做越权校验

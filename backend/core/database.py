@@ -273,6 +273,26 @@ def count_resources(task_id):
     return {r["status"]: r["n"] for r in rows}
 
 
+def count_tasks_by_status():
+    """按状态统计任务数量, 返回 dict。
+
+    供"批量清理"界面做预检: 先让用户看到"将删除 12 个任务", 而不是点完
+    才发现删错了一批。
+    """
+    rows = query("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status")
+    return {r["status"]: r["n"] for r in rows}
+
+
+def iter_tasks_with_status(statuses):
+    """按状态批量取任务(供批量删除使用)。"""
+    if not statuses:
+        return []
+    marks = ",".join("?" for _ in statuses)
+    return query(
+        f"SELECT * FROM tasks WHERE status IN ({marks}) ORDER BY id", tuple(statuses)
+    )
+
+
 def count_downloaded(task_id):
     """本次**真正下载**的资源数(排除增量复用的)。
 

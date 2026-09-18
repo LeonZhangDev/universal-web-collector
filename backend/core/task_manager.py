@@ -1,5 +1,6 @@
 import inspect
 import json
+import shutil
 import threading
 import time
 import traceback
@@ -20,6 +21,10 @@ from downloaders.video import VideoDownloader
 from . import database as db
 
 DOWNLOADS_DIR = settings.download_dir
+
+# 删除任务时, 等 worker 收拾现场的上限(秒)。取消只置标志位, worker 需要时间
+# 退出; 但 HTTP 请求不能因为一个卡死的 worker 一直挂着, 所以给个上限。
+DELETE_SETTLE_SECONDS = 5.0
 
 
 class TaskStatus:
@@ -89,6 +94,40 @@ def can_transition(current, new):
     return new in TRANSITIONS.get(current, set())
 
 
+# 进程内所有活着的 TaskManager 实例。
+#
+# 看门狗判断"这个活动任务真的没有 worker 了吗"时, 只看自己那本 `self._active`
+# 是不够的: 只要进程里存在**第二个** TaskManager(测试、诊断脚本、
+# 后台工具都会创建), 单例的看门狗就会看到 DB 里有个活动任务、而自己的
+# _active 里没有它, 于是把它判成"服务重启遗留"直接标 failed ——
+# 而那个任务的 worker 正在正常下载。所以必须问过所有实例。
+#
+# ⚠️ 这只解决单进程内的多实例。若以 uvicorn --workers N 多进程部署, 各进程
+# 仍会互删任务(此时需要给 tasks 加 worker_id 列来区分归属)。
+_LIVE_MANAGERS = []
+_LIVE_LOCK = threading.Lock()
+
+
+def _register_manager(mgr):
+    with _LIVE_LOCK:
+        _LIVE_MANAGERS.append(mgr)
+
+
+def _unregister_manager(mgr):
+    with _LIVE_LOCK:
+        try:
+            _LIVE_MANAGERS.remove(mgr)
+        except ValueError:
+            pass
+
+
+def _owned_by_any_manager(task_id):
+    """该任务是否正被进程内某个 TaskManager 持有。"""
+    with _LIVE_LOCK:
+        managers = list(_LIVE_MANAGERS)
+    return any(m._entry(task_id) is not None for m in managers)
+
+
 class TaskManager:
     def __init__(self, max_workers=None, download_workers=None):
         self._executor = ThreadPoolExecutor(
@@ -101,6 +140,7 @@ class TaskManager:
         )
         self._active = {}  # task_id -> {"future", "cancel", "hb"}
         self._active_lock = threading.Lock()
+        _register_manager(self)
         self._watchdog_stop = threading.Event()
         self._watchdog = threading.Thread(
             target=self._watchdog_loop, daemon=True, name="watchdog"
@@ -166,11 +206,68 @@ class TaskManager:
             self._publish_task(task_id)
         return ok, None
 
-    def delete(self, task_id):
+    def delete(self, task_id, with_files=False):
+        """删除任务, 返回 {"files": 已删文件数, "bytes": 释放的字节数}。
+
+        * `with_files=False`(默认) —— 只删数据库记录, **磁盘文件保留**。
+          上级目录里那一堆下载好的图片不会因为"从列表里划掉一个任务"而消失。
+        * `with_files=True` —— 连同该任务的下载目录一起删除。
+
+        顺序有讲究: 必须先取消再删文件, 否则正在跑的 worker 会把文件写回来。
+        取消只是置标志位(见 cancel), worker 还要收拾现场, 所以这里要等它
+        真正退出再动手删 —— 但等不到也不能把 HTTP 请求挂住, 故设上限。
+        """
+        info = {"files": 0, "bytes": 0}
+        task = db.get_task(task_id)
+        if not task:
+            return info
         # 只置取消标志, 让 worker 在下一个资源边界自行退出;
         # _active 条目的回收交给 _run 的 finally(见 cancel 里的说明)。
         self.cancel(task_id)
+        if with_files:
+            deadline = time.monotonic() + DELETE_SETTLE_SECONDS
+            while self.is_active(task_id) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            info = self._purge_files(task)
         db.delete_task(task_id)
+        return info
+
+    def _purge_files(self, task):
+        """删除某个任务的下载目录, 返回 {"files": n, "bytes": n}。
+
+        ⚠️ 只删 `<下载根目录>/<task_id>/` 这一层, 且做了双重越界校验 ——
+        下载根目录可由用户自定义, 路径算错就等于删用户的目录, 必须防。
+        另外: 内容 hash 去重时别的任务可能引用本任务目录里的文件(A 复用 B 的
+        同一张图), 删掉会让那些任务的 manifest 指向不存在的文件。这是去重的
+        固有代价, 所以**默认不删文件**, 由用户显式选择。
+        """
+        try:
+            base = task_base_dir(task).resolve()
+        except OSError:
+            return {"files": 0, "bytes": 0}
+        target = base / str(task["id"])
+        # 校验 1: 必须是 base 的直接子目录(不能是 base 本身, 也不能更深)
+        if target.parent != base or not target.is_dir():
+            return {"files": 0, "bytes": 0}
+        # 校验 2: 解析后的真实路径仍须落在 base 内(防软链接指到外面)
+        try:
+            real = target.resolve()
+        except OSError:
+            return {"files": 0, "bytes": 0}
+        if real == base or not real.is_relative_to(base):
+            return {"files": 0, "bytes": 0}
+
+        count = 0
+        total = 0
+        for p in real.rglob("*"):
+            try:
+                if p.is_file():
+                    count += 1
+                    total += p.stat().st_size
+            except OSError:
+                continue
+        shutil.rmtree(real, ignore_errors=True)
+        return {"files": count, "bytes": total}
 
     def submit_resource(self, task_id, resource_id):
         """资源级重试: 单个 failed/skipped 资源重新下载, 不影响任务状态。"""
@@ -246,6 +343,8 @@ class TaskManager:
 
     def shutdown(self):
         self._watchdog_stop.set()
+        # 退出登记: 本实例不再持有任何任务, 它留下的活动任务应可被回收
+        _unregister_manager(self)
         self._scheduler_stop.set()
 
     # ---- 任务配置辅助 ----
@@ -379,6 +478,16 @@ class TaskManager:
             self._transition(task_id, TaskStatus.RUNNING, TaskStatus.EXTRACTING)
             resources = self._crawl(spider, url, task_id, self._options(task_id))
             self._check_cancel(task_id)
+            if not resources:
+                # 采集器一个资源都没发现 -> 直接报失败。
+                # 旧行为是照常走完下载阶段(0 个资源)并判定 success, 于是
+                # "什么也没下到"和"全部下好了"在界面上长得一模一样。
+                # 真实事故: 相册页 URL 被解析出错误的图集 ID, 枚举了 3 个不存在
+                # 的序号后停止, 任务显示 success 而 0 个资源, 用户无从判断原因。
+                raise ValueError(
+                    "未发现任何资源: 请确认 URL 形态与所选采集器匹配, "
+                    "并查看上方日志中采集器的解析/探测结果"
+                )
             filters = self._filters(task_id)
             filtered = 0
             reused = 0
@@ -476,7 +585,14 @@ class TaskManager:
         resources = [r for r in db.get_resources(task_id) if r["status"] == "pending"]
         total = len(resources)
         if total == 0:
-            self._safe_log(task_id, "no resource to download (all filtered out)")
+            # 区分"没找到"与"被规则挡掉": 前者是故障, 后者是用户自己的选择
+            stat = self._resource_stat(task_id)
+            if stat:
+                self._safe_log(
+                    task_id, "no resource to download (全部命中过滤/已复用, 无需下载)"
+                )
+            else:
+                self._safe_log(task_id, "no resource to download (采集器未发现任何资源)")
             return
 
         out_dir = self._out_dir(task_id)
@@ -699,6 +815,9 @@ class TaskManager:
         for t in db.list_active_tasks():
             tid = t["id"]
             entry = self._entry(tid)
+            if entry is None and _owned_by_any_manager(tid):
+                # 别的 TaskManager 实例正在跑它, 不是遗留任务
+                continue
             if entry is None:
                 db.update_task(tid, error="stale task: no active worker (server restarted?)")
                 db.transition_task_from_any(

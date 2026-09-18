@@ -3,7 +3,7 @@ import json
 import queue
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
@@ -17,7 +17,13 @@ from core import events
 from core.config import settings
 from core.filters import parse_size
 from core.manifest import read_manifest
-from core.task_manager import DOWNLOADERS, task_base_dir, task_manager
+from core.task_manager import (
+    ACTIVE_STATES,
+    DOWNLOADERS,
+    TaskStatus,
+    task_base_dir,
+    task_manager,
+)
 from models.schemas import ResourceOut, TaskCreateIn, TaskCreateOut, TaskDetail, TaskOut
 
 router = APIRouter()
@@ -108,6 +114,31 @@ def list_tasks():
     return [dict(t) for t in db.list_tasks()]
 
 
+# ⚠️ 必须声明在 /tasks/{task_id} **之前**: FastAPI 按注册顺序匹配, 否则
+# "storage" 会被当成 task_id 去解析成 int 而返回 422。
+@router.get("/tasks/storage")
+def storage_overview():
+    """任务与产出的整体占用概览, 供"一键清理"界面预检。"""
+    by_status = db.count_tasks_by_status()
+    row = db.query(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes"
+        " FROM resources WHERE status='done'"
+    )[0]
+    finished = sum(
+        by_status.get(s, 0)
+        for s in (TaskStatus.SUCCESS, TaskStatus.PARTIAL,
+                  TaskStatus.FAILED, TaskStatus.CANCELLED)
+    )
+    return {
+        "tasks": sum(by_status.values()),
+        "by_status": by_status,
+        "finished_tasks": finished,
+        "done_resources": row["n"],
+        "recorded_bytes": row["bytes"],
+        "active_states": list(ACTIVE_STATES),
+    }
+
+
 @router.get("/tasks/{task_id}", response_model=TaskDetail)
 def get_task(task_id: int):
     task = db.get_task(task_id)
@@ -151,11 +182,66 @@ def cancel_task(task_id: int):
 
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: int):
-    if not db.get_task(task_id):
+def delete_task(task_id: int, with_files: bool = False):
+    """删除任务。
+
+    with_files=True 时**同时删除该任务下载目录下的文件**(默认只删记录)。
+    默认不删文件是刻意的: 去重机制下别的任务可能正在引用这些文件, 且
+    "从列表里划掉一行"和"把已下载的东西删掉"应该分开决定。
+    """
+    task = db.get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    task_manager.delete(task_id)
-    return {"deleted": task_id}
+    info = task_manager.delete(task_id, with_files=with_files)
+    return {"deleted": task_id, "with_files": with_files, **info}
+
+
+class BulkDeleteIn(BaseModel):
+    """批量清理。默认作用于所有**已结束**的任务(成功/部分/失败/已取消)。"""
+
+    statuses: List[str] = [
+        TaskStatus.SUCCESS,
+        TaskStatus.PARTIAL,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ]
+    with_files: bool = False
+
+
+@router.post("/tasks/bulk-delete")
+def bulk_delete(payload: BulkDeleteIn):
+    """一键清理: 按状态批量删除任务。
+
+    正在运行的任务不会被删(即使状态被显式写进 statuses), 会列在 skipped 里
+    返回 —— 让用户知道"有一个还在跑"比悄悄跳过更好。
+    """
+    invalid = [s for s in payload.statuses if s in ACTIVE_STATES]
+    wanted = [s for s in payload.statuses if s not in ACTIVE_STATES]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="没有可删除的状态(不能停止运行中的任务)")
+
+    deleted = []
+    skipped = []
+    files = 0
+    freed = 0
+    for t in db.iter_tasks_with_status(wanted):
+        info = task_manager.delete(t["id"], with_files=payload.with_files)
+        deleted.append(t["id"])
+        files += info.get("files", 0)
+        freed += info.get("bytes", 0)
+    for t in db.list_tasks():
+        if t["status"] in ACTIVE_STATES:
+            skipped.append(t["id"])
+
+    return {
+        "deleted": deleted,
+        "skipped_active": skipped,
+        "with_files": payload.with_files,
+        "files": files,
+        "bytes": freed,
+        # 显式告知调用方哪些状态被忽略了(例如误传了 running)
+        "ignored_statuses": invalid,
+    }
 
 
 @router.post("/tasks/{task_id}/resources/{resource_id}/retry", response_model=ResourceOut)

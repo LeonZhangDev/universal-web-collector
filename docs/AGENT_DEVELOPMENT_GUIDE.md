@@ -807,3 +807,134 @@ photos/6aa5136f606fe/00143.jpg -> 200 text/html                  <- 越界
   original 落 `00001.jpg`(382KB)、`quality=1200` 落 `00001_1200.webp`(28KB)
 - ⚠️ 验证脚本里 `gb.DEFAULT_MAX = 3` **不生效**: `discover(..., max_count=DEFAULT_MAX)`
   的默认值在函数定义时就绑定了, 改模块全局不影响。要限流得显式传参或包一层采集器
+
+
+# V17 视频相册枚举 + 相册标题命名 ✅ 已完成(2026-09-18)
+
+用户请求: "视频也是可以通过网址 `https://xchina.co/photo/id-6a3654854fd25.html`
+或者相册 ID `6a3654854fd25` 反推到 `.../00001.mp4` 到 `.../00004.mp4`,
+保存的文件名可以用相册名称吗, 就是网页的 `<title>` 标签里的文字"。
+
+## 1. 站点实测: 图片与视频共用同一序号空间
+
+```
+photos/6a3654854fd25/00001.jpg -> 200 image/jpeg          <- 图片也有
+photos/6a3654854fd25/00001.mp4 -> 206 video/mp4  64MB
+photos/6a3654854fd25/00002.mp4 -> 206 video/mp4  77MB
+photos/6a3654854fd25/00003.mp4 -> 206 video/mp4   5MB
+photos/6a3654854fd25/00004.mp4 -> 206 video/mp4 105MB
+photos/6a3654854fd25/00005.mp4 -> 200 text/html          <- 越界
+```
+
+相册页内嵌 `var videos = [...]` 列出 4 段视频, 网格里是 No.1~No.12 共 12 张图。
+**结论: `00001.jpg` 与 `00001.mp4` 并存, 靠扩展名区分, 不会撞名;
+只采图片会漏掉 260MB 视频, 只采视频会漏掉整套图。**
+
+⚠️ 不要反推成"有视频的相册就没有图片"。
+
+判存在性仍只能看 `Content-Type`(`video/mp4` vs `text/html`), 状态码越界时也是 200。
+
+Accept 头这次**不构成门槛**: `.mp4` 对任何 Accept(含完全不带头)都返回 206。
+`VIDEO_ACCEPT` 仍然保留 —— 这是别的站点可能需要的, 不是本站的实测结论。
+
+## 2. `options.media`: 媒体类型可枚举
+
+`GallerySite` 把媒体声明从"隐含只有图片"改成显式列表:
+
+```python
+video_variants = [".mp4"]              # 非空即声明"该站有视频"
+video_base = ""                        # 视频在老 CDN 时填这里
+site.media("image"|"video") -> MediaType(name, variants, quality_map,
+                                          ctype_prefix, accept, seq_format, base)
+```
+
+`MediaType` 自带 `ctype_prefix`(`image/` vs `video/`), 所以 `probe()` 加了同名
+参数 —— 判定"这是什么媒体"和"它存不存在"是同一件事, 不该分两处实现。
+
+`options.media` 四态: `auto`(默认) / `image` / `video` / `both`。
+
+`auto` 的判定两条线索**都问**:
+1. 相册页里的 `var videos` 非空 -> 有视频
+2. 否则探测 `00001.mp4` 是否存在(`_video_at_first_seq`, 该站视频必从 1 开始)
+
+两个都说没有才认为没有。为什么要两条: 页面结构会变(不可依赖), 但多一次探测
+能避免"站点悄悄改了页面导致静默漏采视频"。失败按"没有"处理, 宁可少采不搞挂任务。
+
+## 3. 相册标题命名: `collectors/album_meta.py`
+
+新增模块, 用 headless Chromium 打开相册页 → 解析 `<title>` 与 `var videos`。
+
+`<title>` 形如 `未公开作品（下） - 国模套图 - 小黄书 xChina`,
+按 `site.title_split`(默认 `\s+-\s+`)取第一段作目录名。三档 `options.album_title`:
+
+| 值 | 目录名 |
+| --- | --- |
+| `clean`(默认) | `未公开作品（下）` |
+| `full` | 完整 `<title>` |
+| `id` | 图集 ID(不访问相册页) |
+
+### ⚠️ 三个让这段代码白写的坑
+
+**(a) Cloudflare 挑战页是"真实"页面, 不能只等 `goto` 返回。**
+相册页先返回 `<title>Just a moment...</title>`, headless Chromium 几秒后自动解开。
+若直接读标题就会把 `Just a moment...` 当相册名 —— **比拿不到更糟**(落盘成
+`Just a moment.../00001.jpg`)。所以必须轮询到标题不再是拦截页特征串。
+
+**(b) 不能用 `wait_for_function` 等, 只能轮询。**
+挑战解开靠**一次导航**完成, 导航会销毁 JS 执行上下文, `wait_for_function`
+的 Promise 永远不会 resolve(实测 25s 超时也等不到)。改成
+`while _title_is_bad(page.title()): page.wait_for_timeout(1000)`。
+
+**(c) 失效的 `cf_clearance` 比没有登录态更糟 —— 直接 403。**
+本地 `browser_state/xchina.co.json` 里的 cookie 已过期, 带上它请求会被
+Cloudflare 判为异常而**明确拒绝**; 同一时刻匿名访问反而能正常过挑战。
+A/B 实测: 带登录态 → 标题始终 `Just a moment...`; 不带 → 拿到真实标题。
+所以 `album_meta` 的策略是**先匿名, 失败再带登录态重试一遍**(而不是"有登录态就用")。
+这条与常规直觉相反, 改动前请重新 A/B。
+
+拿不到页面**从不**让任务失败 —— 它只影响目录名与"有无视频"的判定,
+降级为"用图集 ID 命名 + 探测 `00001.mp4`"。
+
+## 4. 命名链路: 采集器建议文件名 vs 任务级模板
+
+`discover()` yield 的 `filename` 是 `{相册名}/{seq:05d}{画质标记}{ext}`
+(如 `未公开作品（下）/00001.jpg`)。优先级仍是
+**任务级 `name_template` > 采集器建议 > 全局默认**:
+用户显式写的模板压过采集器习惯, 采集器的建议压过 `{name}`。
+采集器建议同样过 `safe_relative()` 清洗, 防 URL 里的怪字符拼出 `../`。
+
+`core/naming.py` 新增 `clean_segment()` 并导出 —— 标题里可能带 `/` `:` `?`,
+不清洗就会多出一层目录或拼出非法路径; 清洗后为空则回退图集 ID。
+
+## 5. 验证(2026-09-18)
+
+- `pytest` -> **179 用例**(V16 的 149 + 新增 `tests/test_gallery_video.py` 30 项)
+- 真实站点全链路(真下载): 含 mp4, 魔数 `ftyp` 正确, 任务 `success`
+- 纯图片相册 `6aa5136f606fe` 回归无变化:
+  ```
+  图集 6aa5136f606fe -> 目录 '未公开作品（下）'; 采集媒体: image
+  === ITEMS: 141 ===   images: 141  videos: 0
+  [image] 未公开作品（下）/00001.jpg  size=382383
+  ```
+- 前端 `vite build` -> 72 modules, 新增 media / album_title 两个下拉
+
+## 6. 顺手修掉的三个既有问题
+
+1. **`tests/test_gallery.py` 里有重复定义的用例**: `test_filename_*` 三个函数
+   被完整粘贴了两遍, **后定义覆盖前定义**, 于是 3 个用例名存实亡(一个都不跑)。
+   已删掉重复块。教训: 同一文件的多处编辑别并行发, 改完立刻 grep 核对。
+2. **`TaskManager.shutdown()` 不等 worker 退出**: 测试里留下的 2 秒慢 worker
+   会在**下一个用例**里继续写库(DB 连接是模块级、被 monkeypatch 换过),
+   把错误写进下一个用例的任务里, 表现为"看门狗用例随机失败"。
+   新增 `shutdown(wait=True)` 并让测试 fixture 使用。
+   ⚠️ 生产默认仍是 `wait=False`(不阻塞服务退出), 别把测试的用法当成默认语义。
+3. **`album_title=id` 仍在开浏览器**: 文档说"不访问相册页", 代码却无条件抓取。
+   已改为 `id` 模式整个跳过相册页(media=auto 退回 `00001.mp4` 探测, 不漏视频)。
+
+## 7. 遗留
+
+- `album_meta` 每开一个任务拉起一次 Chromium, 启动成本约 2~4s。
+  做成常驻实例会更省, 但会引入生命周期/崩溃恢复问题, 暂不做
+- 视频**没有**尺寸档位(只有 `.mp4` 一条), 所以 `mirrors` 为空、`quality` 对它无意义
+- 相册页里 `var videos` 目前只用于"有没有视频"的布尔判断, **不**当权威资源清单
+  —— 序号枚举才是稳定路径

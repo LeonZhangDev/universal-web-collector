@@ -32,12 +32,12 @@ const collectors = ref(["generic"]);
 const collectorLabel = {
   generic: "通用网页(浏览器抓取)",
   xchina: "XChina 页面(浏览器抓取)",
-  xchina_gallery: "XChina 相册(相册 ID / 相册页 URL 均可)",
+  xchina_gallery: "XChina 图集/视频相册(相册 ID / 相册页 URL 均可)",
 };
 // 不同采集器对输入的要求不同, 提示语跟着切换
 const urlPlaceholder = computed(() =>
   collector.value === "xchina_gallery"
-    ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX/1.html) / 任意一张图片 URL 都行"
+    ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX.html) / 任意一张图片或视频 URL 都行"
     : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
 );
 const creating = ref(false);
@@ -61,6 +61,27 @@ const qualityLabel = {
   1200: "1200px WebP",
   800: "800px WebP",
   600: "600px WebP (最小)",
+};
+
+// ---- 图集媒体类型 / 输出目录命名(仅图集采集器有效) ----
+// 有的相册同时含图片和视频(实测 xchina 视频相册 = 12 张图 + 4 段 mp4),
+// 所以"采什么"要能选; auto 会先读相册页/探测一次, 再决定采哪些。
+const medias = ref(["auto", "image", "video", "both"]);
+const media = ref("auto");
+const mediaLabel = {
+  auto: "自动 (相册里有什么采什么)",
+  image: "仅图片",
+  video: "仅视频",
+  both: "图片 + 视频",
+};
+// 输出目录名: 相册页 <title> 就是相册名。默认去掉 " - 分类 - 站名" 的尾巴,
+// 想保留原样选"完整标题", 老行为选"图集 ID"。
+const albumTitles = ref(["clean", "full", "id"]);
+const albumTitle = ref("clean");
+const albumTitleLabel = {
+  clean: "相册名 (取 <title>, 去掉站点后缀)",
+  full: "完整 <title>",
+  id: "图集 ID",
 };
 
 // ---- 过滤条件 ----
@@ -127,6 +148,8 @@ function savePrefs() {
       JSON.stringify({
         downloadDir: downloadDir.value,
         quality: quality.value,
+        media: media.value,
+        albumTitle: albumTitle.value,
         selTypes: selTypes.value,
         exts: exts.value,
         excludeExts: excludeExts.value,
@@ -149,6 +172,10 @@ function loadPrefs() {
     const p = JSON.parse(raw);
     downloadDir.value = p.downloadDir || "";
     if (p.quality && qualities.value.includes(p.quality)) quality.value = p.quality;
+    if (p.media && medias.value.includes(p.media)) media.value = p.media;
+    if (p.albumTitle && albumTitles.value.includes(p.albumTitle)) {
+      albumTitle.value = p.albumTitle;
+    }
     selTypes.value = Array.isArray(p.selTypes) ? p.selTypes : [];
     exts.value = p.exts || "";
     excludeExts.value = p.excludeExts || "";
@@ -193,8 +220,10 @@ async function submit() {
     await createTask(url.value.trim(), collector.value, {
       download_dir: downloadDir.value || null,
       filters: Object.keys(f).length ? f : null,
-      // 画质档只对图集采集器有意义, 其他采集器不传, 免得塞无意义参数
+      // 画质/媒体/命名只对图集采集器有意义, 其他采集器不传, 免得塞无意义参数
       quality: isGallery.value ? quality.value : null,
+      media: isGallery.value ? media.value : null,
+      album_title: isGallery.value ? albumTitle.value : null,
     });
     url.value = "";
     savePrefs();
@@ -323,6 +352,8 @@ async function addWatch() {
       interval_minutes: Number(watchEvery.value) || 360,
       download_dir: downloadDir.value || null,
       quality: isGallery.value ? quality.value : null,
+      media: isGallery.value ? media.value : null,
+      album_title: isGallery.value ? albumTitle.value : null,
     });
     watchUrl.value = "";
     await loadWatches();
@@ -431,6 +462,18 @@ onMounted(async () => {
         quality.value = qualities.value[0];
       }
     }
+    if (Array.isArray(cfg.medias) && cfg.medias.length) {
+      medias.value = cfg.medias;
+      if (!medias.value.includes(media.value)) {
+        media.value = cfg.default_media || medias.value[0];
+      }
+    }
+    if (Array.isArray(cfg.album_titles) && cfg.album_titles.length) {
+      albumTitles.value = cfg.album_titles;
+      if (!albumTitles.value.includes(albumTitle.value)) {
+        albumTitle.value = cfg.default_album_title || albumTitles.value[0];
+      }
+    }
   } catch (e) {
     /* 后端不可达时用默认 */
   }
@@ -491,7 +534,27 @@ onUnmounted(() => {
           {{ qualityLabel[q] || q }}
         </option>
       </select>
-      <span class="tip">未选中的档位自动作为备用下载点</span>
+      <span class="tip">未选中的档位自动作为备用下载点; 视频只有一档</span>
+    </div>
+
+    <div class="dir-row" v-if="isGallery">
+      <span class="lbl">采集媒体</span>
+      <select v-model="media" @change="savePrefs">
+        <option v-for="m in medias" :key="m" :value="m">
+          {{ mediaLabel[m] || m }}
+        </option>
+      </select>
+      <span class="tip">有的相册同时含图片与视频; 自动 = 读相册页判断</span>
+    </div>
+
+    <div class="dir-row" v-if="isGallery">
+      <span class="lbl">目录命名</span>
+      <select v-model="albumTitle" @change="savePrefs">
+        <option v-for="a in albumTitles" :key="a" :value="a">
+          {{ albumTitleLabel[a] || a }}
+        </option>
+      </select>
+      <span class="tip">相册名取自相册页 &lt;title&gt;; 取不到时回退图集 ID</span>
     </div>
 
     <div class="filter-toggle">

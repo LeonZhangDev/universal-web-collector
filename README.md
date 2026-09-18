@@ -72,6 +72,9 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
   "url": "...", "collector": "generic",
   "download_dir": "D:\\my-out",
   "name_template": "{site}/{album}/{seq4}.{ext}",
+  "quality": "original",
+  "media": "auto",
+  "album_title": "clean",
   "incremental": true,
   "write_manifest": true,
   "filters": {
@@ -95,10 +98,22 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 `incremental: true` 时, 同一 URL 历史上已成功下载的资源直接复用磁盘文件,
 不再产生网络请求。
 
+只对图集类采集器(`xchina_gallery`)生效的三个选项:
+
+| 选项 | 取值 | 说明 |
+| --- | --- | --- |
+| `quality` | `original` / `1200` / `800` / `600` | 图片主 URL 用哪一档; 未选中的档位自动作 mirrors |
+| `media` | `auto` / `image` / `video` / `both` | 采哪些媒体; `auto` = 相册里有什么采什么 |
+| `album_title` | `clean` / `full` / `id` | 输出目录名取法: 相册页 `<title>` 去站名尾巴 / 完整标题 / 图集 ID |
+
+⚠️ 同一 gid 下图片与视频**可以同时存在**(实测 xchina `6a3654854fd25` 是
+12 张图 + 4 段 mp4, `00001.jpg` 与 `00001.mp4` 并存, 靠扩展名区分)。
+`auto` 会两者都采; 只要图片请显式传 `media=image`。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (149 用例)
+make test           # pytest (179 用例)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)

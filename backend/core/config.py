@@ -14,6 +14,12 @@ DEFAULT_ACCEPT = (
     "image/avif,image/webp,image/apng,*/*;q=0.8"
 )
 IMAGE_ACCEPT = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+# 视频资源用独立的 Accept: 声明接受 video/*, 同时保留 image/* ——
+# 有些站点把视频封面与视频放在同一目录, 用同一套头最省心。
+# ⚠️ 实测 img.xchina.io 的 .mp4 对**任何** Accept(含不带 Accept)都返回 206 video/mp4,
+#    即"Accept 白名单"在该站只约束部分路径; 保留独立常量是为了对其它站点正确,
+#    不要据此推断"Accept 无关紧要"。
+VIDEO_ACCEPT = "video/mp4,video/webm,video/*;q=0.9,image/*;q=0.8,*/*;q=0.5"
 
 
 @dataclass

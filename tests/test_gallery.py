@@ -337,38 +337,3 @@ def test_filename_drops_tag_when_falling_back_to_original():
                             session=Sess(), min_interval=0, max_interval=0))
     assert items[0]["filename"] == "gid/00001.jpg"
 
-
-# ---- 建议文件名: 画质标记 ----
-#
-# 曾经落盘成 `00001_.jpg.jpg`: 判断"是否最高画质档"时拿**变体后缀**(".jpg")
-# 去和**画质档名**("original")比, 永不相等, 于是原图也被贴上标记, 再拼上
-# 从 URL 取来的扩展名就成了双后缀。
-
-
-def test_filename_has_no_double_extension():
-    items = list(G.discover(XCHINA, "gid", max_count=1, session=_ok_session(),
-                            min_interval=0, max_interval=0))
-    assert items[0]["filename"] == "gid/00001.jpg"
-
-
-def test_filename_marks_non_top_quality():
-    items = list(G.discover(XCHINA, "gid", quality="1200", max_count=1,
-                            session=_ok_session(), min_interval=0,
-                            max_interval=0))
-    assert items[0]["filename"] == "gid/00001_1200.webp"
-
-
-def test_filename_drops_tag_when_falling_back_to_original():
-    """1200 档缺失回退原图时, 文件名也不该带 1200 标记(内容其实是原图)。"""
-
-    class Sess:
-        def head(self, url, **kw):
-            ctype = "image/jpeg" if url.endswith(".jpg") else "text/html"
-            return type("R", (), {
-                "status_code": 200,
-                "headers": {"Content-Type": ctype, "Content-Length": "10"},
-            })()
-
-    items = list(G.discover(XCHINA, "gid", quality="1200", max_count=1,
-                            session=Sess(), min_interval=0, max_interval=0))
-    assert items[0]["filename"] == "gid/00001.jpg"

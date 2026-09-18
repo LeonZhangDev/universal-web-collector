@@ -37,8 +37,12 @@ def env(tmp_path, tmp_db, monkeypatch):
             return m
 
         def shutdown(self):
+            # wait=True 是必须的: 本文件里有个用例故意让采集器 sleep 2 秒,
+            # 不等它跑完, 它就会在**下一个用例**里继续写库(DB 连接是模块级、
+            # 被 monkeypatch 换过的), 把错误写进下一个用例的任务里 ——
+            # 表现为"看门狗用例随机失败", 曾真的坑过一次。
             for m in self.created:
-                m.shutdown()
+                m.shutdown(wait=True)
 
     monkeypatch.setattr(tm, "DOWNLOADS_DIR", tmp_path / "dl")
     e = Env()

@@ -11,7 +11,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from collectors import COLLECTORS
-from collectors.gallery_base import QUALITY_KEYS
+from collectors.gallery_base import (
+    ALBUM_TITLE_MODES,
+    DEFAULT_ALBUM_TITLE,
+    DEFAULT_MEDIA,
+    MEDIA_KEYS,
+    QUALITY_KEYS,
+)
 from core import database as db
 from core import events
 from core.config import settings
@@ -88,6 +94,21 @@ def create(payload: TaskCreateIn):
                 detail=f"quality 非法: {payload.quality}. 可选: {', '.join(QUALITY_KEYS)}",
             )
         options["quality"] = payload.quality
+    if payload.media:
+        if payload.media not in MEDIA_KEYS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"media 非法: {payload.media}. 可选: {', '.join(MEDIA_KEYS)}",
+            )
+        options["media"] = payload.media
+    if payload.album_title:
+        if payload.album_title not in ALBUM_TITLE_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"album_title 非法: {payload.album_title}. "
+                       f"可选: {', '.join(ALBUM_TITLE_MODES)}",
+            )
+        options["album_title"] = payload.album_title
 
     task_id = db.create_task(payload.url, payload.collector, download_dir, options)
     task_manager.submit(task_id)
@@ -101,11 +122,15 @@ def list_collectors():
 
 @router.get("/config")
 def get_config():
-    """前端初始化用: 默认下载目录 + 资源类型 + 图集画质档。"""
+    """前端初始化用: 默认下载目录 + 资源类型 + 图集画质档/媒体/命名方式。"""
     return {
         "download_dir": str(settings.download_dir),
         "resource_types": sorted(DOWNLOADERS.keys()),
         "qualities": list(QUALITY_KEYS),
+        "medias": list(MEDIA_KEYS),
+        "default_media": DEFAULT_MEDIA,
+        "album_titles": list(ALBUM_TITLE_MODES),
+        "default_album_title": DEFAULT_ALBUM_TITLE,
     }
 
 
@@ -331,6 +356,8 @@ class WatchIn(BaseModel):
     interval_minutes: int = 360
     download_dir: Optional[str] = None
     quality: Optional[str] = None
+    media: Optional[str] = None
+    album_title: Optional[str] = None
     run_now: bool = True
 
 
@@ -352,6 +379,21 @@ def create_watch(payload: WatchIn):
                 detail=f"quality 非法: {payload.quality}. 可选: {', '.join(QUALITY_KEYS)}",
             )
         options["quality"] = payload.quality
+    if payload.media:
+        if payload.media not in MEDIA_KEYS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"media 非法: {payload.media}. 可选: {', '.join(MEDIA_KEYS)}",
+            )
+        options["media"] = payload.media
+    if payload.album_title:
+        if payload.album_title not in ALBUM_TITLE_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"album_title 非法: {payload.album_title}. "
+                       f"可选: {', '.join(ALBUM_TITLE_MODES)}",
+            )
+        options["album_title"] = payload.album_title
     download_dir = _validate_download_dir(payload.download_dir)
     if download_dir:
         options["download_dir"] = download_dir

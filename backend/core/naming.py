@@ -94,6 +94,18 @@ def _clean_segment(seg):
     return seg[:120]
 
 
+def clean_segment(seg):
+    """公开版 `_clean_segment`: 把任意文本清洗成单个安全的路径段。
+
+    采集器想用「相册标题」这类站点文本做目录名时调用它 —— 标题里可能带
+    `/` `:` `?` 等字符, 不先清洗就会多出一层目录或直接拼出非法路径。
+    返回空串表示清洗后没有可用内容, 调用方应回退到别的命名方案。
+    """
+    if not seg or not isinstance(seg, str):
+        return ""
+    return _clean_segment(seg)
+
+
 def safe_relative(path_str):
     """把一个相对路径字符串清洗成安全的相对路径(统一用 / 分隔)。
 

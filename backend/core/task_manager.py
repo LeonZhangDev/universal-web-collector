@@ -341,11 +341,21 @@ class TaskManager:
         except Exception:
             pass
 
-    def shutdown(self):
+    def shutdown(self, wait=False):
+        """停掉后台线程。
+
+        `wait=True` 会**等所有 worker 真正退出**才返回。测试与脚本必须用它 ——
+        否则上个用例里没跑完的 worker 会继续在**下一个用例**里写库(测试的 DB
+        连接是模块级、可被 monkeypatch 替换的), 症状是"别的用例的任务被写进
+        莫名其妙的错误信息", 表现为随机失败, 极难定位。
+        """
         self._watchdog_stop.set()
         # 退出登记: 本实例不再持有任何任务, 它留下的活动任务应可被回收
         _unregister_manager(self)
         self._scheduler_stop.set()
+        if wait:
+            self._executor.shutdown(wait=True)
+            self._download_executor.shutdown(wait=True)
 
     # ---- 任务配置辅助 ----
 
@@ -382,12 +392,16 @@ class TaskManager:
         之所以把任务级模板放在最前: 它是用户这一次显式指定的意愿, 应当压过
         采集器的默认习惯; 而采集器建议又压过全局默认 `{name}`
         —— 谁了解这个站点, 谁说的算。
+
+        `{album}` 的取值顺序: 资源自带的相册名(采集器查到的相册标题) >
+        options.album(用户显式指定) > 站点标识(见 naming.build_context)。
         """
         opts = self._options(task_id)
+        # _row_field 同时兼容采集器内存字典与 sqlite3.Row
+        album = self._row_field(r, "album") or opts.get("album")
         template = opts.get("name_template")
         if template:
-            ctx = build_context(task_id, r["url"], r["type"], seq,
-                                album=opts.get("album"))
+            ctx = build_context(task_id, r["url"], r["type"], seq, album=album)
             return render(template, ctx, r["url"], r["type"])
         if suggested:
             # 采集器给的相对路径同样要过一遍安全清洗, 防止 URL 里的奇怪字符
@@ -395,8 +409,7 @@ class TaskManager:
             cleaned = safe_relative(suggested)
             if cleaned:
                 return cleaned
-        ctx = build_context(task_id, r["url"], r["type"], seq,
-                            album=opts.get("album"))
+        ctx = build_context(task_id, r["url"], r["type"], seq, album=album)
         return render(getattr(settings, "name_template", "") or "{name}",
                       ctx, r["url"], r["type"])
 

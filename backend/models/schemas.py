@@ -50,6 +50,10 @@ class TaskCreateIn(BaseModel):
     download_dir: Optional[str] = None  # 自定义输出目录(绝对路径), 留空用全局默认
     filters: Optional[FilterIn] = None
     quality: Optional[str] = None  # 图集采集器画质档: original / 1200 / 800 / 600
+    # 图集采集器采哪些媒体: auto(相册里有什么采什么) / image / video / both
+    media: Optional[str] = None
+    # 输出目录名的取值: clean(去掉站点尾巴的 <title>) / full(完整标题) / id(图集 ID)
+    album_title: Optional[str] = None
 
 
 class TaskCreateOut(BaseModel):

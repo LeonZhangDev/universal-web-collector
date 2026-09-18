@@ -21,10 +21,11 @@ core/naming.py                    命名模板（含 .. 整体拒绝）
 core/manifest.py                  产出清单（取消/部分失败也写）
 core/sessions.py                  headful 登录 + 周期快照 storage_state
 core/ffmpeg.py                    ffmpeg 定位（不依赖 PATH）
-collectors/gallery_base.py        SequenceGallerySpider + GallerySite（序号枚举型图集站基类）
+collectors/gallery_base.py        SequenceGallerySpider + GallerySite + MediaType（序号枚举型图集站基类）
+collectors/album_meta.py          相册页 <title> / var videos（headless Chromium，带 TTL 缓存）
 downloaders/ratelimit.py          站点级并发+间隔
 scripts/verify_output.py / verify_hls.py   两个验证台（33 / 18 项断言）
-tests/                            19 个文件，149 个用例
+tests/                            18 个文件，179 个用例
 ```
 
 ## 状态机
@@ -124,6 +125,34 @@ URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含
 采集器给 `mirrors` → `resources.mirrors`(JSON) → `download_with_mirrors`。
 主 URL 失败依次切换；切换时清半成品且**不续传**（不同 URL 内容不能拼接），并按新扩展名改名
 （`_swap_ext`）。**`require_image=True` 必开**，否则越界 URL(200+html) 会被当图存下来且永不触发切换。
+
+## 多媒体枚举（图片 + 视频）与相册标题命名
+同一个 gid 下**图片与视频并存**（xchina `6a3654854fd25` = 12 图 + 4 mp4，
+`00001.jpg` 与 `00001.mp4` 同名不同后缀）。`GallerySite.video_variants` 非空即声明有视频；
+`MediaType.ctype_prefix`（`image/` vs `video/`）决定存在性判定。
+`options.media`：`auto`(默认)/`image`/`video`/`both`；auto **两条线索都问**
+（相册页 `var videos` + 探一次 `00001.mp4`），只信页面会静默漏采。
+⚠️ `.mp4` 对任何 Accept（含不带头）都返回 206，别据此推断别的路径。
+`options.album_title`：`clean`/`full`/`id`，**`id` = 完全不开浏览器**。
+目录名 = `<title>` 截掉 `" - 分类 - 站名"`，取不到回退 gid（**绝不让任务失败**）。
+
+⚠️ 相册页 `xchina.co` 是 Cloudflare 挑战页，三个坑：
+1. 首次返回 `<title>Just a moment...</title>`，几秒后自动跳真实页 → 必须轮询；
+2. **不能** `wait_for_function`（挑战靠一次导航完成，导航销毁执行上下文，Promise 永不
+   resolve），也**不能**按标题判就绪（8s 时标题是 `Loading <url>`，`content()` 紧接着抛
+   异常）→ 只能轮询 `page.content()`，看正文有无 `photo-items`/`hero-title-item`/
+   `var videos`/`objId` 标记；
+3. **先匿名、失败再带登录态**：陈旧的 `cf_clearance` 会让 CF 直接回
+   `Attention Required!`（永久拒绝），匿名反而能过 —— 与 `collectors/browser.py` 相反。
+
+## 测试隔离
+`TaskManager.shutdown(wait=True)`：测试/脚本必须等 worker 真退出，否则上个用例没跑完的
+worker 会在**下一个用例**里继续写库（DB 连接是模块级、被 monkeypatch 换过），把错误写进
+下一个用例的任务 → 表现为随机失败。生产默认仍 `wait=False`。
+⚠️ 同一文件多处 Edit **别并行发**，改完立刻 grep 核对：真的会静默丢改动，且曾造成
+`tests/test_gallery.py` 里 3 个用例被完整粘贴两遍、后定义覆盖前定义而"名存实亡"。
+⚠️ 沙箱 safe-delete shim 在同一 turn 累计删除 >50 次后拒绝删除，会让删除类用例报
+`SystemExit` **假失败**；绕过：`PYTHONPATH= python -m pytest ...`。
 
 ## 接入新站点
 新建 `collectors/<site>/spider.py` → `@register("<name>")` → 在 `collectors/__init__.py` import。

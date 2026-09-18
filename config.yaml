@@ -1,0 +1,82 @@
+# 配置文件管理: 所有路径支持绝对/相对(相对项目根目录), 环境变量 UWC_* 优先生效
+host: 0.0.0.0
+port: 8000
+db_path: data/collector.db
+download_dir: downloads
+browser_state_dir: browser_state
+max_task_workers: 2
+max_download_workers: 4
+image_retries: 3
+video_retries: 3
+request_timeout: 30
+
+# 任务健壮性: 无进度超时(秒)后看门狗取消任务 / 看门狗巡检间隔(秒)
+stale_task_timeout: 900
+watchdog_interval: 30
+
+# 限速: 单域名最大并发请求数 / 请求间隔(秒)
+# domain_max_interval > domain_min_interval 时, 每次请求前在区间内随机等待,
+# 模拟人工浏览节奏(3~10 秒一张)。想回到固定间隔, 把 max 设为 0 即可。
+#
+# concurrency 与间隔是两个正交的闸门, 不要混为一谈:
+#   * 间隔闸门(DomainLimiter._last)是**全局串行**的, 决定"每 N 秒发起一个请求";
+#   * 并发闸门(semaphore)只限制"同时有多少请求在途", 不影响发起节奏。
+# 实测(2026-09-17, 并发=3/间隔=0.5s/每次耗时 2s): 6 个请求发起于
+# 0/0.53/0.53/0.53/0.53s 间隔, 节奏与并发=1 时完全一致。
+# 反过来, 当单个下载耗时 > 间隔时, concurrency=1 会让后续请求阻塞在闸门上空等,
+# 实际节奏被拖长(视频/m3u8 分片尤其明显)。故此处取 3 而非 1。
+domain_concurrency: 3
+domain_min_interval: 3
+domain_max_interval: 10
+
+# 主下载点失败后自动切到备用下载点(同一资源的多个尺寸/CDN 变体)
+mirror_fallback: true
+
+# 枚举探测(HEAD)的间隔(秒)。探测是轻量请求, 不套用上面的下载节奏,
+# 否则光枚举一个 56 张的相册就要几分钟。
+probe_interval: 0.3
+
+# m3u8 分片下载: 分片是同一段视频的连续片段, 走独立的快节奏, 不套用上面的图片
+# 慢速间隔(否则 100 片 x 6.5s ≈ 11 分钟)。仍保留节流, 避免被 WAF 判为异常。
+# segment_concurrency 同时也是分片并发数; segment_retries 是单个分片的重试次数。
+segment_concurrency: 4
+segment_min_interval: 0.15
+segment_max_interval: 0.35
+segment_retries: 3
+
+# 视频引擎:
+#   auto    探测到 ffmpeg 就交给它拉流, 失败自动降级内置分片下载器(默认)
+#   ffmpeg  强制 ffmpeg, 失败直接报错、不降级(避免误以为走了 ffmpeg)
+#   builtin 强制内置分片器下载分片; 若 ffmpeg 可用, 合并后仍会 remux 成 mp4
+# ⚠️ ffmpeg 拉流时请求由 ffmpeg 自己发出 —— 上面的 domain_* 限速不参与,
+#    mirrors 也不会轮换。对限速/镜像敏感的站点请用 builtin。
+video_engine: auto
+
+# ffmpeg 可执行文件路径。留空则自动探测:
+#   显式配置 -> PATH -> 常见安装位置(winget / scoop / choco / 手工解压目录)
+# 之所以不只用 PATH: PATH 是进程启动时的快照, 服务运行期间新装的 ffmpeg
+# 读不到(实测 2026-09-18: winget 装好后 shutil.which("ffmpeg") 仍返回 None)。
+# 环境变量 UWC_FFMPEG 覆盖。
+ffmpeg_path: null
+
+# 代理: http://host:port 或 socks5://host:port, 空/null 禁用; 环境变量 UWC_PROXY 覆盖
+proxy: null
+
+# ---- 产出物组织 ----
+
+# 文件命名模板(可用变量见 backend/core/naming.py 文档)。
+# 默认 {name} = URL 末段, 全部平铺在任务目录下 —— 与历史行为一致。
+# 想按站点/相册分目录就放开下面这一行:
+# name_template: "{album}/{name}"
+# 也支持 {task_id} {site} {host} {seq} {seq4} {type} {stem} {ext} {date}
+name_template: "{name}"
+
+# 任务结束时在输出目录写 manifest.json: 每个文件的来源 URL、实际下载的
+# 镜像 URL、sha256、字节数、Content-Type、过滤/失败原因。
+# 想知道"这个文件原来在哪 / 是不是完整 / 为什么没下载", 靠的就是它。
+write_manifest: true
+
+# 订阅巡检: 调度线程每隔多久检查一次到期的订阅源(秒)。
+# 这只是检查频率的下限 —— 真正的采集节奏由每个订阅自己的 interval_minutes 决定。
+watch_interval: 60
+

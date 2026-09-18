@@ -1,0 +1,466 @@
+import io
+import json
+import queue
+import zipfile
+from pathlib import Path
+from typing import Optional
+from urllib.parse import quote
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+
+from collectors import COLLECTORS
+from collectors.gallery_base import QUALITY_KEYS
+from core import database as db
+from core import events
+from core.config import settings
+from core.filters import parse_size
+from core.manifest import read_manifest
+from core.task_manager import DOWNLOADERS, task_base_dir, task_manager
+from models.schemas import ResourceOut, TaskCreateIn, TaskCreateOut, TaskDetail, TaskOut
+
+router = APIRouter()
+
+
+def _file_url(task, local_path):
+    """把本地路径转成 /files/{task_id}/... 的可访问 URL。
+
+    路径不在该任务下载根目录内时返回 None(例如 hash 去重复用了别的目录的文件)。
+    """
+    if not local_path:
+        return None
+    try:
+        base = task_base_dir(task).resolve()
+        rel = Path(local_path).resolve().relative_to(base)
+    except (ValueError, OSError):
+        return None
+    return f"/files/{task['id']}/" + quote(str(rel).replace("\\", "/"))
+
+
+def _resource_out(r, task):
+    d = dict(r)
+    d["file_url"] = _file_url(task, d.get("local_path"))
+    return d
+
+
+def _validate_download_dir(value):
+    """校验自定义下载目录。空值返回 None(回退全局默认)。"""
+    if not value or not value.strip():
+        return None
+    p = Path(value.strip())
+    if not p.is_absolute():
+        raise HTTPException(status_code=400, detail="下载目录必须是绝对路径")
+    if any(part == ".." for part in p.parts):
+        raise HTTPException(status_code=400, detail="下载目录不允许包含 '..'")
+    if len(p.parts) <= 1:
+        raise HTTPException(status_code=400, detail="不允许把盘符根目录作为下载目录")
+    return str(p)
+
+
+@router.post("/tasks/create", response_model=TaskCreateOut)
+def create(payload: TaskCreateIn):
+    if payload.collector not in COLLECTORS:
+        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
+    download_dir = _validate_download_dir(payload.download_dir)
+
+    # options 平铺: 过滤条件与采集器参数同层存放, Filters 只读它认识的键
+    options = {}
+    if payload.filters:
+        options = payload.filters.model_dump(exclude_none=True)
+        for key in ("min_size", "max_size"):
+            v = options.get(key)
+            if v is not None and parse_size(v) is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} 格式非法: {v}. 示例: 500KB / 2MB / 1048576",
+                )
+    if payload.quality:
+        if payload.quality not in QUALITY_KEYS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"quality 非法: {payload.quality}. 可选: {', '.join(QUALITY_KEYS)}",
+            )
+        options["quality"] = payload.quality
+
+    task_id = db.create_task(payload.url, payload.collector, download_dir, options)
+    task_manager.submit(task_id)
+    return TaskCreateOut(task_id=task_id, status="pending")
+
+
+@router.get("/collectors")
+def list_collectors():
+    return [{"name": n} for n in sorted(COLLECTORS)]
+
+
+@router.get("/config")
+def get_config():
+    """前端初始化用: 默认下载目录 + 资源类型 + 图集画质档。"""
+    return {
+        "download_dir": str(settings.download_dir),
+        "resource_types": sorted(DOWNLOADERS.keys()),
+        "qualities": list(QUALITY_KEYS),
+    }
+
+
+@router.get("/tasks", response_model=list[TaskOut])
+def list_tasks():
+    return [dict(t) for t in db.list_tasks()]
+
+
+@router.get("/tasks/{task_id}", response_model=TaskDetail)
+def get_task(task_id: int):
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    resources = [_resource_out(r, task) for r in db.get_resources(task_id)]
+    return TaskDetail(**dict(task), resources=resources)
+
+
+@router.get("/tasks/{task_id}/logs")
+def get_logs(task_id: int):
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    return [dict(l) for l in db.get_logs(task_id)]
+
+
+@router.post("/tasks/{task_id}/retry", response_model=TaskOut)
+def retry(task_id: int):
+    ok, err = task_manager.retry(task_id)
+    if ok is None:
+        raise HTTPException(status_code=404, detail=err)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    return dict(db.get_task(task_id))
+
+
+@router.post("/tasks/{task_id}/cancel", response_model=TaskOut)
+def cancel_task(task_id: int):
+    """停止任务但保留已下载的文件与任务记录。
+
+    与 DELETE 的区别就在这里: 删除是"没下过", 取消是"下到一半我不想要了"。
+    已经跑完的任务再点停止没有意义, 返回 409 而不是把它改成 cancelled
+    —— 那样会把成功的结果伪装成没做完。
+    """
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    ok, err = task_manager.cancel(task_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail=err)
+    return dict(db.get_task(task_id))
+
+
+@router.delete("/tasks/{task_id}")
+def delete_task(task_id: int):
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    task_manager.delete(task_id)
+    return {"deleted": task_id}
+
+
+@router.post("/tasks/{task_id}/resources/{resource_id}/retry", response_model=ResourceOut)
+def retry_resource(task_id: int, resource_id: int):
+    ok, err = task_manager.submit_resource(task_id, resource_id)
+    if ok is None:
+        raise HTTPException(status_code=404, detail=err)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    task = db.get_task(task_id)
+    return _resource_out(db.get_resource(resource_id), task)
+
+
+# ---- 目录选择 ----
+
+@router.get("/fs/browse")
+def browse_fs(path: str = None):
+    """列出本机目录(仅子目录), 供前端目录选择器使用。
+
+    默认从用户主目录开始。无权限或已断链的条目直接跳过, 不让整个列表失败。
+    """
+    target = Path(path) if path else Path.home()
+    try:
+        target = target.resolve()
+    except OSError:
+        raise HTTPException(status_code=400, detail=f"无法解析路径: {path}")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"路径不存在: {target}")
+    if not target.is_dir():
+        target = target.parent
+
+    try:
+        children = sorted(target.iterdir(), key=lambda p: p.name.lower())
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"没有访问权限: {target}")
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"无法读取目录: {e}")
+
+    entries = []
+    for child in children:
+        try:
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+        except OSError:
+            continue
+        entries.append({"name": child.name, "path": str(child)})
+
+    parent = target.parent
+    return {
+        "cwd": str(target),
+        "parent": str(parent) if parent != target else None,
+        "entries": entries,
+    }
+
+
+class MkdirIn(BaseModel):
+    parent: str
+    name: str
+
+
+@router.post("/fs/mkdir")
+def mkdir_fs(payload: MkdirIn):
+    """在选择器里新建文件夹。"""
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="文件夹名不能为空")
+    if any(c in name for c in '\\/:*?"<>|'):
+        raise HTTPException(status_code=400, detail=f"文件夹名含非法字符: {name}")
+    base = Path(payload.parent)
+    if not base.is_absolute():
+        raise HTTPException(status_code=400, detail="父目录必须是绝对路径")
+    if any(part == ".." for part in base.parts):
+        raise HTTPException(status_code=400, detail="路径不允许包含 '..'")
+    target = base / name
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"创建失败: {e}")
+    return {"path": str(target)}
+
+
+# ---- 订阅巡检 ----
+
+class WatchIn(BaseModel):
+    url: str
+    collector: str = "generic"
+    interval_minutes: int = 360
+    download_dir: Optional[str] = None
+    quality: Optional[str] = None
+    run_now: bool = True
+
+
+@router.post("/watches")
+def create_watch(payload: WatchIn):
+    """订阅一个 URL, 之后按周期巡检并只补新出现的资源。
+
+    巡检任务内部**强制增量**: 复用历史已下载的内容, 不再重复传输。
+    """
+    if payload.collector not in COLLECTORS:
+        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
+    if payload.interval_minutes < 1:
+        raise HTTPException(status_code=400, detail="interval_minutes 至少为 1")
+    options = {}
+    if payload.quality:
+        if payload.quality not in QUALITY_KEYS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"quality 非法: {payload.quality}. 可选: {', '.join(QUALITY_KEYS)}",
+            )
+        options["quality"] = payload.quality
+    download_dir = _validate_download_dir(payload.download_dir)
+    if download_dir:
+        options["download_dir"] = download_dir
+    wid = db.create_watch(
+        payload.url, payload.collector, payload.interval_minutes, options,
+        run_now=payload.run_now,
+    )
+    return dict(db.get_watch(wid))
+
+
+@router.get("/watches")
+def list_watches_api():
+    return [dict(w) for w in db.list_watches()]
+
+
+@router.post("/watches/{watch_id}/run")
+def run_watch(watch_id: int):
+    """手动跑一次(不等周期)。"""
+    task_id = task_manager.run_watch(watch_id)
+    if not task_id:
+        raise HTTPException(
+            status_code=404, detail="watch not found or already claimed"
+        )
+    return {"task_id": task_id}
+
+
+@router.post("/watches/{watch_id}/toggle")
+def toggle_watch(watch_id: int):
+    w = db.get_watch(watch_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="watch not found")
+    enabled = not bool(w["enabled"])
+    db.set_watch_enabled(watch_id, enabled)
+    return dict(db.get_watch(watch_id))
+
+
+@router.delete("/watches/{watch_id}")
+def remove_watch(watch_id: int):
+    if not db.delete_watch(watch_id):
+        raise HTTPException(status_code=404, detail="watch not found")
+    return {"deleted": watch_id}
+
+
+# ---- 文件服务 ----
+
+@router.get("/files/{task_id}/manifest")
+def task_manifest(task_id: int):
+    """读取任务产出清单, 供前端展示"原来在哪/是否完整/为什么没下载"。"""
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    data = read_manifest(task_base_dir(task) / str(task_id))
+    if data is None:
+        raise HTTPException(status_code=404, detail="manifest not found")
+    return data
+
+
+@router.post("/tasks/{task_id}/archive")
+def archive_task(task_id: int, only: str = "done"):
+    """把任务产出打包成 zip 下载。
+
+    only: done / all —— 默认只打包成功下载的, 失败与过滤项通常不值得打包。
+    打包前重新核对每个文件是否仍在 disk 上: 用户可能手工删过几个。
+    """
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    base = task_base_dir(task).resolve()
+    rows = [dict(r) for r in db.get_resources(task_id)]
+    items = []
+    for r in rows:
+        if only == "done" and r["status"] != "done":
+            continue
+        path = _resolve_safely(base, r.get("local_path"))
+        if path:
+            items.append((r, path))
+    if not items:
+        raise HTTPException(status_code=404, detail="no downloadable file in this task")
+    return StreamingResponse(
+        _zip_stream(base, items, task_id),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="task-{task_id}.zip"',
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _resolve_safely(base, local_path):
+    """把 DB 里的绝对路径还原成任务目录内的真实文件, 不存在或越界返回 None。"""
+    if not local_path:
+        return None
+    try:
+        p = Path(local_path).resolve()
+    except OSError:
+        return None
+    if not p.is_file() or not p.is_relative_to(base):
+        return None
+    return p
+
+
+def _dedup_name(name, counter):
+    """同名文件去重: 不同子目录里的 a.jpg 进同一个包会互相覆盖 -> a (1).jpg。"""
+    if name not in counter:
+        counter[name] = 0
+        return name
+    counter[name] += 1
+    root, dot, ext = name.rpartition(".")
+    head = root if dot else name
+    tail = f".{ext}" if dot else ""
+    return f"{head} ({counter[name]}){tail}"
+
+
+def _zip_stream(base, items):
+    """边打包边吐数据的生成器, 不把整个压缩包攒在内存里。
+
+    图片/视频本身已经是压缩过的媒体, deflate 几乎压不动却要吃掉不少 CPU,
+    所以这里用 ZIP_STORED(仅归档, 不再压缩)。
+    """
+
+    class _Sink(io.RawIOBase):
+        """收集 zipfile 写出的字节, 取走后清空(缓冲区不膨胀)。"""
+
+        def __init__(self):
+            self.pending = []
+
+        def writable(self):
+            return True
+
+        def write(self, b):
+            data = bytes(b)
+            self.pending.append(data)
+            return len(data)
+
+        def take(self):
+            if not self.pending:
+                return b""
+            out = b"".join(self.pending)
+            self.pending.clear()
+            return out
+
+    sink = _Sink()
+    counter = {}
+    # zipfile 对不可 seek 的 fileobj 会自动走流式路径(self._seekable=False)
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
+        for _, path in items:
+            zf.write(path, arcname=_dedup_name(path.relative_to(base).as_posix(), counter))
+            chunk = sink.take()
+            if chunk:
+                yield chunk
+    # 退出 with 时写出的是 central directory, 必须一并吐出去
+    tail = sink.take()
+    if tail:
+        yield tail
+
+
+@router.get("/files/{task_id}/{file_path:path}")
+def serve_file(task_id: int, file_path: str):
+    """按任务访问已下载文件。
+
+    相比直接 mount 整个 downloads 目录, 这里把访问范围限制在该任务自己的
+    下载根目录内, 避免跨任务/跨目录读取。
+    """
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    base = task_base_dir(task).resolve()
+    try:
+        full = (base / file_path).resolve()
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not full.is_relative_to(base):
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(full)
+
+
+@router.get("/events")
+def sse_events():
+    q = events.subscribe()
+
+    def gen():
+        try:
+            while True:
+                try:
+                    name, data = q.get(timeout=15)
+                    yield f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            events.unsubscribe(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

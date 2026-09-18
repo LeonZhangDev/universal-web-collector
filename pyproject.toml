@@ -1,0 +1,15 @@
+[project]
+name="universal-web-collector"
+version="0.10.0"
+requires-python=">=3.11"
+dependencies=[
+"fastapi",
+"uvicorn",
+"playwright",
+"requests",
+"pydantic",
+"pyyaml"
+]
+
+[dependency-groups]
+dev=["pytest"]

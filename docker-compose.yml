@@ -1,0 +1,11 @@
+services:
+  collector:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - collector-data:/data
+    restart: unless-stopped
+
+volumes:
+  collector-data:

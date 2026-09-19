@@ -37,6 +37,8 @@ class TaskStatus:
     PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # 暂停: 任务被用户主动停下, 但已下载的文件与资源记录全部保留, 可 resume 续跑
+    PAUSED = "paused"
 
 
 ACTIVE_STATES = (
@@ -48,19 +50,23 @@ ACTIVE_STATES = (
 
 # 合法状态迁移表; retry: partial/failed/cancelled -> pending
 TRANSITIONS = {
-    TaskStatus.PENDING: {TaskStatus.RUNNING, TaskStatus.CANCELLED},
-    TaskStatus.RUNNING: {TaskStatus.EXTRACTING, TaskStatus.FAILED, TaskStatus.CANCELLED},
-    TaskStatus.EXTRACTING: {TaskStatus.DOWNLOADING, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.PENDING: {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.PAUSED},
+    TaskStatus.RUNNING: {TaskStatus.EXTRACTING, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSED},
+    TaskStatus.EXTRACTING: {TaskStatus.DOWNLOADING, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSED},
     TaskStatus.DOWNLOADING: {
         TaskStatus.SUCCESS,
         TaskStatus.PARTIAL,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
+        TaskStatus.PAUSED,
     },
     TaskStatus.SUCCESS: set(),
     TaskStatus.PARTIAL: {TaskStatus.PENDING},
     TaskStatus.FAILED: {TaskStatus.PENDING},
     TaskStatus.CANCELLED: {TaskStatus.PENDING},
+    # 暂停: 不是失败, 也不丢任何文件。保留资源与已下好的文件, 之后可 resume
+    # 从 PENDING 续跑。只有终态/取消态才能进 paused, 避免对已完成任务误操作。
+    TaskStatus.PAUSED: {TaskStatus.PENDING},
 }
 
 DOWNLOADERS = {
@@ -155,11 +161,11 @@ class TaskManager:
 
     # ---- 对外接口 ----
 
-    def submit(self, task_id):
+    def submit(self, task_id, resume=False):
         entry = {"future": None, "cancel": threading.Event(), "hb": time.monotonic()}
         with self._active_lock:
             self._active[task_id] = entry
-        entry["future"] = self._executor.submit(self._run, task_id)
+        entry["future"] = self._executor.submit(self._run, task_id, resume)
 
     def retry(self, task_id):
         task = db.get_task(task_id)
@@ -205,6 +211,57 @@ class TaskManager:
             self._safe_log(task_id, "task cancelled", "warn")
             self._publish_task(task_id)
         return ok, None
+
+    def pause(self, task_id):
+        """暂停: 停下 worker, 但**保留已下载的文件与资源记录**。
+
+        与 cancel 的区别: cancel 是"不要了"(状态 cancelled); pause 是"先停一下"
+        (状态 paused), 之后 resume 能从断点接着下, 已下好的不浪费。
+        实现上先置取消标志让 worker 在下一个资源边界退出, 再把状态标成 paused
+        —— 复用 cancel 的退出路径, 只是落点不同。
+        """
+        task = db.get_task(task_id)
+        if not task:
+            return None, "task not found"
+        if task["status"] not in ACTIVE_STATES:
+            return False, f"cannot pause task in status {task['status']}"
+
+        entry = self._entry(task_id)
+        if entry:
+            entry["cancel"].set()
+            if entry["future"] is not None and entry["future"].cancel():
+                with self._active_lock:
+                    self._active.pop(task_id, None)
+        ok = db.transition_task_from_any(task_id, TaskStatus.PAUSED, ACTIVE_STATES)
+        if ok:
+            self._safe_log(task_id, "task paused", "warn")
+            self._publish_task(task_id)
+        return ok, None
+
+    def resume(self, task_id):
+        """续跑: 把未完成(pending/failed/skipped)的资源标回待下载, 从断点接着下。
+
+        已 done 的资源不动; 已 filtered 的资源也不动(规则明确不要的)。
+        不再重新采集 —— 直接复用上次枚举出来的资源清单(_run 走 resume 分支),
+        这样暂停期间下好的文件全部保留, 只补下缺失的那部分。
+        """
+        task = db.get_task(task_id)
+        if not task:
+            return None, "task not found"
+        if task["status"] != TaskStatus.PAUSED:
+            return False, f"can only resume a paused task, current={task['status']}"
+
+        # 把被暂停打断的资源(downloading/skipped)与之前失败的标回 pending
+        for r in db.get_resources(task_id):
+            if r["status"] in ("pending", "failed", "skipped", "downloading"):
+                db.update_resource(r["id"], status="pending", note=None)
+        db.update_task(task_id, error=None, progress=0)
+        if not db.transition_task(task_id, TaskStatus.PENDING, TaskStatus.PAUSED):
+            return False, "task state changed concurrently"
+        self._safe_log(task_id, "resume from pause")
+        self.submit(task_id, resume=True)
+        self._publish_task(task_id)
+        return True, None
 
     def delete(self, task_id, with_files=False):
         """删除任务, 返回 {"files": 已删文件数, "bytes": 释放的字节数}。
@@ -474,7 +531,7 @@ class TaskManager:
         if e:
             e["hb"] = time.monotonic()
 
-    def _run(self, task_id):
+    def _run(self, task_id, resume=False):
         try:
             task = db.get_task(task_id)
             if not task or task["status"] != TaskStatus.PENDING:
@@ -485,6 +542,21 @@ class TaskManager:
             self._heartbeat(task_id)
             self._safe_log(task_id, f"start {url}")
             self._publish_task(task_id)
+
+            if resume:
+                # 续跑: 不重新采集, 直接下载被暂停打断时标回 pending 的未完成资源。
+                # 已 done 的文件原样保留, 只补下缺失的那部分 —— 这是 pause/resume
+                # 相对于 cancel+retry 的核心价值(后者会全量重下)。
+                self._set_progress(task_id, 20)
+                self._transition(task_id, TaskStatus.RUNNING, TaskStatus.DOWNLOADING)
+                self._safe_log(task_id, f"resume output dir: {self._out_dir(task_id)}")
+                self._download_all(task_id, url)
+                self._check_cancel(task_id)
+                final = self._final_status(task_id)
+                self._transition(task_id, TaskStatus.DOWNLOADING, final)
+                self._set_progress(task_id, 100)
+                self._safe_log(task_id, f"task {final}")
+                return
 
             spider = get_collector(task["collector"])
             self._set_progress(task_id, 5)
@@ -527,11 +599,19 @@ class TaskManager:
                     db.update_resource(rid, size=prior["size"])
                     self._publish_resource(task_id, rid, "done")
                     continue
-                reason = filters.match_url(r["type"], r["url"])
+                reason = filters.match_resource(r["type"], r["url"], r.get("size"))
                 if reason:
                     filtered += 1
                     db.update_resource(rid, status="filtered", note=reason)
             self._safe_log(task_id, f"extracted {len(resources)} resources")
+            # 任务名: 从首个资源的输出路径推断相册名/标题 ——
+            # 图集资源形如 "约啪.../00001.jpg" -> 取首段目录名; 视频资源形如
+            # "base.mp4" -> 取去扩展名的 base。这样列表里一眼能看出采的是哪个相册,
+            # 而不是一排相同的 URL。提取阶段之后才写, 避免无资源时写空名。
+            name = self._infer_name(resources)
+            if name:
+                db.update_task(task_id, name=name)
+                self._publish_task(task_id)
             if reused:
                 self._safe_log(task_id, f"incremental: 复用已下载 {reused} 个, 跳过重复传输")
             if filters.active:
@@ -702,7 +782,7 @@ class TaskManager:
                     size = None
                 if size is None:
                     size = probe_size(r["url"], headers)
-                reason = filters.match_size(size)
+                reason = filters.match_resource(r["type"], r["url"], size)
                 if reason:
                     db.update_resource(rid, status="filtered", note=reason, size=size)
                     self._publish_resource(task_id, rid, "filtered")
@@ -754,6 +834,26 @@ class TaskManager:
             db.update_resource(rid, status="failed")
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"fail {r['url']}: {e}", "error")
+
+    @staticmethod
+    def _infer_name(resources):
+        """从资源输出路径推断任务展示名: 图集取目录首段, 视频取去扩展名 base。"""
+        from pathlib import Path
+
+        for r in resources:
+            fn = r.get("filename") if isinstance(r, dict) else None
+            if not fn:
+                # sqlite3.Row 没有 .get, 用下标容错
+                try:
+                    fn = r["filename"]
+                except (IndexError, KeyError, TypeError):
+                    fn = None
+            if not fn:
+                continue
+            if "/" in fn:
+                return fn.split("/", 1)[0]
+            return Path(fn).stem
+        return None
 
     @staticmethod
     def _row_field(row, key):

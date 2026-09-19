@@ -62,6 +62,12 @@ export function mkdirFs(parent, name) {
 export function cancelTask(id) {
   return api.post(`/tasks/${id}/cancel`).then((r) => r.data);
 }
+export function pauseTask(id) {
+  return api.post(`/tasks/${id}/pause`).then((r) => r.data);
+}
+export function resumeTask(id) {
+  return api.post(`/tasks/${id}/resume`).then((r) => r.data);
+}
 export function getManifest(id) {
   return api.get(`/files/${id}/manifest`).then((r) => r.data);
 }

@@ -73,6 +73,14 @@ button.ghost:hover { color: var(--text); border-color: var(--muted); }
 button.ghost.danger { color: var(--err); border-color: #5a3a3a; }
 button.ghost.danger:hover { border-color: var(--err); }
 button.ghost.mini { padding: 1px 8px; font-size: 11px; margin-left: 6px; }
+button.primary {
+  background: var(--accent);
+  border: 1px solid transparent;
+  color: #fff;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+button.primary:hover { filter: brightness(1.1); }
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); }

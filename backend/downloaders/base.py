@@ -1,4 +1,5 @@
 import hashlib
+import random
 import re
 import time
 from pathlib import Path
@@ -100,7 +101,10 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             last_err = e
             if attempt == retries:
                 raise
-            time.sleep(min(2 ** attempt, 8))
+            # 指数退避 + 抖动: 纯指数会让一批并发失败的请求在同一时刻集体重试
+            # (重试风暴, 把站点/WAF 瞬间打爆)。乘一个 0.6~1.4 的随机因子错开它们。
+            backoff = min(2 ** attempt, 8)
+            time.sleep(backoff * random.uniform(0.6, 1.4))
     raise last_err
 
 

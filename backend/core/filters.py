@@ -15,7 +15,8 @@ options 结构(存 tasks.options JSON):
   "keywords": [],                     # URL 须包含其一, 空=不限
   "exclude_keywords": ["thumb"],      # URL 包含任一则排除
   "min_size": "10KB",                 # 最小文件大小(支持 500KB/2MB/1024)
-  "max_size": "50MB"                  # 最大文件大小
+  "max_size": "50MB",                 # 最大文件大小
+  "min_image_bytes": "1KB"           # 图片体积下限(专治 1x1 跟踪像素/广告占位图)
 }
 """
 
@@ -76,6 +77,27 @@ def fmt_size(n):
     return f"{n:.1f} GB"
 
 
+def _coerce_size(value):
+    """把 size 规整为 int 或 None。
+
+    资源 size 经 JSON/DB 往返可能变成字符串("1047527424"), 也可能就是 int/None。
+    统一成 int, 让 match_size 的数值比较不会因 str < int 抛 TypeError。
+    非法值(非数字、负数)返回 None(上网把"判不出大小"当成放行, 交给下载后复核)。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 else None
+    s = str(value).strip()
+    if s.isdigit():
+        return int(s)
+    return None
+
+
 def url_ext(url):
     """从 URL 提取小写扩展名(不含点)。无扩展名返回 ''。"""
     try:
@@ -132,8 +154,15 @@ class Filters:
         self.exclude_keywords = _norm_words(o.get("exclude_keywords"))
         self.min_size = parse_size(o.get("min_size"))
         self.max_size = parse_size(o.get("max_size"))
+        # 图片专属体积下限: 只作用于 image 类型, 用于过滤 1x1 跟踪像素 / 广告
+        # 占位图。默认不配置, 用户显式开启才有(避免误伤合法的极小图标)。
+        self.min_image_bytes = parse_size(o.get("min_image_bytes"))
         # 只有配置了大小区间才需要 HEAD 探测, 避免额外的网络开销
-        self.need_size = self.min_size is not None or self.max_size is not None
+        self.need_size = (
+            self.min_size is not None
+            or self.max_size is not None
+            or self.min_image_bytes is not None
+        )
 
     @property
     def active(self):
@@ -176,6 +205,34 @@ class Filters:
         # 交由下载后的实际内容决定, 避免误杀
         if self.allow_exts and ext and ext not in self.allow_exts:
             return f"扩展名 .{ext} 不在白名单"
+        return None
+
+    def match_resource(self, rtype, url, size=None):
+        """综合有效性校验: URL/类型 + 大小 + 图片体积下限。
+
+        这就是"什么是有效资源"的统一定义 —— 下游两个接入点(提取阶段按 URL 预筛、
+        下载前按真实体积复核)都走它, 避免定义散落两处导致行为不一致。
+        size 为 None 时只做 URL/类型校验(提取阶段还不知道体积)。
+        """
+        # size 经 JSON/DB 往返可能是字符串(如 "1047527424"); 统一转成 int 再比,
+        # 否则 str 与 int 比较会抛 TypeError, 把整个任务在提取阶段拖垮(资源卡 pending)。
+        size = _coerce_size(size)
+        reason = self.match_url(rtype, url)
+        if reason:
+            return reason
+        if size is not None:
+            reason = self.match_size(size)
+            if reason:
+                return reason
+        # 图片专属下限: 1x1 跟踪像素 / 广告占位图体积极小(43~200B),
+        # 真实缩略图通常 > 1KB。开启 min_image_bytes 后才生效。
+        if (
+            self.min_image_bytes is not None
+            and (rtype or "").lower() == "image"
+            and size is not None
+            and size < self.min_image_bytes
+        ):
+            return f"疑似广告/占位图(体积过小 {fmt_size(size)} < {fmt_size(self.min_image_bytes)})"
         return None
 
     def summarize(self):

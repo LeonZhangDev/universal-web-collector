@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS tasks(
     error TEXT,
     created_time TEXT NOT NULL,
     download_dir TEXT,
-    options TEXT
+    options TEXT,
+    name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS resources(
@@ -83,6 +84,8 @@ _ADD_COLUMNS = [
     ("resources", "mirrors", "TEXT"),
     ("tasks", "download_dir", "TEXT"),
     ("tasks", "options", "TEXT"),
+    # 任务展示名: 提取阶段从首个资源的相册名/标题回写, 列表与详情页优先显示它
+    ("tasks", "name", "TEXT"),
     # 产出物命名与审计: 见 core/naming.py 与 core/manifest.py
     ("resources", "filename", "TEXT"),
     ("resources", "content_type", "TEXT"),
@@ -141,10 +144,10 @@ def _now():
 
 # ---- tasks ----
 
-def create_task(url, collector="xchina", download_dir=None, options=None):
+def create_task(url, collector="xchina", download_dir=None, options=None, name=None):
     cur = execute(
-        "INSERT INTO tasks(url, collector, status, created_time, download_dir, options)"
-        " VALUES(?,?,?,?,?,?)",
+        "INSERT INTO tasks(url, collector, status, created_time, download_dir, options, name)"
+        " VALUES(?,?,?,?,?,?,?)",
         (
             url,
             collector,
@@ -152,6 +155,7 @@ def create_task(url, collector="xchina", download_dir=None, options=None):
             _now(),
             download_dir,
             json.dumps(options or {}, ensure_ascii=False),
+            name,
         ),
     )
     return cur.lastrowid

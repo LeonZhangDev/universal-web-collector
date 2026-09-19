@@ -6,6 +6,8 @@ import {
   getLogs,
   getManifest,
   getTask,
+  pauseTask,
+  resumeTask,
   retryResource,
   retryTask,
 } from "../api";
@@ -52,6 +54,27 @@ const countOf = (key) => stat.value[key] || 0;
 const manifest = ref(null);
 const showManifest = ref(false);
 const archiveHref = computed(() => archiveUrl(props.taskId));
+const archiving = ref(false);
+
+async function archive() {
+  if (archiving.value) return;
+  archiving.value = true;
+  try {
+    // 归档接口是流式响应(无 Content-Length, 无法精确进度),
+    // 用一个临时锚点触发浏览器下载, 2 秒后解除 loading —— 与列表里的停止/重跑
+    // /清单按钮交互一致, 而不是孤零零一个裸链接(过去的问题)。
+    const a = document.createElement("a");
+    a.href = archiveHref.value;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => (archiving.value = false), 2000);
+  } catch (e) {
+    archiving.value = false;
+    alert(e.response?.data?.detail || String(e));
+  }
+}
 
 function fmtSize(n) {
   if (n === null || n === undefined) return "";
@@ -129,6 +152,25 @@ async function stop() {
   }
 }
 
+async function pause() {
+  try {
+    await pauseTask(props.taskId);
+    await load();
+  } catch (e) {
+    alert(e.response?.data?.detail || String(e));
+  }
+}
+
+async function resume() {
+  try {
+    await resumeTask(props.taskId);
+    await load();
+    if (!timer) timer = setInterval(load, 2000);
+  } catch (e) {
+    alert(e.response?.data?.detail || String(e));
+  }
+}
+
 async function loadManifest() {
   showManifest.value = !showManifest.value;
   if (!showManifest.value || manifest.value) return;
@@ -158,13 +200,18 @@ onUnmounted(() => clearInterval(timer));
       <h3>任务 #{{ task.id }} · <span class="badge" :class="task.status">{{ task.status }}</span></h3>
       <span style="flex:1"></span>
       <button v-if="active()" class="ghost" @click="stop">停止</button>
+      <button v-if="active()" class="ghost" @click="pause">暂停</button>
+      <button v-if="task.status === 'paused'" class="primary" @click="resume">继续</button>
       <button v-if="['partial', 'failed', 'cancelled'].includes(task.status)" class="ghost" @click="retry">
         重跑任务
       </button>
-      <a class="ghost btn-link" :href="archiveHref">打包下载</a>
+      <button class="ghost" :disabled="archiving" @click="archive">
+        {{ archiving ? "打包中…" : "打包下载" }}
+      </button>
       <button class="ghost" @click="loadManifest">清单</button>
       <button class="ghost" style="margin-left:8px" @click="emit('close')">关闭</button>
     </div>
+    <div v-if="task.name" class="task-name">{{ task.name }}</div>
 
     <div style="color:var(--muted); margin-bottom:8px; word-break: break-all;">{{ task.url }}</div>
 
@@ -266,6 +313,12 @@ onUnmounted(() => clearInterval(timer));
   align-items: center;
   text-decoration: none;
   margin-left: 8px;
+}
+.task-name {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0 6px;
+  word-break: break-all;
 }
 .view-tabs {
   display: flex;

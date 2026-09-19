@@ -13,6 +13,7 @@ class TaskOut(BaseModel):
     error: Optional[str] = None
     created_time: str
     download_dir: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ResourceOut(BaseModel):

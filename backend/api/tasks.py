@@ -305,6 +305,36 @@ def cancel_task(task_id: int):
     return dict(db.get_task(task_id))
 
 
+@router.post("/tasks/{task_id}/pause", response_model=TaskOut)
+def pause_task(task_id: int):
+    """暂停: 停下 worker, 但保留已下载文件与资源记录, 之后可 resume 续跑。
+
+    与 cancel 的区别: cancel 是"不要了"(状态 cancelled); pause 是"先停一下"
+    (状态 paused), 已下好的不浪费、之后从断点接着下。非运行中的任务返回 409。
+    """
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    ok, err = task_manager.pause(task_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail=err)
+    return dict(db.get_task(task_id))
+
+
+@router.post("/tasks/{task_id}/resume", response_model=TaskOut)
+def resume_task(task_id: int):
+    """续跑: 把暂停时打断的未完成资源标回待下载, 复用已下好的文件从断点接着下。
+
+    与 retry 的区别: retry 会删除全部资源记录重头来过(适合"规则改了/站点变了");
+    resume 只补缺失的那部分 —— 暂停期间下好的文件全部保留。
+    """
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    ok, err = task_manager.resume(task_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail=err)
+    return dict(db.get_task(task_id))
+
+
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: int, with_files: bool = False):
     """删除任务。

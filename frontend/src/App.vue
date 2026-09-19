@@ -17,9 +17,11 @@ import {
   listSessions,
   listTasks,
   listWatches,
+  pauseTask,
   previewTask,
   runWatch,
   resolveCollector,
+  resumeTask,
   startLogin,
   stopLogin,
   toggleWatch,
@@ -402,6 +404,24 @@ async function refreshStorage() {
 
 function askRemove(id) {
   pending.value = { mode: "one", id };
+}
+
+async function doPause(id) {
+  try {
+    await pauseTask(id);
+    await refresh();
+  } catch (e) {
+    alert(e.response?.data?.detail || String(e));
+  }
+}
+
+async function doResume(id) {
+  try {
+    await resumeTask(id);
+    await refresh();
+  } catch (e) {
+    alert(e.response?.data?.detail || String(e));
+  }
 }
 
 function askCleanup() {
@@ -850,6 +870,8 @@ onUnmounted(() => {
       :selected-id="selectedId"
       @select="select"
       @remove="askRemove"
+      @pause="doPause"
+      @resume="doResume"
     />
   </div>
 

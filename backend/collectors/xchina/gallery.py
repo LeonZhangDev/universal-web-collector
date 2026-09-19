@@ -101,6 +101,12 @@ from ..gallery_base import GallerySite, SequenceGallerySpider
 XCHINA = GallerySite(
     name="xchina_gallery",
     base="https://img.xchina.io/photos",
+    # 该站会按相册把资源分到 photos/photos2/photos3 等不同子路径: 枚举前自动试探命中
+    base_candidates=[
+        "https://img.xchina.io/photos",
+        "https://img.xchina.io/photos2",
+        "https://img.xchina.io/photos3",
+    ],
     # 按画质从高到低
     variants=[".jpg", "_1200x0.webp", "_800x0.webp", "_600x0.webp"],
     quality_map={
@@ -114,7 +120,8 @@ XCHINA = GallerySite(
     video_quality_map={"original": ".mp4"},
     id_patterns=[
         # 图片/视频直链: https://img.xchina.io/photos/{id}/00001.jpg|.mp4
-        r"/photos/([0-9A-Za-z_-]{6,})",
+        #   (站点可能把不同相册分到 photos/photos2/photos3 等不同子路径, 见 base_candidates)
+        r"/photos\d*/([0-9A-Za-z_-]{6,})",
         # 相册页: https://xchina.co/photo/id-{id}.html 或 /photo/id-{id}/10.html
         #        (末段是**页码**, 不是 ID)
         r"/photo/id-([0-9A-Za-z_-]{4,})",

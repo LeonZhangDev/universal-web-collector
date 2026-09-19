@@ -13,6 +13,43 @@ from .ratelimit import domain_slot
 
 CHUNK = 64 * 1024
 
+
+class RateLimited(Exception):
+    """站点返回 429。
+
+    与别的失败不同: 429 是站点在说"慢一点", 不是"这个文件坏了"。
+    所以退避时长要听它的(Retry-After), 而不是套用普通的指数退避 ——
+    普通退避最长 8 秒, 而站点要求冷静几十秒时, 硬闯只会让封禁更久。
+    """
+
+    def __init__(self, wait):
+        super().__init__(f"429 被限速, 站点要求等待 {wait:.1f}s")
+        self.wait = wait
+
+
+def _retry_after(resp, default):
+    """解析 Retry-After(秒 或 HTTP 日期), 认不出用 default。"""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, min(float(raw), 300.0))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            import datetime
+
+            delta = (dt - datetime.datetime.now(dt.tzinfo)).total_seconds()
+            return max(0.0, min(delta, 300.0))
+    except Exception:
+        pass
+    return default
+
+
 SESSION = requests.Session()
 if settings.proxy:
     SESSION.proxies.update({"http": settings.proxy, "https": settings.proxy})
@@ -68,6 +105,9 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             if resp.status_code == 416:
                 fill_info(info, url, None)
                 return sha256_file(path), None
+            if resp.status_code == 429:
+                # 站点明确要求减速: 按它说的等, 而不是套普通退避
+                raise RateLimited(_retry_after(resp, float(settings.image_retries) * 5))
             resp.raise_for_status()
 
             ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -97,6 +137,12 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             # 用户点了"停止": 这不是一次失败。按普通失败处理会退避重睡一轮,
             # 再从头续传一个注定被放弃的文件 —— 用户体感是点了没反应。
             raise
+        except RateLimited as e:
+            last_err = e
+            if attempt == retries:
+                raise
+            # 抖动同样要加: 一批并发请求会同时收到 429, 不抖开就是集体复燃
+            time.sleep(e.wait * random.uniform(0.8, 1.4))
         except Exception as e:
             last_err = e
             if attempt == retries:

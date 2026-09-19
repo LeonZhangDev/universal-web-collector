@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS tasks(
     created_time TEXT NOT NULL,
     download_dir TEXT,
     options TEXT,
-    name TEXT
+    name TEXT,
+    -- 心跳时间戳(epoch 秒): 看门狗判活用的, 见 _ADD_COLUMNS 里的说明
+    hb REAL
 );
 
 CREATE TABLE IF NOT EXISTS resources(
@@ -86,6 +88,9 @@ _ADD_COLUMNS = [
     ("tasks", "options", "TEXT"),
     # 任务展示名: 提取阶段从首个资源的相册名/标题回写, 列表与详情页优先显示它
     ("tasks", "name", "TEXT"),
+    # 落库的心跳时间戳(epoch 秒)。看门狗靠它区分「别的进程正在跑」和
+    # 「进程已经死了」—— 只靠内存字典在多实例/多 worker 共用一个库时会误杀。
+    ("tasks", "hb", "REAL"),
     # 产出物命名与审计: 见 core/naming.py 与 core/manifest.py
     ("resources", "filename", "TEXT"),
     ("resources", "content_type", "TEXT"),

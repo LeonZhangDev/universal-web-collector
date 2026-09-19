@@ -233,6 +233,12 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
     - 支持画质档 `quality`: original / 1200 / 800 / 600
     - 支持媒体类型 `media`: 同一 gid 下图片与视频并存(见上文)
     - 支持创建前预告 `POST /tasks/preview`: 零枚举给出目录名/张数/视频体积
+    - **CDN 基址与序号宽度自动探测**: 同一站点可能把不同相册分到
+      `photos` / `photos2` / `photos3`, 序号也可能是 4 位(`0001.jpg`)而非 5 位。
+      写死基址会让"相册在另一个 CDN 子路径"变成 0 资源 -> failed, 而用户只看
+      到失败、看不出是路径不对。现在默认基址先用, 不中才试探候选(正常相册
+      **零额外请求**); 若输入本身是资源直链, 基址与宽度直接从 URL 里读出来
+    - 任务级 `proxy` 选项覆盖全局代理
     - 序号枚举型站点可继承 `collectors/gallery_base.py::SequenceGallerySpider`,
       站点只声明 URL 模板、ID 正则与探测规则; 媒体类型由 `MediaType` 声明
       (自带 `ctype_prefix`: 图片看 `image/`、视频看 `video/`)
@@ -243,8 +249,17 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
     健全性校验(过期/占位/无密钥一律拒绝), AES-128 解密走 ffmpeg
     (零新增依赖; 密钥与分片均无需签名, 只有 playlist 那一层设防)
 - 资源类型: image / video / audio / doc / text, 对应下载器
-- 资源过滤: 类型/扩展名黑白名单/URL关键词/大小区间, 命中者标记 filtered 并记原因。
-  大小过滤优先复用**采集阶段已探测到的** size(图集任务因此零额外请求), 未知才补 HEAD
+- 资源过滤("什么是有效资源"的唯一定义在 `core/filters.py::match_resource`):
+  类型/扩展名黑白名单/URL关键词/大小区间/图片体积下限/广告位识别,
+  命中者标记 filtered 并记原因。
+  - 大小过滤优先复用**采集阶段已探测到的** size(图集任务因此零额外请求), 未知才补 HEAD
+  - `min_image_bytes`: 挡 1x1 跟踪像素这类体积极小的图片
+  - `exclude_ad`: 按**路径分段精确匹配**识别广告位/站点装饰图(`/ad/`、`banner_*.jpg`
+    `/assets/logo.png`…)。绝不做子串包含 —— 子串会把 `downloads/badges/1.jpg`
+    这种正常文件误杀
+- 429 退避: 站点说"慢一点"时按它给的 `Retry-After` 等(支持秒与 HTTP 日期),
+  而不是套用普通指数退避 —— 普通退避最长 8 秒, 站点要求冷静几十秒时硬闯只会
+  让封禁更久。普通失败则是指数退避 × 0.6~1.4 抖动, 避免重试风暴
 - 输出组织: 任务级命名模板(默认保留 URL 原名), 落 `<download_dir>/<task_id>/` 下的
   任意层级; 任务结束(含取消/部分失败)都会产出 `manifest.json`, 记录来源 URL、
   实际生效的下载点、Content-Type、sha256、字节数、本地相对路径与过滤原因
@@ -252,8 +267,16 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
   订阅源(watches)在此基础上按间隔自动巡检并创建任务
 - 导出: `/tasks/{id}/archive` 流式打包 ZIP(不把整包攒进内存), 前端有图库视图
   与状态筛选(成功/过滤/失败)、清单表格
+- 任务名: 提取阶段从首个资源推断相册名/视频标题回写 `tasks.name`,
+  列表与详情页优先显示它(不用在一排 URL 里认任务)
+- 暂停/继续: `POST /tasks/{id}/pause` 停下 worker 但**保留文件与资源记录**并落
+  `paused`; `/resume` 把被打断的资源复位 pending 后从断点补下, 不重新采集、
+  不重下已 done 的文件 —— 这是它相对"取消+重跑"的核心价值
 - 停止: `POST /tasks/{id}/cancel` 立刻落 cancelled 状态, 下载循环在每个数据块
   检查取消标志(不是资源边界), 半成品即时清理, 已下载文件保留
+- 看门狗: 心跳**同时写库**(`tasks.hb`)。只靠进程内字典判断时, 两个实例共用
+  一个 SQLite 库会互相把对方正在跑的任务判成"重启遗留"并标 failed
+  (实测: 一个正在枚举 114 张图的任务就这么被杀掉了)
 - 删除: **记录与文件分开决定**。默认 `DELETE /tasks/{id}` 只删记录, 磁盘文件
   保留(去重机制下别的任务可能正引用它们); 要连文件删需显式
   `?with_files=true`, 只会删 `<下载根目录>/<task_id>/` 这一层并做双重越界校验。

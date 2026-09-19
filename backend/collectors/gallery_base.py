@@ -135,9 +135,11 @@ class MediaType:
     def root(self, site):
         return self.base or site.base
 
-    def url_for(self, site, gid, seq, variant=None):
+    def url_for(self, site, gid, seq, variant=None, base=None, seq_format=None):
         suffix = variant if variant is not None else self.variants[0]
-        return f"{self.root(site)}/{gid}/{self.seq_format.format(seq=seq)}{suffix}"
+        root = base or self.root(site)
+        fmt = seq_format or self.seq_format
+        return f"{root}/{gid}/{fmt.format(seq=seq)}{suffix}"
 
     def variant_of(self, quality):
         """画质档 -> 变体后缀; 未知档位回退最高画质。"""
@@ -163,6 +165,12 @@ class GallerySite:
     base: str                       # URL 前缀, 如 https://img.xchina.io/photos
     variants: list                  # 主媒体(图片)的变体后缀, 按画质从高到低
     quality_map: dict = field(default_factory=dict)  # 画质档 -> 后缀
+    # CDN 基址候选(可选)。部分站点会按相册把资源分到不同子路径, 如
+    # img.xchina.io/photos 与 img.xchina.io/photos2/photos3 并存。留空只试 base;
+    # 填上后枚举前会先对 00001 试探, 命中 image/* 的那个就作为本次基址 ——
+    # 让采集器自己发现"资源到底在哪", 而不是写死一个 base(否则像
+    # 69ad45698f836 这种在 photos2 的相册会整体判空 -> 任务 failed)。
+    base_candidates: Optional[list] = None
     seq_format: str = "{seq:05d}"
     # 视频媒体: 非空即声明"该站同一 gid 下还有视频"。留空则该站只采图片。
     video_variants: list = field(default_factory=list)
@@ -388,10 +396,132 @@ def _quality_tag(mtype, variant):
     return "_" + variant.strip("._").replace(".", "_")
 
 
+def _seq_format_variants(fmt):
+    """候选序号格式: 先站点默认, 再试相邻补零宽度。
+
+    同一站点不同相册的补零位数可能不一样(实测 xchina 既有 `00001.jpg` 也有
+    `0001.jpg`)。宽度只影响"不足位补几个零" —— 序号变大后 `{seq:04d}` 照样
+    渲染出 5 位, 所以多试一种宽度只会多花一次探测, 不会改变既有行为。
+    """
+    m = re.search(r"seq:0(\d+)d", fmt or "")
+    if not m:
+        return [fmt]
+    w = int(m.group(1))
+    out = [fmt]
+    for alt in (w - 1, w + 1):
+        if 1 <= alt <= 9:
+            f2 = f"{fmt[:m.start(1)]}{alt}{fmt[m.end(1):]}"
+            if f2 not in out:
+                out.append(f2)
+    return out
+
+
+def parse_resource_hint(site, raw):
+    """从一条**资源直链**里直接读出 CDN 基址与序号宽度; 不是直链返回 None。
+
+    用户手上的直链是本站最可靠的一份证据: 它把"这批资源放在哪个 CDN 子路径"和
+    "序号补几位零"都写在 URL 里了 —— 例如 `.../photos2/69ad45698f836/0001.jpg`
+    同时说明了基址是 `photos2`、宽度是 4。先采信它可以省掉一整轮探测。
+
+    ⚠️ 这只是**线索**不是结论: `_resolve_base` 仍会拿它去探一次, 探不通就
+    退回候选探测 —— 用户也可能粘了一条失效的旧直链。
+    """
+    s = (raw or "").strip()
+    if "://" not in s:
+        return None
+    u = urlparse(s)
+    if u.scheme not in ("http", "https"):
+        return None
+    # 去掉 query/fragment 再匹配: 直链可能带 ?v=... 之类的无关参数
+    plain = s.split("#", 1)[0].split("?", 1)[0]
+    for name in ("image", "video"):
+        mtype = site.media(name)
+        if mtype is None:
+            continue
+        root = mtype.root(site)
+        # root 本身含 scheme+host, 所以是对**整条 URL**做前缀匹配
+        m = re.match(
+            rf"^{re.escape(root)}(?P<tail>\d*)/(?P<gid>[0-9A-Za-z_-]{{4,}})"
+            rf"/(?P<seq>\d+)(?P<ext>\.[0-9A-Za-z]+)?$",
+            plain,
+        )
+        if not m:
+            continue
+        return {
+            "base": f"{root}{m.group('tail')}",
+            "seq_format": "{seq:0%dd}" % len(m.group("seq")),
+        }
+    return None
+
+
+def _resolve_base(site, gid, session, media, log=None, hint=None, budget=6):
+    """探测该相册真实的(CDN 基址, 序号补零宽度)。
+
+    该站会按相册把资源分到不同 CDN 子路径(`photos` / `photos2` / `photos3`),
+    甚至补零位数也不同。写死一个 base 的后果是: 相册明明存在, 枚举的却是另一条
+    不存在的路径 -> 全部判 missing -> **0 个资源 -> 任务 failed**, 而用户看到
+    的只是"失败", 完全不知道是 CDN 路径不对。
+
+    顺序: ① 输入直链给的线索(零代价, 最可信) ② 默认宽度 × 各候选基址
+    ③ 相邻宽度 × 各候选基址。命中即停, 常见情形只花 1 次探测; `budget` 是
+    总探测次数上限, 防止一个真不存在的图集被试探十几轮。
+
+    全部探不到时退回默认值, 由常规的「连续缺失 -> 停止 -> 空结果判 failed」
+    处理 —— 那时确实是这个图集不存在。
+    """
+    mtype = site.media(media)
+    if mtype is None:
+        return site.base, None
+    default = mtype.root(site)
+    default_fmt = mtype.seq_format
+
+    def _try(cand_base, cand_fmt):
+        url = mtype.url_for(site, gid, DEFAULT_START, mtype.variants[0],
+                            base=cand_base, seq_format=cand_fmt)
+        try:
+            state, _, _ = probe(session, url, ctype_prefix=mtype.ctype_prefix,
+                                accept=mtype.accept, retries=1)
+        except Exception:
+            state = PROBE_ERROR
+        return state
+
+    # ① 直链线索: 用户已经把答案写在 URL 里了
+    h_base = (hint or {}).get("base")
+    h_fmt = (hint or {}).get("seq_format")
+    if h_base:
+        if _try(h_base, h_fmt) == PROBE_OK:
+            if log:
+                log(f"CDN 基址采信输入直链: {h_base} (序号格式 {h_fmt})")
+            return h_base, h_fmt
+        if log:
+            log(f"输入直链指向的 {h_base} 探测未命中, 改由候选探测")
+
+    # ② ③ 候选组合
+    cands = [default]
+    for c in (site.base_candidates or []):
+        if c and c not in cands:
+            cands.append(c)
+    spent = 0
+    for fmt in _seq_format_variants(default_fmt):
+        for c in cands:
+            if spent >= budget:
+                if log:
+                    log(f"CDN 候选探测已达上限({budget}), 用默认基址")
+                return default, default_fmt
+            spent += 1
+            if _try(c, fmt) == PROBE_OK:
+                if log and (c != default or fmt != default_fmt):
+                    log(f"CDN 探测命中: 基址 {c}, 序号格式 {fmt}")
+                return c, fmt
+            if log:
+                log(f"CDN 探测未命中: {c} (序号格式 {fmt})")
+    return default, default_fmt
+
+
 def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX,
              miss_stop=DEFAULT_MISS_STOP, session=None, proxy=None,
              min_interval=None, max_interval=None, log=None,
-             media="image", album=None):
+             media="image", album=None, hint_url=None):
     """枚举图集资源, 逐个 yield 结果字典。
 
     yield::
@@ -422,19 +552,52 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
     top_variant = mtype.variants[0]
     sess = session or _session(proxy)
     own = session is None
+    # CDN 基址与序号宽度(photos/photos2/photos3..., 00001/0001)**惰性探测**:
+    # 写死 base 会让"相册在另一个 CDN 子路径"整体判空 -> 0 资源 -> failed,
+    # 而用户只看到失败、看不出是路径不对。但反过来, 若每次枚举都先探一轮候选,
+    # 那么绝大多数(就在默认基址上的)相册都要平白多花一次请求。
+    # 所以: 先用默认值探第一张 —— 中了就完全不额外开销; 不中才启动候选探测。
+    # hint 来自**用户原始输入**(可能是资源直链), 它把答案直接写在了 URL 里,
+    # 这里乐观采信、探不中再退回候选探测(用户也可能粘了条失效的旧直链)。
+    hint = parse_resource_hint(site, hint_url)
+    resolved_base = (hint or {}).get("base") or mtype.root(site)
+    fmt = (hint or {}).get("seq_format") or mtype.seq_format
+    base_fixed = False  # 基址是否已经确认过(只对第一张做一次候选探测)
+
+    def seq_name(n):
+        """按探测到的宽度渲染序号(同一站点不同相册可能是 00001 也可能是 0001)。"""
+        try:
+            return fmt.format(seq=n)
+        except Exception:
+            return mtype.seq_format.format(seq=n)
 
     try:
         miss_run = 0
         seq = start
         while seq < start + limit:
             use = default_variant
-            main = mtype.url_for(site, gid, seq, use)
+            main = mtype.url_for(site, gid, seq, use, base=resolved_base,
+                                 seq_format=fmt)
             state, size, ctype = probe(sess, main, ctype_prefix=mtype.ctype_prefix,
                                        accept=mtype.accept)
 
+            # 第一张就不中: 极可能是这个相册不在默认(或直链所指的)CDN 路径/宽度上
+            # —— 换成候选基址重探一次, 避免"相册存在却采到 0 个"的静默失败。
+            if state != PROBE_OK and seq == start and not base_fixed:
+                base_fixed = True
+                b2, f2 = _resolve_base(site, gid, sess, media, log)
+                if (b2, f2) != (resolved_base, fmt):
+                    resolved_base, fmt = b2, f2
+                    main = mtype.url_for(site, gid, seq, use, base=resolved_base,
+                                         seq_format=fmt)
+                    state, size, ctype = probe(sess, main,
+                                               ctype_prefix=mtype.ctype_prefix,
+                                               accept=mtype.accept)
+
             if state == PROBE_MISSING and use != top_variant:
                 # 该档位不存在 != 这张图不存在
-                fallback = mtype.url_for(site, gid, seq, top_variant)
+                fallback = mtype.url_for(site, gid, seq, top_variant,
+                                         base=resolved_base, seq_format=fmt)
                 state, size, ctype = probe(sess, fallback,
                                            ctype_prefix=mtype.ctype_prefix,
                                            accept=mtype.accept)
@@ -454,9 +617,11 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
                     "seq": seq,
                     "type": mtype.name,
                     "url": main,
-                    "mirrors": [mtype.url_for(site, gid, seq, v) for v in others],
+                    "mirrors": [mtype.url_for(site, gid, seq, v, base=resolved_base,
+                                              seq_format=fmt)
+                                for v in others],
                     "size": size,
-                    "filename": f"{group}/{seq:05d}{tag}"
+                    "filename": f"{group}/{seq_name(seq)}{tag}"
                                 f"{_ext_of_url(main, mtype.default_ext)}",
                 }
             elif state == PROBE_MISSING:
@@ -481,7 +646,7 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
             sess.close()
 
 
-def _video_at_first_seq(site, gid, session=None):
+def _video_at_first_seq(site, gid, session=None, proxy=None):
     """该图集是否存在 `00001.mp4`。
 
     用于 media=auto 的判定: 该站视频序号从 1 开始, 所以"第一段在不在"就等价于
@@ -491,10 +656,13 @@ def _video_at_first_seq(site, gid, session=None):
     mtype = site.media("video")
     if mtype is None:
         return False
-    sess = session or _session()
+    sess = session or _session(proxy)
     own = session is None
     try:
-        state, _, _ = probe(sess, mtype.url_for(site, gid, DEFAULT_START),
+        resolved_base, fmt = _resolve_base(site, gid, sess, "video")
+        state, _, _ = probe(sess, mtype.url_for(site, gid, DEFAULT_START,
+                                                mtype.variants[0],
+                                                base=resolved_base, seq_format=fmt),
                             ctype_prefix=mtype.ctype_prefix, accept=mtype.accept,
                             retries=1)
         return state == PROBE_OK
@@ -533,9 +701,13 @@ def _match_score(site, raw):
         return None
 
     host, path = u.netloc.lower(), u.path
-    b_host, b_path = _netloc_path(site.base)
-    if host == b_host and (path + "/").startswith(b_path + "/"):
-        return SCORE_RESOURCE_URL
+    # ⚠️ 不能只比 site.base: 该站会把相册分到 photos/photos2/photos3 等不同
+    # CDN 子路径, 只认默认那个会让 photos2 上的直链落不进来 -> 派给 generic
+    # -> "不支持预览" 400。候选基址要一起比对。
+    for root in [site.base, *(site.base_candidates or [])]:
+        r_host, r_path = _netloc_path(root)
+        if host == r_host and (path + "/").startswith(r_path + "/"):
+            return SCORE_RESOURCE_URL
     if site.album_url_template:
         p_host, _ = _netloc_path(site.album_url_template.format(gid="x"))
         if host == p_host:
@@ -559,7 +731,7 @@ class SequenceGallerySpider:
         """
         return _match_score(cls.site, url)
 
-    def resolve_media(self, site, gid, media_opt, meta=None, log=None):
+    def resolve_media(self, site, gid, media_opt, meta=None, log=None, proxy=None):
         """把 options.media 解析成实际要枚举的媒体列表。
 
         auto 的判定顺序(先看相册页, 再看一次探测): 相册页里的视频清单是站点
@@ -582,7 +754,7 @@ class SequenceGallerySpider:
             if log:
                 log(f"相册页显示含 {len(meta['videos'])} 段视频, 图片+视频一起采")
             return ["image", "video"]
-        if _video_at_first_seq(site, gid):
+        if _video_at_first_seq(site, gid, proxy=proxy):
             if log:
                 log("探测到 00001.mp4, 判定该相册含视频, 图片+视频一起采")
             return ["image", "video"]
@@ -692,13 +864,15 @@ class SequenceGallerySpider:
         album = self.album_name(meta, title_mode, gid)
         group = self.group_name(meta, album, opts, gid)
 
-        medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log)
+        medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log,
+                                    proxy=opts.get("proxy"))
         self.plan_log(log, gid, group, medias, meta)
 
         items = []
         for name in medias:
             for it in discover(site, gid, quality=quality, media=name,
-                               album=group, log=log, max_count=max_count):
+                               album=group, log=log, max_count=max_count,
+                               hint_url=url, proxy=opts.get("proxy")):
                 items.append({
                     "type": it["type"],
                     "url": it["url"],
@@ -742,7 +916,8 @@ class SequenceGallerySpider:
                                     use_cache=not _truthy(opts.get("refresh")))
         album = self.album_name(meta, title_mode, gid)
         group = self.group_name(meta, album, opts, gid)
-        medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log)
+        medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log,
+                                    proxy=opts.get("proxy"))
 
         video_items = list((meta or {}).get("videos") or [])
         photos = (meta or {}).get("photos")
@@ -768,7 +943,7 @@ class SequenceGallerySpider:
             for name in medias:
                 got = list(discover(site, gid, quality=opts.get("quality"),
                                     media=name, album=group, log=log,
-                                    max_count=max_items))
+                                    max_count=max_items, hint_url=url))
                 counts[name] = len(got)
                 for it in got[:3]:
                     if it.get("filename"):

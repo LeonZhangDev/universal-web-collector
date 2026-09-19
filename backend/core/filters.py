@@ -16,8 +16,19 @@ options 结构(存 tasks.options JSON):
   "exclude_keywords": ["thumb"],      # URL 包含任一则排除
   "min_size": "10KB",                 # 最小文件大小(支持 500KB/2MB/1024)
   "max_size": "50MB",                 # 最大文件大小
-  "min_image_bytes": "1KB"           # 图片体积下限(专治 1x1 跟踪像素/广告占位图)
+  "min_image_bytes": "1KB",           # 图片体积下限(专治 1x1 跟踪像素/广告占位图)
+  "exclude_ad": true                  # 排除广告位/站点装饰/跟踪像素(见 _match_ad)
 }
+
+"什么是有效资源"三道关:
+1. **长得像不像**(URL 层): 类型/扩展名/关键词, 以及广告位与站点装饰
+2. **够不够格**(体积层): min/max_size, 图片专属下限
+3. **是不是真的**(内容层): 下载后按 Content-Type 复核 —— 见 downloaders 的
+   require_image(越界 URL 会返回 200+html, 光看状态码会被骗)
+
+⚠️ 第 1 关的**广告识别一律按路径分段精确匹配, 绝不做子串包含**:
+子串匹配会把 `/photos2/my-logo-album/0001.jpg` 这种正常资源误杀,
+而"静默少采几张"比"多采一张广告"难查得多。
 """
 
 import re
@@ -77,6 +88,21 @@ def fmt_size(n):
     return f"{n:.1f} GB"
 
 
+def _truthy(value, default=False):
+    """options 里的布尔值兼容(True/"true"/"1"/1 为真, 其余为假)。
+
+    未显式配置(null/"")返回 default —— 与"写了 false"区分开, 否则
+    options 里缺这个键会被当成"用户明确关掉了"。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _coerce_size(value):
     """把 size 规整为 int 或 None。
 
@@ -127,12 +153,62 @@ def _norm_exts(exts):
     return out
 
 
+#: 广告位: URL **路径分段**命中即排除(整段匹配, 不含扩展名)。
+#: 这类词出现在路径里几乎不可能是相册内容。
+_AD_SEGMENTS = frozenset({
+    "ad", "ads", "advert", "advertising", "advertisement", "adserver",
+    "banner", "banners", "sponsor", "sponsored", "promo", "promotion",
+    "popup", "popunder", "adbox", "adimg", "adimage",
+})
+
+#: 站点装饰 / 占位图: 只看**最后一段文件名**的 stem, 且必须完全相等。
+#: (放在 stem 而不是路径段, 是因为 /static/logo.png 的 logo 在文件名里)
+_AD_STEMS = frozenset({
+    "pixel", "tracking", "track", "spacer", "blank", "placeholder",
+    "default", "sprite", "favicon", "logo", "icon", "noimage", "no-image",
+    "noimg", "loading", "placeholder-image",
+})
+
+#: 1x1 / 2x2 这类尺寸的跟踪像素文件名
+_AD_DIM_RE = re.compile(r"^(\d+)x(\d+)$")
+
+
 def _norm_words(words):
     if not words:
         return []
     if isinstance(words, str):
         words = re.split(r"[,\s]+", words)
     return [w.strip() for w in words if isinstance(w, str) and w.strip()]
+
+
+def _match_ad(url):
+    """广告位 / 站点装饰 / 跟踪像素识别。命中返回原因, 否则 None。
+
+    ⚠️ 一律**路径分段精确匹配**: 不做子串包含。
+    子串匹配会把 `/photos2/my-logo-album/0001.jpg` 这种正常相册误杀,
+    而"静默少采几张"比"多采一张广告"难查得多 —— 宁可漏判也不误杀。
+    """
+    try:
+        p = urlparse(url or "")
+        path = unquote(p.path or "").lower()
+    except Exception:
+        return None
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return None
+    for s in segs:
+        stem = s.rsplit(".", 1)[0] if "." in s else s
+        if stem in _AD_SEGMENTS:
+            return f"疑似广告位(路径段 '{stem}')"
+    stem = segs[-1]
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    if stem in _AD_STEMS:
+        return f"疑似站点装饰/占位图(文件名 '{stem}')"
+    m = _AD_DIM_RE.match(stem)
+    if m and int(m.group(1)) <= 2 and int(m.group(2)) <= 2:
+        return f"疑似跟踪像素({stem})"
+    return None
 
 
 class Filters:
@@ -157,6 +233,9 @@ class Filters:
         # 图片专属体积下限: 只作用于 image 类型, 用于过滤 1x1 跟踪像素 / 广告
         # 占位图。默认不配置, 用户显式开启才有(避免误伤合法的极小图标)。
         self.min_image_bytes = parse_size(o.get("min_image_bytes"))
+        # 广告位/站点装饰排除。默认开: 通用采集器抓整页时, 站点 logo / 横幅 /
+        # sprite 会混进资源列表, 它们"看起来是图片"但用户根本不想要。
+        self.exclude_ad = _truthy(o.get("exclude_ad"), default=True)
         # 只有配置了大小区间才需要 HEAD 探测, 避免额外的网络开销
         self.need_size = (
             self.min_size is not None
@@ -173,6 +252,7 @@ class Filters:
             or self.keywords
             or self.exclude_keywords
             or self.need_size
+            or self.exclude_ad
         )
 
     def match_size(self, size):
@@ -194,6 +274,11 @@ class Filters:
         for kw in self.exclude_keywords:
             if kw.lower() in low:
                 return f"命中排除关键词 '{kw}'"
+
+        if self.exclude_ad:
+            reason = _match_ad(url)
+            if reason:
+                return reason
 
         if self.keywords and not any(kw.lower() in low for kw in self.keywords):
             return "未命中包含关键词"
@@ -240,6 +325,8 @@ class Filters:
         if not self.active:
             return "无过滤条件"
         parts = []
+        if self.exclude_ad:
+            parts.append("排除广告位/装饰图")
         if self.types:
             parts.append("类型=" + ",".join(sorted(self.types)))
         if self.allow_exts:

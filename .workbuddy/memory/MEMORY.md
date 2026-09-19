@@ -56,12 +56,19 @@ TRANSITIONS 表 + 乐观锁（update where status=expected）。
 ## 线程与看门狗
 - ThreadPoolExecutor(max_workers=2)；看门狗 30s 轮询：无 worker 的 active 任务→failed；心跳超时 900s→cancelled。
 - ⚠️ 看门狗必须**问过进程内所有存活 TaskManager**（`_LIVE_MANAGERS`），只看自己 `_active` 会把别的
-  实例正在跑的任务判成"重启遗留"标 failed。仍不覆盖 `uvicorn --workers N`（需 tasks 加 worker_id 列）。
+  实例正在跑的任务判成"重启遗留"标 failed。
+- ⚠️⚠️ `_LIVE_MANAGERS` **是进程内列表，管不了多进程**。两个后端实例共用一个 SQLite 时，
+  A 的看门狗看不到 B 正在跑的任务 → 实测把一个正在枚举 114 张图的任务标 failed，
+  于是 worker 走到 `extracting -> downloading` 时状态对不上，报 `invalid transition` 整任务报销。
+  **判据必须是库里的心跳 `tasks.hb`**（`_heartbeat()` 同时写库）：还在跳就是活的，
+  只有 `now - hb > stale_task_timeout` 才判死。长耗时枚举期间靠采集日志回调节流 5s 刷新心跳。
 
 ## 限速器（2026-09-17 离线实验纠正，别反向推断）
 两闸门**正交**：间隔闸门 `_last` 决定「每 N 秒发一个请求」；并发闸门 `_sem` 只限在途数，**不摊薄间隔**。
 单次耗时 > 间隔时 `concurrency=1` 会让后续请求空等（分片场景致命）→ `domain_concurrency=3`。
 `_limiter()` 按**站点**（注册域）分桶，非 netloc；可用 config `site_groups` 覆盖。
+⚠️ 429 是"慢一点"不是"文件坏了"：按 `Retry-After`（秒/HTTP 日期）等，别套 8 秒封顶的
+普通退避（站点要求冷静几十秒时硬闯只会封更久）。普通失败才是 2^n × 0.6~1.4 抖动。
 
 ## 过滤 / 类型 / 去重
 URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含·排除。
@@ -100,6 +107,15 @@ URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含
 - 画质档 `original/1200/800/600`：选定档作主 URL，其余按邻近度作 mirrors；缺该档回退最高档。
 - ⚠️ 判断是否最高画质档要拿**变体后缀**跟 `site.variants[0]` 比，不能拿档名比（曾落盘成 `00001_.jpg.jpg`）。
 - ⚠️ 自动识别时用 `parse_gid(strict=True)`（不用末段退路），见下"自动识别"。
+- ⚠️⚠️ **CDN 基址与序号宽度会按相册变**：`69ad45698f836` 的图片在 `photos2`、序号是 **4 位**
+  `0001.jpg`，而 `6aa5136f606fe` 在 `photos`、5 位 `00001.jpg`。写死 base 会让前者
+  全部判 MISSING → 0 资源 → failed，而用户只看到"失败"、看不出是路径不对。
+  现在 `_resolve_base()` 默认基址先用、**不中才试探候选**（正常相册零额外请求，
+  这是被测试逼出来的：第一版无条件预探测让 happy path 平白多一次请求）。
+  输入是直链时 `parse_resource_hint()` 直接从 URL 读出基址+宽度（⚠️ hint 必须传
+  **用户原始输入**，传 gid 的话直链信息早丢了）。`_match_score` 也要把
+  `base_candidates` 纳入前缀比对，否则 `photos2` 直链不认领 → 落 generic。
+- 任务级 `options.proxy` 覆盖全局 `settings.proxy`（透传到 `discover(proxy=)`）。
 
 ## mirrors 机制
 采集器给 `mirrors` → `resources.mirrors`(JSON) → `download_with_mirrors`。

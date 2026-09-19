@@ -70,6 +70,54 @@ def test_pause_marks_paused_and_resume_continues(tmp_db, tmp_path, monkeypatch):
         mgr.shutdown(wait=True)
 
 
+def test_watchdog_spares_task_whose_heartbeat_is_fresh(tmp_db):
+    """别的心跳还在跳 -> 说明有工作进程在推进, 绝不能判死。
+
+    真实事故: 两个后端实例共用一个 SQLite 时, A 实例的看门狗看不到 B 实例
+    正在跑的任务(进程内字典), 把一个正在枚举 114 张图的任务标成 failed,
+    于是 worker 走到 extracting->downloading 时状态对不上, 整个任务报销。
+    """
+    tid = db.create_task("https://fake/album", "fake", None, {})
+    db.update_task_status(tid, tm.TaskStatus.EXTRACTING)
+    db.update_task(tid, hb=time.time())  # 刚刚还在跳
+
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    try:
+        mgr._watchdog_pass()
+        assert db.get_task(tid)["status"] == tm.TaskStatus.EXTRACTING
+        assert not (db.get_task(tid)["error"] or "")
+    finally:
+        mgr.shutdown(wait=True)
+
+
+def test_watchdog_reaps_task_with_dead_heartbeat(tmp_db):
+    """心跳早就停了 -> 确实是重启遗留, 该收就收。"""
+    tid = db.create_task("https://fake/album", "fake", None, {})
+    db.update_task_status(tid, tm.TaskStatus.EXTRACTING)
+    db.update_task(tid, hb=time.time() - 99999)
+
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    try:
+        mgr._watchdog_pass()
+        assert db.get_task(tid)["status"] == tm.TaskStatus.FAILED
+    finally:
+        mgr.shutdown(wait=True)
+
+
+def test_watchdog_reaps_task_with_no_heartbeat_at_all(tmp_db):
+    """老库行没有 hb 列值 -> 按旧行为处理(判死), 不留悬空任务。"""
+    tid = db.create_task("https://fake/album", "fake", None, {})
+    db.update_task_status(tid, tm.TaskStatus.DOWNLOADING)
+    db.update_task(tid, hb=None)
+
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    try:
+        mgr._watchdog_pass()
+        assert db.get_task(tid)["status"] == tm.TaskStatus.FAILED
+    finally:
+        mgr.shutdown(wait=True)
+
+
 def test_cannot_pause_terminal_task(tmp_db):
     tid = db.create_task("https://fake", "fake", None, {})
     db.update_task_status(tid, tm.TaskStatus.SUCCESS)
@@ -101,11 +149,15 @@ def test_infer_name_from_album_directory():
     assert tm.TaskManager._infer_name([]) is None
 
 
-def test_valid_resource_rejects_tiny_advert_pixel():
-    """有效资源定义: 开启 min_image_bytes 后, 1x1 跟踪像素/广告占位图被挡。"""
+def test_valid_resource_rejects_tiny_image():
+    """有效资源定义: 开启 min_image_bytes 后, 体积过小的图片被挡。
+
+    注意 URL 要挑一个**不像广告**的 —— 否则会被 URL 层的广告识别先拦下
+    (它更靠前也更省), 这条用例就测不到体积下限了。
+    """
     f = Filters({"min_image_bytes": "1KB"})
-    reason = f.match_resource("image", "https://x/track.gif", size=150)
-    assert reason and "广告" in reason
+    reason = f.match_resource("image", "https://x/p/0001.jpg", size=150)
+    assert reason and "广告/占位" in reason
     # 真图放行
     assert f.match_resource("image", "https://x/1.jpg", size=500 * 1024) is None
     # 视频不受图片下限约束

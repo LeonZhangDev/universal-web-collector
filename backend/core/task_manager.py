@@ -527,9 +527,21 @@ class TaskManager:
             raise TaskCancelled()
 
     def _heartbeat(self, task_id):
+        """刷新心跳: 内存一份(本进程判活用), 库里一份(别的进程判活用)。
+
+        只写内存是不够的 —— `_LIVE_MANAGERS` 是进程内列表, 两个实例共用一个
+        SQLite 时, A 进程看不到 B 进程正在跑的任务, 会把它判成"重启遗留"直接
+        标 failed, 而那个任务其实跑得好好的(实测: 一个正在枚举 114 张图的任务
+        就这么被杀掉了)。库里的 hb 是跨进程的真相: 还在跳就是活的。
+        """
+        now = time.time()
         e = self._entry(task_id)
         if e:
             e["hb"] = time.monotonic()
+        try:
+            db.update_task(task_id, hb=now)
+        except Exception:
+            pass
 
     def _run(self, task_id, resume=False):
         try:
@@ -668,7 +680,19 @@ class TaskManager:
         )
         kwargs = {}
         if accepts_kw or "log" in params:
-            kwargs["log"] = lambda m: self._safe_log(task_id, m)
+            # 采集阶段的日志同时当心跳用: 图集枚举可能连跑几百个序号、
+            # 十几分钟不碰一次 _set_progress, 期间心跳不刷新就会被看门狗当成
+            # "卡住了"取消掉。节流到 5 秒一次, 避免每条日志都写库。
+            beat = [0.0]
+
+            def crawl_log(m):
+                self._safe_log(task_id, m)
+                now = time.time()
+                if now - beat[0] >= 5:
+                    beat[0] = now
+                    self._heartbeat(task_id)
+
+            kwargs["log"] = crawl_log
         if options and (accepts_kw or "options" in params):
             kwargs["options"] = options
         return spider.crawl(url, **kwargs) if kwargs else spider.crawl(url)
@@ -941,6 +965,12 @@ class TaskManager:
                 # 别的 TaskManager 实例正在跑它, 不是遗留任务
                 continue
             if entry is None:
+                # 本进程没在跑它 —— 可能是别的进程在跑, 也可能是真死了。
+                # 判据只能是**库里的心跳**: 还在跳就说明有别的工作进程在推进,
+                # 这时候标 failed 就是误杀(多实例/多 worker 共用库时会踩到)。
+                hb = self._row_field(t, "hb")
+                if hb and time.time() - float(hb) <= settings.stale_task_timeout:
+                    continue
                 db.update_task(tid, error="stale task: no active worker (server restarted?)")
                 db.transition_task_from_any(
                     tid, TaskStatus.FAILED,

@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from collectors import COLLECTORS, get_collector
+from collectors import COLLECTORS, get_collector, resolve_collector
 from collectors.gallery_base import (
     ALBUM_TITLE_MODES,
     DEFAULT_ALBUM_TITLE,
@@ -114,10 +114,28 @@ def _gallery_options(filters=None, quality=None, media=None, album_title=None,
     return options
 
 
+#: 采集器处的 "auto" = 让后端按 URL 挑一个。
+#: ⚠️ 库里**永远存解析后的真实采集器名**, 否则重放/订阅巡检时
+#: "同一个 auto 指向了不同采集器", 任务行为就不再可复现了。
+AUTO_COLLECTOR = "auto"
+
+
+def _pick_collector(url, chosen):
+    """确定本次实际使用的采集器: 显式指定 -> 校验存在; auto/留空 -> 自动识别。"""
+    name = (chosen or "").strip()
+    if name and name != AUTO_COLLECTOR:
+        if name not in COLLECTORS:
+            raise HTTPException(status_code=400, detail=f"unknown collector: {name}")
+        return name, None
+    got = resolve_collector(url, fallback=None)
+    if not got["collector"]:
+        raise HTTPException(status_code=400, detail=got["reason"])
+    return got["collector"], got
+
+
 @router.post("/tasks/create", response_model=TaskCreateOut)
 def create(payload: TaskCreateIn):
-    if payload.collector not in COLLECTORS:
-        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
+    collector, resolved = _pick_collector(payload.url, payload.collector)
     download_dir = _validate_download_dir(payload.download_dir)
     options = _gallery_options(
         filters=payload.filters,
@@ -127,14 +145,15 @@ def create(payload: TaskCreateIn):
         album_tags_dir=payload.album_tags_dir,
     )
 
-    task_id = db.create_task(payload.url, payload.collector, download_dir, options)
+    task_id = db.create_task(payload.url, collector, download_dir, options)
     task_manager.submit(task_id)
-    return TaskCreateOut(task_id=task_id, status="pending")
+    # resolved 非 None 时把识别结论一并回显, 界面可以显示"已识别为 X"
+    return TaskCreateOut(task_id=task_id, status="pending", resolved=resolved)
 
 
 class PreviewIn(BaseModel):
     url: str
-    collector: str = "generic"
+    collector: str = AUTO_COLLECTOR
     quality: Optional[str] = None
     media: Optional[str] = None
     album_title: Optional[str] = None
@@ -154,14 +173,13 @@ def preview(payload: PreviewIn):
     存在的意义: 一个相册可能是"12 张图 + 4 段视频共 260MB", 让用户在**创建
     之前**就看到体积, 而不是等它默默下完(见 media / max_size 选项)。
     """
-    if payload.collector not in COLLECTORS:
-        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
-    spider = get_collector(payload.collector)
+    collector, resolved = _pick_collector(payload.url, payload.collector)
+    spider = get_collector(collector)
     fn = getattr(spider, "preview", None)
     if not callable(fn):
         raise HTTPException(
             status_code=400,
-            detail=f"采集器 {payload.collector} 不支持预览(仅图集类采集器支持)",
+            detail=f"采集器 {collector} 不支持预览(仅图集类采集器支持)",
         )
     options = _gallery_options(
         quality=payload.quality,
@@ -176,12 +194,27 @@ def preview(payload: PreviewIn):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     data["logs"] = logs
+    if resolved:
+        data["resolved"] = resolved
     return data
+
+
+@router.get("/collectors/resolve")
+def resolve_collector_api(url: str = ""):
+    """URL -> 采集器, 不做任何网络请求。
+
+    存在的意义: 自动识别必须**先给用户看见再生效**。这里是纯 CPU 的字符串
+    判定, 前端可以在输入框失焦时立刻回显"已识别为 X", 让用户有机会改。
+    """
+    return resolve_collector((url or "").strip(), fallback=None)
 
 
 @router.get("/collectors")
 def list_collectors():
-    return [{"name": n} for n in sorted(COLLECTORS)]
+    return [
+        {"name": n, "supports_preview": hasattr(COLLECTORS[n], "preview")}
+        for n in sorted(COLLECTORS)
+    ]
 
 
 @router.get("/config")
@@ -190,6 +223,8 @@ def get_config():
     return {
         "download_dir": str(settings.download_dir),
         "resource_types": sorted(DOWNLOADERS.keys()),
+        "collectors": sorted(COLLECTORS),
+        "auto_collector": AUTO_COLLECTOR,
         "qualities": list(QUALITY_KEYS),
         "medias": list(MEDIA_KEYS),
         "default_media": DEFAULT_MEDIA,
@@ -416,7 +451,7 @@ def mkdir_fs(payload: MkdirIn):
 
 class WatchIn(BaseModel):
     url: str
-    collector: str = "generic"
+    collector: str = AUTO_COLLECTOR
     interval_minutes: int = 360
     download_dir: Optional[str] = None
     quality: Optional[str] = None
@@ -431,8 +466,7 @@ def create_watch(payload: WatchIn):
 
     巡检任务内部**强制增量**: 复用历史已下载的内容, 不再重复传输。
     """
-    if payload.collector not in COLLECTORS:
-        raise HTTPException(status_code=400, detail=f"unknown collector: {payload.collector}")
+    collector, resolved = _pick_collector(payload.url, payload.collector)
     if payload.interval_minutes < 1:
         raise HTTPException(status_code=400, detail="interval_minutes 至少为 1")
     options = {}
@@ -462,10 +496,12 @@ def create_watch(payload: WatchIn):
     if download_dir:
         options["download_dir"] = download_dir
     wid = db.create_watch(
-        payload.url, payload.collector, payload.interval_minutes, options,
+        payload.url, collector, payload.interval_minutes, options,
         run_now=payload.run_now,
     )
-    return dict(db.get_watch(wid))
+    watch = dict(db.get_watch(wid))
+    # 订阅会长期反复跑, 识别结论更要回显: 一旦猜错, 每次巡检都会错
+    return watch if resolved is None else {**watch, "resolved": resolved}
 
 
 @router.get("/watches")

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import FolderPicker from "./components/FolderPicker.vue";
 import TaskDetail from "./components/TaskDetail.vue";
 import TaskTable from "./components/TaskTable.vue";
@@ -19,6 +19,7 @@ import {
   listWatches,
   previewTask,
   runWatch,
+  resolveCollector,
   startLogin,
   stopLogin,
   toggleWatch,
@@ -27,19 +28,31 @@ import {
 const tasks = ref([]);
 const selectedId = ref(null);
 const url = ref("");
-const collector = ref("generic");
-const collectors = ref(["generic"]);
+const collector = ref("auto");
+// 后端列表不含 "auto", 由前端补在最前 —— 它是个"让后端挑"的选择, 不是采集器
+const collectors = ref(["auto"]);
 // 采集器中文名; 后端只给代号, 展示层做映射, 未收录的回退显示代号本身
 const collectorLabel = {
+  auto: "自动识别 (推荐)",
   generic: "通用网页(浏览器抓取)",
   xchina: "XChina 页面(浏览器抓取)",
   xchina_gallery: "XChina 图集/视频相册(相册 ID / 相册页 URL 均可)",
 };
+// 自动识别的结论。**必须回显给用户并可覆盖** —— 悄悄生效的自动识别, 一旦
+// 猜错用户连"该去哪里改"都无从下手, 只会以为站点坏了。
+const resolved = ref(null);
+// 实际会用的采集器: 手动指定 > 已识别 > generic(让后端报错)
+const effectiveCollector = computed(() => {
+  if (collector.value !== "auto") return collector.value;
+  return resolved.value?.collector || "generic";
+});
 // 不同采集器对输入的要求不同, 提示语跟着切换
 const urlPlaceholder = computed(() =>
-  collector.value === "xchina_gallery"
-    ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX.html) / 任意一张图片或视频 URL 都行"
-    : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
+  collector.value === "auto"
+    ? "粘贴任意链接或图集 ID, 自动识别采集器(相册页 URL / 图片直链 / 6aa113208a506 均可)"
+    : effectiveCollector.value === "xchina_gallery"
+      ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX.html) / 任意一张图片或视频 URL 都行"
+      : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
 );
 const creating = ref(false);
 const errorMsg = ref("");
@@ -56,7 +69,7 @@ const showPicker = ref(false);
 // 未被选中的档位会作为备用下载点, 主档位失败时自动切换。
 const qualities = ref(["original", "1200", "800", "600"]);
 const quality = ref("original");
-const isGallery = computed(() => collector.value === "xchina_gallery");
+const isGallery = computed(() => effectiveCollector.value === "xchina_gallery");
 const qualityLabel = {
   original: "原图 (画质最高)",
   1200: "1200px WebP",
@@ -140,6 +153,39 @@ function buildFilters() {
 
 const activeFilterCount = computed(() => Object.keys(buildFilters()).length);
 
+// ---- 采集器自动识别 ----
+// 为什么要回显: 不回显的自动识别, 一旦认错, 用户只能看到"采集到 0 个资源",
+// 既不知道错在哪、也不知道手选能绕过。所以结论必须在**创建之前**就摆在界面上。
+// debounce 只为避免打字过程中刷屏; 过期结果按序号丢弃(输入已变就别回填)。
+let resolveTimer = null;
+let resolveSeq = 0;
+
+async function autoResolve() {
+  const u = url.value.trim();
+  if (collector.value !== "auto" || !u) {
+    resolved.value = null;
+    return;
+  }
+  const seq = ++resolveSeq;
+  const got = await resolveCollector(u);
+  if (seq === resolveSeq) resolved.value = got;
+}
+
+watch([url, collector], () => {
+  resolved.value = null;
+  clearTimeout(resolveTimer);
+  resolveTimer = setTimeout(autoResolve, 300);
+});
+
+const resolveHint = computed(() => {
+  if (collector.value !== "auto" || !url.value.trim() || !resolved.value) return null;
+  const r = resolved.value;
+  if (!r.collector) return { kind: "bad", text: "无法识别该输入, 请手动选择采集器" };
+  const name = collectorLabel[r.collector] || r.collector;
+  if (r.ambiguous) return { kind: "warn", text: `识别结果不唯一: ${r.reason}` };
+  return { kind: "ok", text: `已识别为「${name}」`, reason: r.reason };
+});
+
 function toggleType(t) {
   const i = selTypes.value.indexOf(t);
   if (i >= 0) selTypes.value.splice(i, 1);
@@ -151,6 +197,7 @@ function savePrefs() {
     localStorage.setItem(
       LS_KEY,
       JSON.stringify({
+        collector: collector.value,
         downloadDir: downloadDir.value,
         quality: quality.value,
         media: media.value,
@@ -177,6 +224,8 @@ function loadPrefs() {
     if (!raw) return;
     const p = JSON.parse(raw);
     downloadDir.value = p.downloadDir || "";
+    // 持久化的可能是已经被后端移除的采集器名, 交给 onMounted 的列表校验兜底
+    if (p.collector) collector.value = p.collector;
     if (p.quality && qualities.value.includes(p.quality)) quality.value = p.quality;
     if (p.media && medias.value.includes(p.media)) media.value = p.media;
     if (p.albumTitle && albumTitles.value.includes(p.albumTitle)) {
@@ -449,6 +498,8 @@ async function removeW(w) {
 // 登录过程中后端周期性快照 cookies, 所以**直接把浏览器关掉就行**,
 // 不需要在第三方页面上找什么"完成"按钮。
 const sessionsData = ref({ sessions: [], jobs: [] });
+// 哪些域的登录态在采集时被判定失效(带它访问会被 Cloudflare 拒绝)
+const cfStaleDomains = computed(() => sessionsData.value.cf_stale || []);
 const showSessions = ref(false);
 const loginUrl = ref("");
 const loginJob = ref(null);
@@ -509,9 +560,13 @@ onMounted(async () => {
   try {
     const list = await getCollectors();
     if (list.length) {
-      collectors.value = list.map((c) => c.name);
+      // "auto" 由前端补: 它是"让后端挑"的选择, 不是一个真实采集器。
+      // 放在最前 = 默认项, 用户不用先理解三个采集器分别是什么才能开始用。
+      collectors.value = ["auto", ...list.map((c) => c.name)];
+      // 上次持久化的采集器可能已经被后端移除, 这种情况退回自动识别,
+      // 而不是让下拉框悄悄停在一个不存在的值上
       if (!collectors.value.includes(collector.value)) {
-        collector.value = collectors.value[0];
+        collector.value = "auto";
       }
     }
   } catch (e) {
@@ -552,6 +607,7 @@ onUnmounted(() => {
   if (es) es.close();
   clearInterval(timer);
   clearInterval(loginTimer);
+  clearTimeout(resolveTimer);
 });
 </script>
 
@@ -582,6 +638,12 @@ onUnmounted(() => {
         {{ previewing ? "读取中..." : "预览" }}
       </button>
     </form>
+
+    <!-- 自动识别的结论: 必须在创建之前给用户看见, 且一行就够, 不占流程位置 -->
+    <div v-if="resolveHint" class="dir-row resolve-row" :class="resolveHint.kind">
+      <span class="lbl">识别结果</span>
+      <span :title="resolveHint.reason || ''">{{ resolveHint.text }}</span>
+    </div>
 
     <div class="dir-row">
       <span class="lbl">下载目录</span>
@@ -890,11 +952,19 @@ onUnmounted(() => {
         </button>
       </div>
 
+      <!-- 失效的登录态必须显式警告: 带着它访问会被 Cloudflare 永久拒绝,
+           而用户看到的现象只是"采到的东西目录名变成了图集 ID" -->
+      <div class="cf-stale" v-if="cfStaleDomains.length">
+        登录态已失效: {{ cfStaleDomains.join("、") }} (带着它访问会被 Cloudflare
+        拒绝)。请重新登录生成新的登录态。
+      </div>
+
       <div class="row-list" v-if="sessionsData.sessions.length">
         <div class="row-item" v-for="s in sessionsData.sessions" :key="s.domain">
-          <span class="dot"></span>
+          <span class="dot" :class="{ off: cfStaleDomains.includes(s.domain) }"></span>
           <span class="grow">{{ s.domain }}</span>
-          <span class="mono dim">{{ s.modified }}</span>
+          <span class="mono dim" v-if="cfStaleDomains.includes(s.domain)">已失效</span>
+          <span class="mono dim" v-else>{{ s.modified }}</span>
           <button class="ghost mini" @click="removeSession(s.domain)">删除</button>
         </div>
       </div>
@@ -1044,5 +1114,27 @@ onUnmounted(() => {
   flex: 1;
   color: var(--muted);
   font-size: 12px;
+}
+/* 自动识别的结论: 认出来了是绿色, 不唯一用黄色, 认不出来用红色 */
+.resolve-row {
+  font-size: 12px;
+  color: var(--muted);
+}
+.resolve-row.ok span:last-child {
+  color: var(--ok);
+}
+.resolve-row.warn span:last-child {
+  color: var(--warn);
+}
+.resolve-row.bad span:last-child {
+  color: var(--err);
+}
+.cf-stale {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--warn);
+  color: var(--warn);
+  font-size: 12px;
+  background: var(--panel-2);
 }
 </style>

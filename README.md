@@ -37,9 +37,10 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | /tasks/create | 创建任务 `{"url": "...", "collector": "generic"}` |
+| POST | /tasks/create | 创建任务 `{"url": "...", "collector": "auto"}` |
 | POST | /tasks/preview | **创建前预告**: 只发现不下载不写库, 返回目录名/张数/视频体积/标签 |
 | GET | /collectors | 已注册采集器列表 |
+| GET | /collectors/resolve | **URL -> 采集器**(纯字符串判定, 不打网络请求), 用于"已识别为 X"回显 |
 | GET | /tasks | 任务列表 |
 | GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
 | GET | /tasks/{id} | 任务详情 + 资源 |
@@ -70,7 +71,7 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 
 ```json
 {
-  "url": "...", "collector": "generic",
+  "url": "...", "collector": "auto",
   "download_dir": "D:\\my-out",
   "name_template": "{site}/{album}/{seq4}.{ext}",
   "quality": "original",
@@ -92,6 +93,31 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 `download_dir` 必须是绝对路径、不含 `..`、不能是盘符根目录;
 文件始终落在该目录下的 `<task_id>/` 子目录。被过滤的资源标记
 `filtered` 并把原因写入 `note`, 可在详情页"强制下载"单独补下。
+
+### 采集器自动识别
+
+`collector` 缺省就是 `"auto"`: 后端按 URL 形态挑一个采集器, **不需要用户
+记住"这个链接该用哪个采集器"**。每个采集器用类方法 `match_score(url)` 声明
+自己能处理什么(返回 `None` = 不认领), 分数越高越优先, 通用采集器恒定垫底。
+
+| 输入 | 识别结果 |
+| --- | --- |
+| `https://xchina.co/photo/id-6aa513208a506.html` | `xchina_gallery` (分数 100, 相册页) |
+| `https://img.xchina.io/photos/6aa513208a506/00001.jpg` | `xchina_gallery` (分数 50, 资源直链) |
+| `6aa513208a506`(纯图集 ID) | `xchina_gallery` (分数 10) |
+| `https://example.com/a/b` | `generic`(没有专用采集器认领) |
+| `随便打几个字` | 无法识别 -> 400 "请手动选择采集器" |
+
+三条设计约束:
+
+1. **认领必须有凭据** —— 只凭域名不够, 必须先 `parse_gid` 成功, 而且用的是
+   `strict` 模式(不用"路径末段"那条退路)。`/tag/some-tag` 这种列表页的末段
+   同样过得了 ID 字符集校验, 被认领就会去枚举一个不存在的图集 —— 后果是
+   "任务成功但 0 个资源", 比报错难查得多。
+2. **库里存解析后的真名, 不存 `auto`** —— 否则重放/订阅巡检时同一个 `auto`
+   可能指向不同采集器, 任务行为不再可复现。
+3. **结论必须回显且可覆盖** —— 界面在输入框失焦时调 `/collectors/resolve`
+   显示"已识别为 X"; 认不出来或结果不唯一会明确提示。手选永远优先。
 
 `name_template` 可用占位符: `{site}` `{host}` `{album}` `{seq}` `{seq4}`
 `{ext}` `{type}` `{id}`, 支持 `/` 分层; 含 `..` 或绝对路径分隔符的模板
@@ -148,7 +174,7 @@ curl -X POST localhost:8000/tasks/preview \
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (200 用例)
+make test           # pytest (245 用例)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -200,6 +226,18 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
   不再出现"任务成功但什么都没下到"
 - 登录态: `POST /sessions/login` 起 headful 浏览器手动登录, 定期快照
   storage_state, 落 `browser_state/{domain}.json`
+  - ⚠️ 带着**失效**的 `cf_clearance` 访问会得到 `Attention Required!`(永久拒绝,
+    不会自愈)。一旦在使用登录态时被这样拒过, 该域登录态会被标记失效并停用,
+    `GET /sessions` 的 `cf_stale` 字段会列出了来说明"请重新登录"(详见下节)
+- Cloudflare 长期对策(见 `collectors/album_meta.py` 模块文档):
+  - **不投入指纹对抗** —— 军备竞赛打不赢, 真正的对策是让采集**不依赖**那个
+    HTML 页: 资源发现永远走纯 HTTP 序号枚举, 相册页只提供目录名/自报数量/
+    视频体积这些锦上添花的信息, 拿不到就降级用图集 ID 命名
+  - **域级熔断**: 连续 3 次读不到(被拦)就在 10 分钟内**不再开 Chromium**,
+    直接降级并说明原因 —— 每次读页都要开一个 headless 浏览器(几十秒),
+    明知道会被拦还去开纯粹是浪费, 也更像扫描器
+  - **降级原因可见**: 所有降级路径都往日志写人话(还要回答"接下来会怎样")
+  - 被拦 ≠ 登录态失效: 只有**带着登录态**被拒才把账记到登录态头上
 - 输出目录: 支持任务级自定义目录, 文件服务按任务目录做越权校验
 - 下载限速: 站点级并发 + 请求间隔(支持随机区间, 如 3~10 秒模拟人工节奏);
   支持 HTTP/SOCKS5 代理。并发与间隔是两个**正交**闸门, 互不影响

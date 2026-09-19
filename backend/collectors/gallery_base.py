@@ -57,6 +57,7 @@ import requests
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings
 from core.filters import fmt_size
 from core.naming import clean_segment, safe_relative
+from collectors.scores import SCORE_ALBUM_PAGE, SCORE_BARE_ID, SCORE_RESOURCE_URL
 
 PROBE_OK = "ok"            # 资源存在
 PROBE_MISSING = "missing"  # 序号越界(服务器仍未返回 404, 但内容不是媒体)
@@ -229,7 +230,7 @@ def _ext_tail(variant, default):
     return "." + tail[-1].lower() if len(tail) > 1 else default
 
 
-def parse_gid(site, raw):
+def parse_gid(site, raw, strict=False):
     """从「图集 ID / 资源直链 / 相册页 URL」中提取图集 ID。
 
     支持三种输入::
@@ -245,6 +246,12 @@ def parse_gid(site, raw):
     路径末段 `10` 当作图集 ID, 后续去枚举 `photos/10/00001.jpg`。该站对不存在的
     图集仍返回 200 + text/html, 于是被判定为"序号不存在", 连续 3 次后停止,
     最终**任务报 success 但 0 个资源** —— 用户完全看不出哪里错了。
+
+    `strict=True` 时**跳过下面的末段退路**, 只认正则配出来的 ID。它为自动
+    识别服务: `/tag/some-tag` 这种列表页的末段同样过得了 ID 字符集校验,
+    于是会被当成图集 ID 认领, 后果是去枚举一个不存在的图集 —— 又是一次
+    "成功但 0 资源"。真实采集保留退路(用户已手选采集器, 输入形态各异);
+    **替用户做决定的场合必须用 strict**, 那里猜错的代价是静默的。
     """
     s = (raw or "").strip()
     if not s:
@@ -264,6 +271,8 @@ def parse_gid(site, raw):
     m = re.search(rf"[?&]{re.escape(site.id_in_query)}=([0-9A-Za-z_-]{{6,}})", s)
     if m:
         return m.group(1)
+    if strict:
+        return None
 
     # 退路: 取路径最后一段, 去掉扩展名后再判断它到底像不像一个 ID
     seg = urlparse(s).path.rstrip("/").rsplit("/", 1)[-1]
@@ -496,10 +505,59 @@ def _video_at_first_seq(site, gid, session=None):
             sess.close()
 
 
+def _netloc_path(url):
+    p = urlparse(url)
+    return p.netloc.lower(), p.path.rstrip("/")
+
+
+def _match_score(site, raw):
+    """站点声明 -> 对某个输入的认领分数(None = 不认领), 详见 `match_score`。"""
+    if site is None:
+        return None
+    s = (raw or "").strip()
+    if not s:
+        return None
+
+    # 纯 ID: 既没协议也没路径。这份功劳谁都能领, 所以分数最低。
+    if "://" not in s:
+        if "/" in s:
+            return None
+        return SCORE_BARE_ID if _ID_CHARS.fullmatch(s) else None
+
+    u = urlparse(s)
+    if u.scheme not in ("http", "https"):
+        return None
+    # 先坐实这是本图集站的东西: 只认正则配出来的 ID, 不能用末段退路 ——
+    # 退路会把 `/tag/some-tag` 这种列表页也认领下来(详见 parse_gid)。
+    if not parse_gid(site, s, strict=True):
+        return None
+
+    host, path = u.netloc.lower(), u.path
+    b_host, b_path = _netloc_path(site.base)
+    if host == b_host and (path + "/").startswith(b_path + "/"):
+        return SCORE_RESOURCE_URL
+    if site.album_url_template:
+        p_host, _ = _netloc_path(site.album_url_template.format(gid="x"))
+        if host == p_host:
+            return SCORE_ALBUM_PAGE
+    return None
+
+
 class SequenceGallerySpider:
     """序号枚举型采集器基类: 子类只需声明 `site`。"""
 
     site: GallerySite = None
+
+    @classmethod
+    def match_score(cls, url):
+        """该站点采集器对这个输入的自信程度; None = 处理不了。
+
+        ⚠️ **必须先 parse_gid 成功才认领**。只凭域名认领会把同域的其它路径
+        (如 `img.xchina.io/gallery/abc`)也揽下来, 然后 `parse_gid` 的退路
+        取到 `abc` 去枚举一个不存在的图集 —— 那条退路本来只服务于"已知是
+        资源/相册页"的情形。宁可让 URL 落给通用采集器, 也不接站不住的输入。
+        """
+        return _match_score(cls.site, url)
 
     def resolve_media(self, site, gid, media_opt, meta=None, log=None):
         """把 options.media 解析成实际要枚举的媒体列表。

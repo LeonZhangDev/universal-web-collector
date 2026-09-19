@@ -1030,3 +1030,89 @@ if size is None:
 - 同一相册 `album_title=id`: `sampled=true`、`page=false`, 退回探测到 `00001.mp4`, 仍判出含视频
 - 真实页面解析复核: `photos=12 videos_declared=4 maker=FENDSON`, 6 个标签, 4 段视频体积
 - 前端 `vite build` -> 72 modules, 新增「预览」按钮与预告面板
+
+---
+
+# V19 采集器自动识别 + Cloudflare 长期对策 ✅ 已完成(2026-09-19)
+
+用户不该记住"这个 URL 该配哪个采集器"; 而 Cloudflare 这件事的长期答案
+也不是打赢指纹对抗, 而是**让采集不依赖那个被保护的 HTML 页**。
+
+## 1. 采集器自动识别
+
+约定(见 `collectors/__init__.py` 模块文档)::
+
+    class SomeSpider:
+        @classmethod
+        def match_score(cls, url) -> Optional[int]: ...
+
+返回 `None` = 不认领; 整数 = 能处理, **越大越优先**; 同分按名字升序 ——
+可复现比"更聪明"重要, 否则同一输入今天走 A 明天走 B, 没法复盘。
+
+分数阶梯放在 `collectors/scores.py`(单独一个模块是为了**打破循环依赖**:
+`collectors/__init__` 末尾要导入所有 spider, spider 又要读这些常量)::
+
+    SCORE_ALBUM_PAGE(100) > SCORE_RESOURCE_URL(50) > SCORE_BARE_ID(10)
+    > SCORE_GENERIC(-1000)      # 通用采集器恒定垫底
+
+### ⚠️ 两个必须守住的点
+
+1. **认领必须有凭据, 而且要用 `strict` 模式解析 ID**
+   第一版只要求"域名匹配 + `parse_gid` 成功", 结果 `/tag/some-tag` 被认领:
+   `parse_gid` 的"路径末段退路"会从 `some-tag` 里读出一个看似合法的图集 ID,
+   于是去枚举一个不存在的图集 —— 又是"任务成功但 0 个资源"。
+   现在自动识别走 `parse_gid(..., strict=True)`, **跳过末段退路**, 只认
+   正则配出来的 ID。真实采集保留退路(那时用户已手选采集器)。
+   > 一句话: **替用户做决定的场合, 一律用最严的那条规则。**
+
+2. **库里存真名, 不存 `auto`**
+   存 `auto` 会让重放/订阅巡检时"同一个 auto 指向不同采集器", 任务行为
+   不再可复现。`TaskCreateIn.collector` 默认 `"auto"`, `_pick_collector()`
+   解析后立刻换成真名入库, 并把识别结论塞进响应的 `resolved` 字段回显。
+
+没法识别时(输入连 URL 都不是)**明确报 400**, 不悄悄兜底给 generic ——
+那会在 DNS 层失败, 错误信息对用户毫无帮助。
+
+前端: 下拉框首项是「自动识别」, 输入框变化 300ms 后调 `/collectors/resolve`
+显示"已识别为 X"; 认不出来 / 结果不唯一会换成对应颜色提示。
+**不回显的自动识别是不合格的** —— 一旦认错, 用户连去哪里手选都找不到。
+
+## 2. Cloudflare 长期对策
+
+先说结论: **不投入指纹对抗**。那是永远升级的军备竞赛, 而且靠 headless 指纹
+"打赢"之后, 下次失败往往更莫名其妙。真正的对策在架构上:
+
+- 资源发现永远走纯 HTTP 序号枚举(`gallery_base`), 相册页只提供
+  **锦上添花**的三样东西: 目录名、自报数量、视频体积线索。
+- 拿不到页面 -> 降级用图集 ID 命名。**采集照常**, 只差一点美观。
+
+在此之上补三件事(均在 `collectors/album_meta.py`):
+
+| 机制 | 做法 | 为什么 |
+| --- | --- | --- |
+| 域级熔断 | 连续 3 次读不到 -> 该域 10 分钟内不再开 Chromium, 直接降级 | 每次读页要开一次 headless(几十秒), 明知会被拦还去开纯属浪费, 也更像扫描器 |
+| 陈旧登录态隔离 | 带登录态被 `Attention Required!` 拒 -> 标记失效, 本进程不再使用; `/sessions` 的 `cf_stale` 列出 → 提示重新登录 | 陈旧 `cf_clearance` 是**永久拒绝**, 不会自愈; 必须第一次就认出来 |
+| 降级可见 | 所有降级路径往 log 写人话, 并回答"接下来会怎样" | 用户至少要分清"我被拦了"和"站点改版了" |
+
+⚠️ **被拦 ≠ 登录态失效**: 匿名同样会被拦。只有**带着登录态**被拒才把账记到
+登录态头上 —— 否则会无端让用户去重新登录, 而真正的问题没解决。
+
+同样的区分也用在熔断计数上: **页面结构不符**(比如站点改版、`objId` 对不上)
+不计入熔断 —— 那是另一个问题, 继续开浏览器也救不回来, 但不该把采集器拖进冷却。
+
+用户重新登录/删除登录态后, `finish_login` 与 `remove_session` 会调
+`clear_domain_state()`, 立刻解掉记录(不需要重启后端)。
+
+## 3. 验证(2026-09-19)
+
+- `pytest` -> **245 用例**(205 + `test_collector_autoresolve` 28 项 +
+  `test_cloudflare_guard` 12 项)
+- 这两个文件都是**先写测试才抓到 bug** 的典型:
+  - 自动识别 `/tag/some-tag` 被误认领 -> 引出 `parse_gid(strict=True)`
+  - `loader.html = ""`(连正文都没拿到)原先不计入熔断 -> 改成 `not html`
+- 真实站点冒烟: 三种输入形态 -> `xchina_gallery`; `example.com` -> `generic`;
+  `随便打几个字` -> 400 "没有采集器能处理该输入"
+- 真实预览走 auto: `12 图 / 4 视频 / 251.0MB`, `resolved.collector=xchina_gallery`
+- 真实 create 走 auto: 库存 `xchina_gallery`(非 auto), 图集不存在时报 failed 并
+  列出可接受的 URL 形态(失败是**响亮**的)
+- `verify_output` 33 项 / `verify_hls` 18 项 / `vite build` 72 modules

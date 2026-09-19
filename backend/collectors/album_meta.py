@@ -29,6 +29,31 @@ Cloudflare 的两个坑(2026-09-18 实测, 都踩过)
 **标题只是命名优化, 拿不到绝不能让采集任务失败** —— 否则一次 Cloudflare 抖动
 或没装浏览器就会让整个相册采不动。
 
+长期对策(2026-09-19)
+====================
+这个项目**不投入 Cloudflare 指纹对抗**: 那是一场永远升级的军备竞赛, 而且一旦
+靠headless 指纹"打赢", 下次失败往往更莫名其妙。真正的对策是让**采集不依赖
+那个 HTML 页** —— 资源发现永远走纯 HTTP 的序号枚举(见 `gallery_base`),
+相册页只提供三样锦上添花的东西: 目录名、自报数量、视频体积线索。拿不到就
+降级即用图集 ID 命名, 与"取得了命名"相比只差一点美观。
+
+在此之上补齐三件事, 让降级**省钱、可见、不自伤**:
+
+1. **域级熔断 + 冷却**(`_DOMAIN_STATE`)
+   每次读相册页都要开一个 headless Chromium(几百毫秒到几十秒), 而 CF 拦截
+   期间每次都注定失败。连续失败 `_CF_TRIP` 次就跳闸, 冷却 `_CF_COOLDOWN`
+   秒内**不再开浏览器**, 直接降级并说明原因。这既省时间, 也避免在对方眼里
+   "像个打不强退的扫描器" —— 后者更可能招来更严的策略。
+
+2. **陈旧登录态自动隔离**
+   带着失效的 `cf_clearance` 访问会直接拿到 `Attention Required!`(永久拒绝,
+   不会自愈)。一旦在使用登录态时命中, 就把该域的登录态标记为失效,
+   本进程内不再使用, 并明确提示"请重新登录"。
+
+3. **降级原因对用户可见**
+   所有降级路径都往 `log` 里写人话; 界面/预览原样显示。用户至少要知道
+   "是我被拦了还是站点改版了", 以及下一步该干什么。
+
 实测(2026-09-18, 相册 6a3654854fd25)
 ====================================
 页面里有几段可用线索::
@@ -117,6 +142,19 @@ _BAD_TITLE_RE = re.compile(
 # 用于挡掉挑战页 / 登录页 / 导航中的半成品页面。
 _READY_MARKERS = ("photo-items", "hero-title-item", "var videos", '"objId"')
 
+_CF_REJECT_HINT = "attention required"  # 只有带着失效登录态访问才会出现
+
+# ---- 域级熔断 / 登录态隔离状态 ----
+# host -> {"fails": 连续失败次数, "until": 冷却截止时间戳, "stale_state": 登录态已失效}
+_DOMAIN_STATE = {}
+
+#: 连续多少次"仍被拦"就跳闸。取值理由: 单次失败可能只是网络抖动或一次
+#: 偶发的挑战加严, 连续 3 次基本可以断定"这一阵压根过不去"。
+_CF_TRIP = 3
+#: 跳闸后的冷却秒数。10 分钟足够跨过一轮 CF 策略窗口, 又不至于让用户
+#: 在这台机器上等到失去耐心 —— 而且期间采集照旧, 只是目录名用图集 ID。
+_CF_COOLDOWN = 600.0
+
 DEFAULT_TITLE_SPLIT = r"\s+-\s+"
 
 
@@ -136,6 +174,93 @@ def _absolutize(url, base):
     if url.startswith("/") and base:
         return base.rstrip("/") + url
     return url
+
+
+def _host_of(url):
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url or "").netloc.lower()
+    except Exception:
+        return ""
+
+
+def cooldown_left(url_or_host):
+    """这个域还剩多少秒处于熔断冷却中; 0 表示可以正常尝试。"""
+    host = url_or_host if "//" not in (url_or_host or "") else _host_of(url_or_host)
+    st = _DOMAIN_STATE.get(host)
+    if not st:
+        return 0
+    left = st.get("until", 0) - time.time()
+    return max(0, int(left))
+
+
+def is_stale_state(url_or_host):
+    """已保存的登录态是否被判为失效(用例: 提示用户重新登录)。"""
+    host = url_or_host if "//" not in (url_or_host or "") else _host_of(url_or_host)
+    return bool(_DOMAIN_STATE.get(host, {}).get("stale_state"))
+
+
+def stale_state_domains():
+    """所有已失效的登录态域名, 用于界面提示"请重新登录"。"""
+    with _LOCK:
+        return [h for h, st in _DOMAIN_STATE.items() if st.get("stale_state")]
+
+
+def note_success(url):
+    """这一次读成功了 —— 连续失败计数清零(失败是"连续"才有意义)。"""
+    host = _host_of(url)
+    if not host:
+        return
+    with _LOCK:
+        st = _DOMAIN_STATE.setdefault(host, {})
+        st["fails"] = 0
+        st["until"] = 0
+
+
+def note_failure(url, html=None, used_state=False):
+    """记录一次 Cloudflare 拦截失败, 必要时跳闸。
+
+    返回 dict::{ "cooldown": 冷却秒数(>0 表示已跳闸), "stale_state": 本次判定为
+    登录态失效, "fails": 连续失败次数 }。一切都只影响内存状态 —— 磁盘上的
+    `browser_state/*.json` 不动, 重新生成之后重启进程即可恢复。
+    """
+    host = _host_of(url)
+    if not host:
+        return {"cooldown": 0, "stale_state": False, "fails": 0}
+    rejected = _CF_REJECT_HINT in (html or "").lower()
+    with _LOCK:
+        st = _DOMAIN_STATE.setdefault(host, {})
+        st["fails"] = st.get("fails", 0) + 1
+        # 只有**带着登录态**访问却被拒绝, 才能断定登录态失效;
+        # 匿名访问也一样会拿到拦截页, 不能甩锅给登录态。
+        if used_state and rejected:
+            st["stale_state"] = True
+        if st["fails"] >= _CF_TRIP:
+            st["until"] = time.time() + _CF_COOLDOWN
+        return {
+            "cooldown": max(0, int(st["until"] - time.time())) if st.get("until") else 0,
+            "stale_state": bool(st.get("stale_state")),
+            "fails": st["fails"],
+        }
+
+
+def clear_domain_state(url_or_host):
+    """抹掉某个域的熔断/隔离记录。
+
+    用例: 用户刚重新登录、或删掉了旧登录态 —— 这时候"记得它失效过"反而有害,
+    会让人以为重登也没用。删除登录态与完成登录的接口都会调用它。
+    """
+    host = url_or_host if "//" not in (url_or_host or "") else _host_of(url_or_host)
+    if host:
+        with _LOCK:
+            _DOMAIN_STATE.pop(host, None)
+
+
+def reset_state():
+    """清空熔断/隔离状态(测试与"我重新登录好了"的场景用)。"""
+    with _LOCK:
+        _DOMAIN_STATE.clear()
 
 
 def _is_challenge(html):
@@ -307,6 +432,23 @@ def _looks_ready(html):
     return any(m in html for m in _READY_MARKERS)
 
 
+_PW_OK = None
+
+
+def _playwright_missing():
+    """Playwright 是否不可用。结果**永久缓存**: 缺一个依赖这件事在运行期
+    不会变(与 ffmpeg 不同, ffmpeg 是可能被用户半路装上的)。"""
+    global _PW_OK
+    if _PW_OK is None:
+        try:
+            import playwright.sync_api  # noqa: F401
+
+            _PW_OK = True
+        except Exception:
+            _PW_OK = False
+    return not _PW_OK
+
+
 def _storage_state(url):
     """已保存的登录态文件路径(付费站点需要), 不存在返回 None。"""
     try:
@@ -339,8 +481,13 @@ def fetch_album_meta(url, split=DEFAULT_TITLE_SPLIT, log=None, use_cache=True,
                      gid=None):
     """取相册页元信息; 任何一步失败都返回 None(调用方回退图集 ID 命名)。
 
-    先匿名读, 不合格再带已保存的登录态重试 —— 顺序不能反:
+    顺序: 先匿名读, 不合格再带已保存的登录态重试 —— 不能反:
     陈旧的 `cf_clearance` 会让 Cloudflare 直接回 `Attention Required!`(见模块文档)。
+    已判定失效的登录态会被直接跳过, 不再"明知会拒还要试一遍"。
+
+    失败时按原因分流处理:**Cloudflare 拦截**会计入域级熔断(见本模块"长期对策"),
+    并在必要时把登录态标记为失效; **页面结构不符**(比如站点改版)则不计入 ——
+    那是另一个问题, 继续开浏览器尝试也救不回来, 但至少不该把采集器拖进冷却。
     """
     if not url:
         return None
@@ -352,30 +499,61 @@ def fetch_album_meta(url, split=DEFAULT_TITLE_SPLIT, log=None, use_cache=True,
         if hit and time.time() - hit[0] < META_TTL:
             return hit[1]
 
+    if _playwright_missing():
+        if log:
+            log("未安装 Playwright, 无法读取相册页; 本次用图集 ID 命名"
+                "(资源发现不依赖相册页, 只是少了相册名)")
+        return None
+
+    left = cooldown_left(url)
+    if left:
+        if log:
+            log(f"相册页连续取不到(Cloudflare 拦截), {left}s 内不再开浏览器尝试; "
+                "本次用图集 ID 命名 —— 图片/视频照常采集")
+        return None
+
     attempts = [None]
-    state = _storage_state(url)
-    if state:
-        attempts.append(state)
+    saved = _storage_state(url)
+    if saved and not is_stale_state(url):
+        attempts.append(saved)
+    elif saved and log:
+        log("已跳过保存的登录态: 它曾导致 Cloudflare 直接拒绝, 请重新登录后再用")
 
     for i, state in enumerate(attempts):
         html = _load_html(url, log=log, storage_state=state)
         meta = extract_album_meta(html, split=split) if html else None
         reason = _validate(meta, gid)
         if reason is None:
+            note_success(url)
             if i and log:
                 log("相册页: 匿名读取不合格, 带已保存登录态重试成功")
             if use_cache:
                 with _LOCK:
                     _CACHE[url] = (time.time(), meta)
             return meta
+
         more = i + 1 < len(attempts)
-        if log:
-            log(f"相册页读取无效({reason})" + (", 改用已保存的登录态重试" if more
-                                              else ", 用图集 ID 命名"))
+        tail = ", 改用已保存的登录态重试" if more else ", 用图集 ID 命名"
+        # _load_html 只在"没能在限时内拿到可用正文"时返回空 —— 无论具体原因是
+        # 挑战没解开还是页面是空的, 结果都一样: 这次白开了浏览器, 计入熔断。
+        blocked = (not html) or _is_challenge(html)
+        if blocked:
+            info = note_failure(url, html, used_state=bool(state))
+            bits = [reason]
+            if info["stale_state"]:
+                bits.append("保存的登录态已失效(带着它访问会被 Cloudflare 永久拒绝),"
+                            " 请在登录态管理里重新生成")
+            if info["cooldown"]:
+                bits.append(f"连续 {info['fails']} 次被拦, "
+                            f"未来 {info['cooldown']}s 内不再开浏览器重试")
+            if log:
+                log("相册页读取无效(%s)%s" % ("; ".join(bits), tail))
+        elif log:
+            log(f"相册页读取无效({reason}){tail}")
     return None
 
 
 def clear_cache():
-    """清空缓存(测试用)。"""
+    """清空缓存(测试用)。熔断状态另有 `reset_state()`, 两者互不影响。"""
     with _LOCK:
         _CACHE.clear()

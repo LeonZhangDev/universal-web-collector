@@ -46,7 +46,8 @@ class FilterIn(BaseModel):
 
 class TaskCreateIn(BaseModel):
     url: str
-    collector: str = "generic"
+    # "auto" = 按 URL 自动识别; 库里存的永远是**解析后**的真实采集器名
+    collector: str = "auto"
     download_dir: Optional[str] = None  # 自定义输出目录(绝对路径), 留空用全局默认
     filters: Optional[FilterIn] = None
     quality: Optional[str] = None  # 图集采集器画质档: original / 1200 / 800 / 600
@@ -62,3 +63,6 @@ class TaskCreateIn(BaseModel):
 class TaskCreateOut(BaseModel):
     task_id: int
     status: str
+    # collector="auto" 时回填识别结论({collector, score, reason, ...}),
+    # 显式指定采集器时为 None —— 前端据此显示"已识别为 X"
+    resolved: Optional[dict] = None

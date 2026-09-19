@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS resources(
     mirrors TEXT,
     filename TEXT,
     content_type TEXT,
-    resolved_url TEXT
+    resolved_url TEXT,
+    -- 感知指纹与"疑似重复"(见 core/phash.py): 只标记, 绝不自动删除
+    phash TEXT,
+    duplicate_of INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_logs(
@@ -95,6 +98,11 @@ _ADD_COLUMNS = [
     ("resources", "filename", "TEXT"),
     ("resources", "content_type", "TEXT"),
     ("resources", "resolved_url", "TEXT"),
+    # 感知指纹(dHash, 16 位十六进制)与"疑似与哪条资源重复"(指向同任务的
+    # resources.id)。见 core/phash.py —— **只标记不删除**: 指纹会误判,
+    # 删文件是不可逆的, 而出错的代价由用户承担。
+    ("resources", "phash", "TEXT"),
+    ("resources", "duplicate_of", "INTEGER"),
 ]
 
 
@@ -356,6 +364,21 @@ def find_by_hash(hash_value):
     return query_one(
         "SELECT * FROM resources WHERE hash=? AND status='done' LIMIT 1", (hash_value,)
     )
+
+
+def task_phashes(task_id, exclude_id=None):
+    """本任务内已算出指纹的成功资源, 返回 [(resource_id, phash), ...]。
+
+    ⚠️ 只在**同一个任务内**比对。跨任务比对看着更"彻底", 但会让提示语变成
+    "与任务 #37 的第 12 张重复" —— 用户点不过去、也删不掉, 等于给了一条
+    无法行动的信息。而同一个相册内部才是真正的重复高发区。
+    """
+    rows = query(
+        "SELECT id, phash FROM resources WHERE task_id=? AND status='done'"
+        " AND phash IS NOT NULL" + (" AND id<>?" if exclude_id else ""),
+        (task_id, exclude_id) if exclude_id else (task_id,),
+    )
+    return [(r["id"], r["phash"]) for r in rows]
 
 
 # ---- logs ----

@@ -1372,3 +1372,137 @@ segments, duration, encrypted, key_url, ...)`:
 - 自动识别 12 形态复核: 6 种聚合形态 → `xchina_aggregate`, 相册/视频页/直链/
   裸 ID 各归其位, `/tag/some-tag` 与非本站域落 `generic`, 全部无歧义
 
+## 7. 正则加固 / CDN 画像 / 感知去重 / 形状软提示(2026-09-19 续)
+
+### 7.1 声明自检 `check_site`: 把"改一行正则的副作用"变成测试红灯
+
+`parse_gid` 取的是**首个命中**的 pattern, 所以新加一条正则时若不慎也能匹配旧
+URL, 行为就**静默**变了 —— 某个相册突然采空, 日志里一切正常。
+
+`GallerySite.id_samples = [(url, 期望gid), ...]` + `check_site(site)` 断言两件事:
+
+1. 每条样本经 `parse_gid(strict=True)` 得到期望的 gid;
+2. **没有任何一条 `id_patterns` 单独**就能对某条样本配出不同结果 ——
+   这是"谁先谁赢"的隐式依赖, 顺序一变行为就变, 应该修正则而不是靠顺序。
+
+第三层自洽检查: 声明了 `gid_shape` 却没有任何样本能通过 = 形状写窄了
+(自动识别会把真图集也挡在外面)。
+
+分工: 运行期只记 warn(采集器不该因一次自检失败就拒绝干活), 测试里
+`selfcheck_all() == {}` 是硬断言, 运维另跑 `scripts/selfcheck.py`。
+
+### 7.2 手选采集器的形状软提示
+
+`gid_shape` 在自动识别时是**硬**判据(不符直接不认领), 在手选时只给提示。
+理由是不对称: 自动识别认错是静默的(去枚举不存在的图集 -> "成功但 0 资源");
+手选是用户已表过的态, 而站点可能刚换 ID 格式、我们比用户知道得晚。
+
+实现上**刻意不塞进 `resolved`** —— 那个字段专指自动识别的结论, 界面靠 `auto`
+区分显示方式。所以 `_pick_collector` 返回三元组 `(名字, 识别结论, 软提示)`,
+创建响应里是 `TaskCreateOut.warning`(独立字段), 预告面板顶层也是 `warning`。
+
+### 7.3 CDN 画像: 消费 `seq_formats` 才是真正省钱的那一步
+
+`cdn_profile.py` 原本只被用来重排**基址**。实测发现问题: 探测循环是
+"格式外层、基址内层", 所以**宽度不对时会把每个候选基址都白试一遍**才轮到正确
+宽度 —— 用户那个相册因此花掉 6 次探测。把画像里的 `preferred_seq_format` 提到
+首位后:
+
+```
+冷启动  6 次探测(photos/photos2..5 × {seq:05d} 全灭, 才试到 photos2+{seq:04d})
+有画像  1 次探测(photos2 + {seq:04d})
+```
+
+⚠️ 只是**排序提示**: 全部候选组合仍真探一遍。反向断言
+(`test_profiled_format_does_not_hide_other_widths`) 专门锁住这一点, 防的
+是未来有人把 `fmts` 直接替换成 `[fav_fmt]`。
+
+### 7.4 ⚠️ `tests/conftest.py` 为什么必须隔离画像文件
+
+画像落在真实数据库旁边时, 测试会**借助磁盘文件偷偷互相通信**: 一个用例探到
+photos2 并记一笔, 之后每个用 XCHINA 的用例候选顺序都被改掉,
+`test_discover_no_extra_request_on_happy_path` 于是失败, 而报错只有
+"请求数 4 != 3", 完全看不出跟上个用例有关。单跑绿、全跑红、重跑又绿。
+
+解法: `UWC_CDN_PROFILE` 环境变量(生产上也是有用的运维开关), conftest 里
+autouse fixture 把它指到每个用例自己的 `tmp_path`。**隔离靠机制, 不靠自觉。**
+
+### 7.5 感知去重(dHash): 只标记, 绝不删除
+
+已有的是 sha256(字节级), 认不出"换尺寸 / 重新压缩 / 重复收录"——
+而图集站上最常见的重复恰恰是这种。`core/phash.py` 用 ffmpeg 解成 9x8 灰度再算
+64 位 dHash, **零新增依赖**。
+
+三条约束(写在模块 docstring 里, 改之前必读):
+
+1. **只标记不删除** —— dHash 会误判(纯色图、连拍), 删文件不可逆, 出错的代价
+   由用户承担。命中写 `resources.duplicate_of` + manifest 的 `duplicate_of`。
+2. **失败即放行** —— ffmpeg 不在 / 解码失败一律当"没算出指纹", 绝不因此让
+   下载失败。`_mark_perceptual_dup` 自己兜住所有分支。
+3. **不动 sha256 那条路径** —— 两条独立判据并行。
+
+实测判别力(ffmpeg 现场生成真图): 同图换尺寸 **距离 0**、同图重压 jpg **距离 0**、
+异图(testsrc2 vs smptebars) **距离 40**。阈值 4/64。
+
+几个易错点:
+
+- `-frames:v 1` 不能省: 动图会让 ffmpeg 一路吐帧, 输出超过 9x8 字节时旧实现会
+  把后续帧当同一张图的像素接着算 —— 得到一个"稳定但错误"的指纹, 比报错难查。
+- `distance(a, b)` 返回 `None`(没法比)与 `0`(完全相同)含义必须分开。
+  把"没法比"当"相同", 就是凭空冤枉用户的文件。
+- `find_duplicate` 要返回**最近**的那个而不是第一个命中的: 提示语里会写
+  "与 #N 疑似同一张, 距离 d 位", 报一个更不像的会让用户觉得功能不准,
+  于是整个标记都不看了。
+- **只在同一任务内比对**: 跨任务的"重复"用户点不过去也删不掉, 是不可行动的信息。
+- 默认开、可关(`filters.dedup_perceptual`), 但它**不算过滤条件**(不进
+  `Filters.active`)—— 否则每个任务都会打印一行"filter [无过滤条件]"。
+
+### 7.6 ⚠️ `FilterIn` 静默丢弃字段(界面开关空转的元凶)
+
+`models/schemas.py::FilterIn` 曾只声明 8 个字段, 而前端 `buildFilters()` 会发
+`min_width` / `min_height` / `exclude_ad` / `min_image_bytes`。pydantic 默认
+**忽略未知字段**, 于是这些参数在进入 `Filters` 之前就被丢掉了 ——
+**界面上的「尺寸下限」「排除广告位」开关按了没有任何效果**, 无报错、无日志,
+用户只会以为"这个功能没用"。
+
+实测: `FilterIn(min_width='300').model_dump()` 返回 `{}`。
+
+两条一起做: ① 已知键全部声明; ② `extra="allow"` 兜底(新前端 + 老后端混跑时
+不再吞参数, `Filters` 只读它认识的键, 多余键无害)。回归断言
+`test_filter_in_keeps_every_dimension_it_declares` 拿
+`Filters` 认识的键集合做对照 —— 以后新增维度忘了声明, 这里立刻红。
+
+### 7.7 验证(本轮)
+
+- `pytest` -> **458 用例**(新增 `test_phash` 19 项 + `test_site_declaration` 40 项)
+- `verify_output` 33 / `verify_hls` 18 / `vite build` 全过
+- 真站回归(同一相册): 冷启动 6 次探测 -> 有画像 **1 次**; `data/cdn_profile.json`
+  记录 `{photos2: n, {seq:04d}: n, last: photos2}`
+- 感知去重真实图片判别力: 同图 0 / 0 / 异图 40(阈值 4)
+
+## 8. 新增/改动的文件清单(本轮)
+
+```
+backend/core/phash.py           新   dHash 指纹(ffmpeg 解码, 零新依赖)
+backend/core/cdn_profile.py     新   站点 CDN 画像(含 UWC_CDN_PROFILE 开关)
+scripts/selfcheck.py            新   声明自检 + 画像快照
+tests/conftest.py               新   把 CDN 画像隔离到 tmp_path
+tests/test_phash.py             新   19 项
+tests/test_site_declaration.py  新   40 项
+backend/collectors/gallery_base.py   check_site / assert_site / selfcheck_all /
+                                     shape_warning / base_host_templates /
+                                     page_tail 列表化 / % 解码 / ±2 宽度 /
+                                     _hit() 记画像 / 画像排序
+backend/collectors/xchina/gallery.py id_samples(8 条, 覆盖全部输入形态)
+backend/core/database.py             resources.phash / duplicate_of + task_phashes()
+backend/core/manifest.py             manifest 带 phash / duplicate_of
+backend/core/filters.py              dedup_perceptual / dedup_threshold
+backend/models/schemas.py            FilterIn 补全 + extra="allow";
+                                     TaskCreateOut.warning; ResourceOut 补字段
+backend/core/task_manager.py         _mark_perceptual_dup()
+backend/api/tasks.py                 _pick_collector 三元组 / _manual_warning
+frontend/src/App.vue                 重复检测开关 / 手选提示行 / 偏好持久化
+frontend/src/components/TaskDetail.vue  疑似重复标记(清单 + 资源网格)
+frontend/src/style.css               .dup-hint
+```
+

@@ -62,6 +62,12 @@ def build_manifest(task, resources, out_dir, stats=None, error=None):
                 "content_type": _field(r, "content_type"),
                 "status": r["status"],
                 "note": _field(r, "note"),
+                # 感知指纹与"疑似重复"(见 core/phash.py)。**只标记不删除**:
+                # 文件仍在磁盘上, 这里只是把判断依据留给用户和下游脚本。
+                # 写成两个字段而不是塞进 note, 是为了能被 jq 直接筛:
+                #   jq '.resources[] | select(.duplicate_of) | .file'
+                "phash": _field(r, "phash"),
+                "duplicate_of": _field(r, "duplicate_of"),
             }
         )
 

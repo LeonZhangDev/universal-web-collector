@@ -18,6 +18,7 @@ from collectors.gallery_base import (
     DEFAULT_MEDIA,
     MEDIA_KEYS,
     QUALITY_KEYS,
+    shape_warning,
 )
 from core import database as db
 from core import events
@@ -145,22 +146,48 @@ AGGREGATE_MAX_DEPTH = 3
 AUTO_COLLECTOR = "auto"
 
 
+def _manual_warning(name, url):
+    """手选采集器时的**软**提示(目前只有"ID 形状不像本站")。没有则返回 None。
+
+    刻意不做成 400: 手选是用户已表过的态, 站点可能刚换 ID 格式而我们比用户
+    知道得晚(`core.filters` / `shape_warning` 里有完整理由)。但也刻意不塞进
+    `resolved` —— 那个字段专指**自动识别的结论**, 界面靠 `auto` 区分显示方式,
+    把两种性质不同的东西混进同一个字段, 以后谁都说不清它到底代表什么。
+    """
+    cls = COLLECTORS.get(name)
+    site = getattr(cls, "site", None) if cls else None
+    if site is None:
+        return None
+    try:
+        return shape_warning(site, url)
+    except Exception:
+        return None      # 软提示不该有能力让创建/预览失败
+
+
 def _pick_collector(url, chosen):
-    """确定本次实际使用的采集器: 显式指定 -> 校验存在; auto/留空 -> 自动识别。"""
+    """确定本次实际使用的采集器。
+
+    返回 `(采集器名, 识别结论, 软提示)`:
+
+    - **自动识别**: 第二项是 `resolve_collector` 的结论(界面用它显示"已识别为 X"),
+      第三项为 None —— 自动识别形状不符时是**不认领**, 轮不到软提示。
+    - **手动指定**: 第二项为 None(没走识别, 不该回显识别结论), 第三项可能给出
+      形状软提示。库里存的永远是解析后的真实采集器名, 与 `auto` 无关。
+    """
     name = (chosen or "").strip()
     if name and name != AUTO_COLLECTOR:
         if name not in COLLECTORS:
             raise HTTPException(status_code=400, detail=f"unknown collector: {name}")
-        return name, None
+        return name, None, _manual_warning(name, url)
     got = resolve_collector(url, fallback=None)
     if not got["collector"]:
         raise HTTPException(status_code=400, detail=got["reason"])
-    return got["collector"], got
+    return got["collector"], got, None
 
 
 @router.post("/tasks/create", response_model=TaskCreateOut)
 def create(payload: TaskCreateIn):
-    collector, resolved = _pick_collector(payload.url, payload.collector)
+    collector, resolved, warning = _pick_collector(payload.url, payload.collector)
     download_dir = _validate_download_dir(payload.download_dir)
     options = _gallery_options(
         filters=payload.filters,
@@ -174,8 +201,10 @@ def create(payload: TaskCreateIn):
 
     task_id = db.create_task(payload.url, collector, download_dir, options)
     task_manager.submit(task_id)
-    # resolved 非 None 时把识别结论一并回显, 界面可以显示"已识别为 X"
-    return TaskCreateOut(task_id=task_id, status="pending", resolved=resolved)
+    # resolved 非 None 时把识别结论一并回显, 界面可以显示"已识别为 X";
+    # warning 是**软**提示(任务已创建, 只是提醒多半粘错了链接), 界面不要当错误显示。
+    return TaskCreateOut(task_id=task_id, status="pending", resolved=resolved,
+                         warning=warning)
 
 
 class PreviewIn(BaseModel):
@@ -202,7 +231,7 @@ def preview(payload: PreviewIn):
     存在的意义: 一个相册可能是"12 张图 + 4 段视频共 260MB", 让用户在**创建
     之前**就看到体积, 而不是等它默默下完(见 media / max_size 选项)。
     """
-    collector, resolved = _pick_collector(payload.url, payload.collector)
+    collector, resolved, warning = _pick_collector(payload.url, payload.collector)
     spider = get_collector(collector)
     fn = getattr(spider, "preview", None)
     if not callable(fn):
@@ -249,6 +278,14 @@ def preview(payload: PreviewIn):
     data["logs"] = logs
     if resolved:
         data["resolved"] = resolved
+    # 手选采集器的形状软提示要出现在**用户正在看的那块面板**里。前端已经会渲染
+    # 预告顶层的 `warning`(采不到资源时给的就是"下一步怎么做"), 这里顺势放进去。
+    # 用 setdefault: 采集器自己给的 warning 更贴近本次结果, 不能被形状提示顶掉。
+    if warning:
+        data.setdefault("warning", warning)
+    # 兼容: 采集器自己也可能往 resolved 里塞 warning(旧路径), 一并提上来
+    if resolved and resolved.get("warning"):
+        data.setdefault("warning", resolved["warning"])
     return data
 
 
@@ -557,7 +594,7 @@ def create_watch(payload: WatchIn):
 
     巡检任务内部**强制增量**: 复用历史已下载的内容, 不再重复传输。
     """
-    collector, resolved = _pick_collector(payload.url, payload.collector)
+    collector, resolved, warning = _pick_collector(payload.url, payload.collector)
     if payload.interval_minutes < 1:
         raise HTTPException(status_code=400, detail="interval_minutes 至少为 1")
     # 与创建任务/预览**共用**同一个选项构造器。原先这里手抄了一份校验,
@@ -579,8 +616,13 @@ def create_watch(payload: WatchIn):
         run_now=payload.run_now,
     )
     watch = dict(db.get_watch(wid))
-    # 订阅会长期反复跑, 识别结论更要回显: 一旦猜错, 每次巡检都会错
-    return watch if resolved is None else {**watch, "resolved": resolved}
+    # 订阅会长期反复跑, 识别结论更要回显: 一旦猜错, 每次巡检都会错。
+    # 手选时的形状软提示同理 —— 订阅错一个 ID, 错的是**每一次**巡检。
+    if resolved is not None:
+        watch["resolved"] = resolved
+    if warning:
+        watch["warning"] = warning
+    return watch
 
 
 @router.get("/watches")

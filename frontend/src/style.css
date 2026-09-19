@@ -260,6 +260,9 @@ h3 { margin: 0 0 12px; font-size: 15px; }
 .stat-item.filtered { color: #d9b96a; }
 
 .resource-item .meta .sz { margin-left: 6px; font-size: 11px; color: #6c7885; }
+/* 疑似重复: 用提示色, 且**不禁用**任何操作 —— 文件还在, 可能用户就是要留着。
+   把它做成"灰色不可点"会让人以为被系统处理掉了。 */
+.resource-item .meta .dup-hint { color: var(--warn); }
 .resource-item .meta .note {
   margin-top: 4px; font-size: 11px; color: #d9b96a;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

@@ -160,11 +160,64 @@ worker 之后才收拾现场。
 
 - `TaskManager.shutdown(wait=True)`：测试必须等 worker 真退出，否则随机失败（生产 `wait=False`）。
 - ⚠️ 断言失败要 `check_eq` 打印期望/实际值 —— 只打标签的门禁排不了偶发失败。
+- ⚠️⚠️ **测试会借磁盘文件偷偷互相通信**：CDN 画像落在真实库旁时，一个用例探到
+  photos2 记一笔 → 之后每个用 XCHINA 的用例候选顺序被改 → "happy path 不该多花请求"
+  失败，而报错只有"请求数 4 != 3"，看不出跟上个用例有关。**单跑绿、全跑红、重跑又绿。**
+  解法：`tests/conftest.py` 里 autouse fixture 把 `UWC_CDN_PROFILE` 指到各用例的 `tmp_path`。
+  凡"运行期会攒数据、测试会读它"的模块，都要有一个这样的开关 + 隔离夹具。
+
+## 站点声明自检 / 形状软提示（本轮新增）
+
+- `GallerySite.id_samples = [(url, 期望gid), ...]` + `check_site(site)`：`parse_gid` 取**首个命中**，
+  新加正则若不慎也匹配旧 URL，行为**静默**变（某相册突然采空，日志全正常）。
+  自检还断言"没有哪条 pattern **单独**就能配出不同结果"（谁先谁赢的隐式依赖）。
+- 分工：运行期只 warn（不能因自检失败拒绝干活）＋ 测试里 `selfcheck_all() == {}` 硬断言。
+- `gid_shape`：自动识别 **硬** 判据（不符不认领）；**手选只给软提示，绝不 400** ——
+  手选是用户已表过的态，站点可能刚换 ID 格式而我们比用户知道得晚。
+  ⚠️ 软提示**不塞进 `resolved`**（那个字段专指自动识别结论）→ `_pick_collector` 返回三元组
+  `(名字, 识别结论, 软提示)`；`TaskCreateOut.warning` 是独立字段。
+
+## CDN 画像（本轮新增）
+
+- `data/cdn_profile.json`，`UWC_CDN_PROFILE` 可改路径或设 `off`。
+- **消费 `seq_formats` 才是省钱的那一步**：探测循环是"格式外层、基址内层"，宽度不对时
+  会把每个候选基址都白试一遍 → 实测 6 次探测。把上次命中的宽度提首位后 **1 次命中**。
+- ⚠️ 画像只是**排序提示**，全部组合仍真探一遍；反向断言锁住"画像指错宽度时仍能回到正确宽度"。
+- 另有用处：某基址占比**突然**从主跌到 0 = 站点在迁 CDN，比用户报障早得多。
+
+## 感知去重 dHash（本轮新增，`core/phash.py`）
+
+已有 sha256 认不出"换尺寸/重压缩/重复收录"，而这是图集站最常见的重复形态。
+ffmpeg 解成 9x8 灰度 → 64 位 dHash，**零新增依赖**。
+
+- ⚠️ **只标记不删除**（写 `resources.duplicate_of` + manifest），dHash 会误判（纯色/连拍），
+  删文件不可逆且代价由用户承担。
+- ⚠️ **失败即放行**：ffmpeg 不在/解码失败一律返回 None，绝不因此让下载失败。
+- ⚠️ `-frames:v 1` 不能省：动图会让 ffmpeg 一路吐帧，输出超 9x8 时会把后续帧当同一张图的
+  像素接着算 → "稳定但错误"的指纹，比报错难查。
+- ⚠️ `distance()` 的 `None`（没法比）与 `0`（完全相同）**必须分开**；把前者当后者就是凭空冤枉文件。
+- `find_duplicate` 返回**最近**的而非第一个命中的（提示语里要写距离，报个更不像的会毁掉可信度）。
+- ⚠️ **只在同一任务内比对**：跨任务的"重复"用户点不过去也删不掉，属不可行动信息。
+- 默认开、可关（`filters.dedup_perceptual`），但**不算过滤条件**（不进 `Filters.active`）——
+  否则每个任务都打印一行"filter [无过滤条件]"。
+- 实测判别力：同图换尺寸 **0**、同图重压 jpg **0**、异图(testsrc2 vs smptebars) **40**；阈值 4/64。
+
+## ⚠️ `FilterIn` 静默丢弃字段（曾让界面开关空转）
+
+`models/schemas.py::FilterIn` 曾只声明 8 个字段，而前端会发 `min_width`/`min_height`/
+`exclude_ad`/`min_image_bytes`。pydantic 默认**忽略未知字段** → 参数在进入 `Filters` 前被丢掉，
+**界面「尺寸下限」「排除广告位」开关按了没反应，无报错无日志**。
+实测 `FilterIn(min_width='300').model_dump()` 返回 `{}`。
+
+修法：① 已知键全部声明 ② `extra="allow"` 兜底（新前端+老后端混跑不再吞参数）。
+回归断言拿 `Filters` 认识的键集合做对照 —— 以后新增维度忘了声明立刻红。
+**教训：凡 pydantic 模型转发到"只读自己认识的键"的组件，必须显式声明 + 允许额外键。**
 
 ## 接入新站点
 
 新建 `collectors/<site>/spider.py` → `@register("<name>")` → 在 `collectors/__init__.py` import
 （`__init__` 末尾 import 所有 spider，spider 又要读常量 → 分数常量必须放 `scores.py` 防循环依赖）。
 **序号枚举型图集站**继承 `SequenceGallerySpider`，只声明 `GallerySite`
-（`id_patterns`/`page_tail`/`gid_shape`/URL 模板/变体/画质映射/`base_candidate_digits`），
-并可加 `match_score`。开工前按 skill `gallery-site-probe` 探测。
+（`id_patterns`/`page_tail`（可为列表）/`gid_shape`/`id_samples`/URL 模板/变体/画质映射/
+`base_candidate_digits`/`base_host_templates`），并可加 `match_score`。
+**`id_samples` 必填** —— 那是声明自检唯一的护栏。开工前按 skill `gallery-site-probe` 探测。

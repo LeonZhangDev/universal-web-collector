@@ -105,6 +105,12 @@ function badgeClass(s) {
   return "pending";
 }
 
+// 被标为"疑似重复"的项数。只用于**说明**这句提示为什么出现 —— 感知去重不会
+// 删任何文件, 所以这里不是一个"被清理了多少"的计数, 别把它显示成节省。
+const dupCount = computed(
+  () => (manifest.value?.resources || []).filter((i) => i.duplicate_of).length
+);
+
 async function load() {
   try {
     task.value = await getTask(props.taskId);
@@ -254,6 +260,11 @@ onUnmounted(() => clearInterval(timer));
             <div class="meta">
               <div class="name">{{ r.url.split("/").pop() || r.url }}</div>
               <span class="badge" :class="badgeClass(r.status)">{{ r.status }}</span>
+              <!-- 疑似重复只作提示, 不隐藏也不删 —— 与产出清单里同一个口径 -->
+              <span class="sz dup-hint" v-if="r.duplicate_of"
+                    title="感知指纹判定与同一任务内的另一张图疑似相同。文件已保留。">
+                疑似重复 #{{ r.duplicate_of }}
+              </span>
               <span class="sz" v-if="r.size">{{ fmtSize(r.size) }}</span>
               <button
                 v-if="canRetryResource && ['failed', 'skipped', 'filtered'].includes(r.status)"
@@ -291,16 +302,29 @@ onUnmounted(() => clearInterval(timer));
         <div class="m-tr m-th">
           <span>#</span><span>状态</span><span>文件</span><span>来源</span><span>sha256</span>
         </div>
-        <div class="m-tr" v-for="i in manifest.resources" :key="i.id">
+        <div class="m-tr" v-for="i in manifest.resources" :key="i.id"
+             :class="{ 'is-dup': i.duplicate_of }">
           <span>{{ i.seq }}</span>
           <span><em class="badge" :class="badgeClass(i.status)">{{ i.status }}</em></span>
-          <span class="ell" :title="i.file || '—'">{{ i.file || "—" }}</span>
+          <span class="ell" :title="i.file || '—'">
+            {{ i.file || "—" }}
+            <!-- 感知去重的标记: dHash 判"与 #N 疑似同一张"。**文件仍在磁盘上**,
+                 这里只提示, 不做任何隐藏/删除 —— 指纹会误判, 删不删由用户决定。 -->
+            <em v-if="i.duplicate_of" class="tag dup"
+                title="感知指纹(dHash)判定与同一任务内的另一张图疑似相同。文件已保留, 未删除。">
+              疑似重复 #{{ i.duplicate_of }}
+            </em>
+          </span>
           <span class="ell" :title="i.resolved_url || i.source_url">
             {{ (i.resolved_url || i.source_url || "").split("/").pop() }}
             <em v-if="i.resolved_url && i.resolved_url !== i.source_url" class="tag">镜像</em>
           </span>
           <span class="ell mono" :title="i.sha256 || ''">{{ (i.sha256 || "—").slice(0, 12) }}</span>
         </div>
+      </div>
+      <div class="m-note" v-if="dupCount">
+        其中 {{ dupCount }} 项被标为疑似重复 —— 依据是感知指纹, 不是字节一致,
+        所以<b>文件全部保留</b>。核对后自行决定是否删除。
       </div>
       <div class="m-note" v-if="manifest.error">任务错误: {{ manifest.error }}</div>
     </div>
@@ -400,6 +424,16 @@ onUnmounted(() => clearInterval(timer));
   background: var(--panel);
   color: var(--accent);
   margin-left: 4px;
+}
+/* 疑似重复: 用 warn 色而不是 err 色 —— 它不是错误, 只是一条"你看看"的提示。
+   用红色会让人以为下载出了问题, 跑去查一个不存在的问题。 */
+.tag.dup {
+  color: var(--warn);
+  cursor: help;
+}
+.m-tr.is-dup span:last-child,
+.m-tr.is-dup span:first-child {
+  opacity: 0.7;
 }
 .m-note {
   margin-top: 8px;

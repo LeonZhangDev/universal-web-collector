@@ -248,19 +248,87 @@ curl -X POST localhost:8000/tasks/preview \
 把已拿到的值带进下载层后, 大小过滤(`max_size`)在**图集任务上是零额外请求**的,
 只有 size 未知的采集器才回退一次 HEAD。
 
+## 去重与"什么是有效资源"
+
+两层去重, 职责不同, **都不删用户的文件**(除显式判定为广告的那一档):
+
+| 层 | 判据 | 命中后 | 默认 |
+|---|---|---|---|
+| 字节级 | sha256 完全一致 | 复用已有文件, 不重复传输 | 开 |
+| 感知级 | dHash 指纹海明距离 ≤ 4/64 | 写 `duplicate_of`, **文件保留** | 开 |
+
+字节级认不出"换尺寸 / 重新压缩 / 重复收录"的同一张图 —— 而这恰恰是图集站上
+最常见的重复形态。感知级用 ffmpeg 把图解成 9x8 灰度再算 64 位 dHash
+(`backend/core/phash.py`), **零新增依赖**(复用已装好的 ffmpeg)。
+
+三条硬约束(想改这个功能请先读 `phash.py` 的模块注释):
+
+1. **只标记, 绝不自动删除** —— dHash 会误判(纯色图、连拍), 删文件不可逆,
+   出错的代价由用户承担。标记同时写进 `manifest.json`:
+   `jq '.resources[] | select(.duplicate_of) | .file'`
+2. **失败即放行** —— ffmpeg 不在 / 解码失败一律当"没算出指纹", 绝不让下载失败
+3. **不动 sha256 那条路径** —— 两条并行的独立判据
+
+关掉它: `filters.dedup_perceptual=false`(界面上的「重复检测」开关, 默认开)。
+唯一的理由是省掉每张图一次本地解码; 阈值可调 `filters.dedup_threshold`(默认 4)。
+
+体积/尺寸这些**过滤**判据见 `backend/core/filters.py::match_resource`:
+① URL 层(类型/扩展名/关键词/**广告位按路径分段精确匹配**) ② 体积层
+③ 内容层(下载后复核 Content-Type) ④ 像素层(下载后读文件头, 只作用于 image)。
+探测失败一律放行 —— 宁可漏判, 不误杀。
+
+## 站点声明自检与 CDN 画像
+
+图集站点的一切都写在一份**声明**里(`collectors/<站点>/gallery.py`), 两套机制
+保证这份声明不会悄悄失真:
+
+```bash
+python scripts/selfcheck.py              # 声明自检 + CDN 画像快照
+python scripts/selfcheck.py --reset-profile
+```
+
+**声明自检** (`check_site`): 用 `id_samples` 把每种输入形态钉成断言 ——
+每条样本必须解析出同一个 gid, 且不得有某条 `id_patterns` **单独**就能配出
+不同结果(那是"谁先谁赢"的隐式依赖, 改一次顺序行为就变)。`parse_gid` 取的是
+首个命中, 新加一条正则时若不慎也能匹配旧 URL, 行为就**静默**变了 —— 某个相册
+突然采空, 而日志里一切正常。测试里 `selfcheck_all()` 对全部已注册站点断言为空。
+
+**CDN 画像** (`backend/core/cdn_profile.py` → `data/cdn_profile.json`): 记住每条
+基址的命中次数与序号格式, 用来给候选探测排序。实测价值:
+
+```
+冷启动  6 次探测  photos/photos2..5 × {seq:05d} 全灭, 才试到 photos2+{seq:04d}
+有画像  1 次探测  photos2+{seq:04d} 直接命中
+```
+
+画像只是**排序提示**: 全部候选组合仍然真探一遍, 画像错了最多多花一次探测,
+绝不会让本来能采的相册采不到。没有它也能工作 —— 缺失/损坏/写不进去一律退回
+站点的固定顺序。另一层用处是排查: 某条基址的占比**突然**从主跌到 0, 基本就是
+站点换了 CDN 子路径, 这比用户报"某天开始全失败"要早得多。
+
+`UWC_CDN_PROFILE` 可覆盖画像文件位置, 或设成 `off` 关掉。
+
+**手选采集器的形状软提示**: `gid_shape` 在**自动识别**时是硬判据(形状不符直接
+不认领 —— 认错是静默的); 在**手选**时只给一条 `warning`(不做 400)。理由是不
+对称: 手选是用户已表过的态, 站点可能刚换 ID 格式而我们比用户知道得晚。提示会
+出现在创建响应与预告面板里, **任务照常创建**。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (399 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页)
+make test           # pytest (458 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
 python scripts/preview_probe.py <相册页URL或图集ID>   # 真实站点创建前预告
+python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 ```
 
 配置: `config.yaml`, 环境变量 `UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` /
-`UWC_BROWSER_STATE_DIR` / `UWC_PROXY` 优先。
+`UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_CDN_PROFILE` / `UWC_FFMPEG` 优先。
 站点解析探针: `uv run python scripts/probe.py <url>`。
+感知去重依赖 ffmpeg(与视频 remux 共用同一套探测, 见 `core/ffmpeg.py`) ——
+探测不到时自动降级为"不算指纹", 不影响任何下载。
 
 ## 架构
 
@@ -287,10 +355,13 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
       ③ 候选基址 × 相邻序号宽度逐个试探 —— 默认基址先用, **不中才探**,
       所以正常相册零额外请求
     - 候选不写死清单: 站点声明 `base_candidate_digits=5` 即自动展开
-      `photos2..photos5`(手写三个的话, 下次出现 `photos4` 就整批判空)
+      `photos2..photos5`(手写三个的话, 下次出现 `photos4` 就整批判空);
+      换 host 的迁移另用 `base_host_templates` 显式声明(数字后缀表达不了)
+    - 序号宽度试**相邻 ±2**(站点写 5 位而相册实际 3 位时, ±1 恰好漏掉)
+    - 探测顺序由 **CDN 画像**排序(实际命中过的基址/宽度优先), 见下节
     - `gid_shape` 声明 ID 形状(如 `[0-9a-f]{8,}`), 自动识别时用它当
       "这真的是本站 ID"的判据 —— `/photos/featured/0001.jpg` 这类路径词因此
-      不会被误认领。手选采集器时不做此校验
+      不会被误认领。手选采集器时只给软提示, 不做校验
     - ⚠️ 一个资源根**只能有一个出处**(`_base_candidates`): 探测与自动识别共用,
       各写一份会出现"采集能探到、识别不认领"的半通状态
     - 任务级 `proxy` 选项覆盖全局代理

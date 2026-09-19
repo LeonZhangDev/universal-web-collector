@@ -248,6 +248,21 @@ class Filters:
         self.min_width = parse_size(o.get("min_width")) if o.get("min_width") else None
         self.min_height = parse_size(o.get("min_height")) if o.get("min_height") else None
         self.min_pixels = parse_size(o.get("min_pixels")) if o.get("min_pixels") else None
+        # 感知去重(dHash): 把"人眼看着是同一张、但字节不同"的图标出来
+        # (换尺寸 / 重新压缩 / 重复收录)。默认**开**, 因为:
+        #   ① 它只标记、绝不删文件(见 core/phash.py), 误判的代价只是多看一眼;
+        #   ② 图集站上这类重复本来就是最常见的形态, 而 sha256 一个都认不出;
+        #   ③ 开销是每张图一次 ffmpeg 缩放解码(毫秒级), 相对一次网络下载可忽略。
+        # 觉得慢或不需要就传 dedup_perceptual=false。
+        self.dedup_perceptual = _truthy(o.get("dedup_perceptual"), default=True)
+        # 阈值单位是"位", 满值 64。**别把它调大来"多抓几个"** —— 调大后
+        # 同一场景的连拍会互相标记, 用户会以为功能不准, 于是整个标记都不看了。
+        try:
+            self.dedup_threshold = int(o.get("dedup_threshold"))
+        except (TypeError, ValueError):
+            from core.phash import DEFAULT_THRESHOLD
+
+            self.dedup_threshold = DEFAULT_THRESHOLD
         # 只有配置了大小区间才需要 HEAD 探测, 避免额外的网络开销
         self.need_size = (
             self.min_size is not None

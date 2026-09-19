@@ -50,7 +50,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
@@ -177,6 +177,18 @@ class GallerySite:
     # 对用户只表现为"任务失败", 看不出是路径变了。显式 candidates 仍可与它并用
     # (用于非数字后缀的情形, 如 img2.example.com)。
     base_candidate_digits: int = 0
+    # 数字后缀**覆盖不到**的另一类迁移: 换 host / 换前缀(如 CDN 从
+    # img.xchina.io 迁到 cdn2.xchina.io, 或新增 /media 前缀)。这里声明整条
+    # 备选基址(可选, 含 {gid} 前的完整前缀), 与数字后缀并列进候选。
+    # 留空则只按 base + 数字后缀生成 —— 那种情形下"站点换域名"只能靠用户报障
+    # 才会被发现, 所以有已知迁移迹象就填上。
+    base_host_templates: list = None
+    # 自检样本 URL: 每条都必须能被本站的 id_patterns 解析出**同一个** gid。
+    # `check_site()` 用它做启动期断言, 防的是一类很难查的回归 —— 新加的
+    # pattern 与旧 pattern 对同一条 URL 各配出一个不同的 ID, 而 `parse_gid`
+    # 取的是**首个命中**, 于是后加的那条**静默改变**了已有行为(某个相册突然
+    # 采空)。样本形如 [(url, 期望 gid), ...]。
+    id_samples: list = None
     # 图集 ID 的**形状**正则(fullmatch)。只在**自动识别**时生效 —— 那时是我们
     # 替用户做决定, 认错会去枚举一个不存在的图集(表现为"成功但 0 个资源"),
     # 代价是静默的, 所以要用最严的判据。用户手选采集器时不校验:
@@ -199,7 +211,10 @@ class GallerySite:
     # 例如 /photo/id-6aa5136f606fe/10.html 的末段是 "10"。
     # 拿不到靠谱的 ID 时必须返回 None(让上层报错), 绝不能猜 ——
     # 猜错会去枚举一个不存在的图集, 结果是"任务成功但 0 个资源"。
-    page_tail: Optional[str] = r"^\d+$"
+    # 接受单条正则或正则列表: 站点分页形态不止一种时(纯数字 `10.html`、
+    # 带前缀 `page-10.html`、query `?p=10`), 列表化可以只加不改 —— 写成
+    # 单条的话换形态那天它悄悄失效, 又退化成"拿页码当 gid"。
+    page_tail: object = r"^\d+$"
     # 该站接受的输入形态(仅用于报错提示, 不影响解析逻辑)
     input_forms: list = field(default_factory=list)
     # 相册页 URL 模板(含 {gid})。给了才能取到 <title> 作目录名、并判断有无视频。
@@ -279,6 +294,11 @@ def parse_gid(site, raw, strict=False):
     s = (raw or "").strip()
     if not s:
         return None
+    # percent-encode 过的 ID 直接匹配不上 `_ID_CHARS`, 会白白落进退路(甚至被
+    # 判成 None -> "无法识别")。解码一次成本几乎为零, 却能把 `%36aa...` 这类
+    # 从别处复制来的链接救回来。真实 ID 是十六进制/短横线, 不会因为多解一次变形。
+    if "%" in s:
+        s = unquote(s)
 
     def accept(gid):
         """strict 下再验一次 ID 形状 —— 形状不符说明这大概率不是图集 ID。"""
@@ -311,12 +331,136 @@ def parse_gid(site, raw, strict=False):
     if _THUMB_NAME.fullmatch(stem):
         return None
     # 形如 10.html -> "10" 的**页码**不是图集 ID。宁可让上层报错,
-    # 也不能拿它去枚举一个猜出来的图集。
-    if site.page_tail and re.fullmatch(site.page_tail, stem):
+    # 也不能拿它去枚举一个猜出来的图集。page_tail 支持单条或列表 ——
+    # 站点分页形态不止一种时(纯数字/带前缀/query), 加一条即可, 不必改动既有。
+    tails = site.page_tail
+    if isinstance(tails, str):
+        tails = [tails]
+    if any(p and re.fullmatch(p, stem) for p in (tails or [])):
         return None
     # 退路只在"看起来确实像个 ID"时才算数: /photo/ 这种普通路径词长度/字符集
     # 都不达标, 就该返回 None, 由采集器抛出可读的错误。
     return stem if _ID_CHARS.fullmatch(stem) else None
+
+
+def check_site(site):
+    """本站点声明的自检: 样本 URL 必须被解析出**唯一且正确**的 gid。
+
+    防的是一类很难查的回归 —— `parse_gid` 取的是**首个命中**的 pattern, 新加
+    一条正则时若不慎也能匹配旧 URL, 就会**静默改变**已有行为: 某个相册突然
+    采空, 而日志里一切正常。样本把这个"改一行正则"的副作用变成一条可断言的
+    事实, 而不是等用户报障。
+
+    返回**问题描述列表**; 空列表 = 通过。调用方决定是抛错还是只记日志
+    (默认由 `tests` 断言为空, 运行期只记 warn —— 采集器不该因为一次自检
+    失败就拒绝干活, 那时用户更需要的仍然是"先把资源下下来")。
+    """
+    problems = []
+    samples = list(site.id_samples or [])
+    for item in samples:
+        try:
+            raw, want = item
+        except (TypeError, ValueError):
+            problems.append(f"样本格式应为 (url, 期望gid): {item!r}")
+            continue
+        got = parse_gid(site, raw, strict=True)
+        if got != want:
+            problems.append(f"{raw} -> 解析出 {got!r}, 期望 {want!r}")
+
+    # 每条 pattern 单独跑: 若某条单独就能配出与整套不同的结果, 说明存在
+    # "谁先谁赢" 的隐式依赖 —— 顺序一变行为就变, 应当修正则而不是靠顺序。
+    for raw, want in [s for s in samples if isinstance(s, (list, tuple)) and len(s) == 2]:
+        for pat in (site.id_patterns or []):
+            m = re.search(pat, raw)
+            if m and m.group(1) and m.group(1) != want:
+                problems.append(
+                    f"pattern {pat!r} 单独匹配 {raw} 得到 {m.group(1)!r}, 与期望 {want!r} 冲突"
+                )
+
+    # 形状声明与样本要自洽: 声明了 gid_shape 却没有任何样本能通过, 说明
+    # 形状写窄了(自动识别会把真图集也挡在外面)。
+    shape = site.gid_shape
+    if shape and samples:
+        ok = any(
+            isinstance(s, (list, tuple)) and len(s) == 2 and re.fullmatch(shape, s[1] or "")
+            for s in samples
+        )
+        if not ok:
+            problems.append(f"gid_shape={shape!r} 无法匹配任何样本的期望 gid")
+    return problems
+
+
+def assert_site(site):
+    """`check_site` 的抛错版: 配置错误应当**当场**炸掉, 而不是留到采集时。"""
+    problems = check_site(site)
+    if problems:
+        raise ValueError(
+            f"站点 {site.name!r} 的声明自检未通过:\n  - " + "\n  - ".join(problems)
+        )
+
+
+def selfcheck_all():
+    """对所有已注册的图集站点跑一遍声明自检, 返回 {站点名: [问题, ...]}。
+
+    只返回**有问题**的站点(全绿时返回 {})。放在这里而不是 import 期自动执行:
+    自检失败**不能**拦着采集器干活 —— 用户当下更需要"先把资源下下来"。所以它由
+    测试(`tests/test_gallery.py`)与 `scripts/selfcheck.py` 显式调用; 运行期若在
+    日志里看见 `site self-check failed`, 那是真的配置写错了, 别当噪音忽略。
+    """
+    try:
+        from . import COLLECTORS
+    except ImportError:      # 以脚本方式单文件运行时
+        return {}
+    out = {}
+    for name, cls in COLLECTORS.items():
+        site = getattr(cls, "site", None)
+        if site is None:
+            continue
+        try:
+            problems = check_site(site)
+        except Exception as e:                       # 自检本身出错也算问题
+            problems = [f"自检抛异常: {type(e).__name__}: {e}"]
+        if problems:
+            out[getattr(site, "name", name)] = problems
+    return out
+
+
+def shape_warning(site, url):
+    """手选采集器时, 对"ID 形状明显不像本站"的输入给一条**警告**(不阻止)。
+
+    与 `strict=True` 的区别在于**谁来承担后果**:
+
+    - 自动识别在替用户做决定, 认错是静默的(去枚举一个不存在的图集, 站点照样
+      返回 200 text/html, 于是"成功但 0 资源")。那里必须严格, 不符直接不认领。
+    - 手动选择是用户已经表过态。此时我们**没有资格**拒绝 —— 站点可能刚换了 ID
+      格式, 而我们知道得比用户晚。但让他知道"这个 ID 形状本站从没见过"是有价值
+      的: 一旦真是手滑粘错, 他当场就能改, 不必等任务失败再回头查。
+
+    返回提示字符串; 形状相符、或站点未声明 `gid_shape`、或 URL 里根本没有 ID
+    时返回 None(后两种情形"没意见"就是正确的表态)。
+    """
+    shape = getattr(site, "gid_shape", "")
+    if not shape:
+        return None
+    try:
+        gid = parse_gid(site, url, strict=False)
+    except Exception:
+        return None
+    if not gid or re.fullmatch(shape, gid):
+        return None
+    return (
+        f"输入的图集 ID {gid!r} 不符合本站已知的 ID 形状({shape}); "
+        f"本站 ID 通常形如 {_shape_sample(site)}。若确认无误可继续, "
+        f"但更可能是粘错了链接 —— 形状不符时任务多半会以 0 个资源告终。"
+    )
+
+
+def _shape_sample(site):
+    """从 id_samples 里挑一个样本 ID 给用户看, 没有就退回描述形状本身。"""
+    for item in (site.id_samples or []):
+        if isinstance(item, (list, tuple)) and len(item) == 2 and item[1]:
+            return repr(item[1])
+    return "站点文档中给出的形态"
 
 
 def _session(proxy=None):
@@ -418,23 +562,27 @@ def _quality_tag(mtype, variant):
     return "_" + variant.strip("._").replace(".", "_")
 
 
-def _seq_format_variants(fmt):
-    """候选序号格式: 先站点默认, 再试相邻补零宽度。
+def _seq_format_variants(fmt, spread=2):
+    """候选序号格式: 先站点默认, 再试**相邻**补零宽度(默认 ±2)。
 
     同一站点不同相册的补零位数可能不一样(实测 xchina 既有 `00001.jpg` 也有
     `0001.jpg`)。宽度只影响"不足位补几个零" —— 序号变大后 `{seq:04d}` 照样
-    渲染出 5 位, 所以多试一种宽度只会多花一次探测, 不会改变既有行为。
+    渲染出 5 位, 所以多试几种宽度只会多花几次探测, 不会改变既有行为。
+
+    ⚠️ 为什么是 ±2 而不是 ±1: 站点若把默认写成 5 位而实际相册是 3 位, ±1
+    恰好漏掉。探测是 HEAD 且无限速器, 多两轮代价可忽略, 覆盖却翻倍。
     """
     m = re.search(r"seq:0(\d+)d", fmt or "")
     if not m:
         return [fmt]
     w = int(m.group(1))
     out = [fmt]
-    for alt in (w - 1, w + 1):
-        if 1 <= alt <= 9:
-            f2 = f"{fmt[:m.start(1)]}{alt}{fmt[m.end(1):]}"
-            if f2 not in out:
-                out.append(f2)
+    for delta in range(1, max(0, int(spread)) + 1):
+        for alt in (w - delta, w + delta):
+            if 1 <= alt <= 9:
+                f2 = f"{fmt[:m.start(1)]}{alt}{fmt[m.end(1):]}"
+                if f2 not in out:
+                    out.append(f2)
     return out
 
 
@@ -513,6 +661,11 @@ def _base_candidates(site, default=None):
     for c in (site.base_candidates or []):
         if c and c not in out:
             out.append(c)
+    # 换 host 的迁移形态: 站点若把 CDN 从 img.xchina.io 迁到 img2.xchina.io,
+    # 「数字后缀」那套生成逻辑无能为力, 只能靠显式声明。
+    for t in (site.base_host_templates or []):
+        if t and t not in out:
+            out.append(t)
     try:
         n = int(site.base_candidate_digits or 0)
     except (TypeError, ValueError):
@@ -523,6 +676,17 @@ def _base_candidates(site, default=None):
         c = f"{d}{i}"
         if c not in out:
             out.append(c)
+    # 站点画像排序: 把"命中过"的基址提到前面, 省掉每个新相册那次白试。
+    # 只重排**候选集合内部**的顺序, 不增不减 —— 探测仍逐条真验, 画像错了也不会
+    # 让本来能探到的相册探不到。
+    try:
+        from core.cdn_profile import preferred_bases
+
+        head = [b for b in preferred_bases(site.name) if b in out]
+    except Exception:
+        head = []
+    if head:
+        out = head + [b for b in out if b not in head]
     return out
 
 
@@ -563,6 +727,22 @@ def _resolve_base(site, gid, session, media, log=None, hint=None, hints=None,
             state = PROBE_ERROR
         return state
 
+    def _hit(cand_base, cand_fmt, how):
+        """命中收尾: 记进站点画像(下次优先试它), 然后原样返回。
+
+        ⚠️ 只在**真的探通**时记 —— 退回默认值不算命中, 把它记进去会让画像
+        被"没探到"的结果污染, 反而拖慢下次的真实命中。
+        """
+        try:
+            from core.cdn_profile import record_hit
+
+            record_hit(site.name, cand_base, cand_fmt)
+        except Exception:
+            pass    # 画像只是优化, 写不进去不该影响采集
+        if log:
+            log(f"CDN {how}: {cand_base} (序号格式 {cand_fmt})")
+        return cand_base, cand_fmt
+
     # ① ② 线索: 用户直链 + 相册页里出现的直链。去重保序, 先来的更可信。
     all_hints = ([hint] if hint else []) + list(hints or [])
     seen = set()
@@ -573,15 +753,30 @@ def _resolve_base(site, gid, session, media, log=None, hint=None, hints=None,
             continue
         seen.add((h_base, h_fmt))
         if _try(h_base, h_fmt) == PROBE_OK:
-            if log:
-                log(f"CDN 基址采信线索: {h_base} (序号格式 {h_fmt})")
-            return h_base, h_fmt
+            return _hit(h_base, h_fmt, "基址采信线索")
         if log:
             log(f"线索指向的 {h_base} 探测未命中, 继续尝试下一条")
 
     # ③ 候选组合
     cands = _base_candidates(site, default)
     fmts = _seq_format_variants(default_fmt)
+    # 画像里的**序号格式**也提到最前。
+    #
+    # 实测这有多值: 循环是"格式外层、基址内层", 所以宽度不对时会把**每个候选
+    # 基址都白试一遍**才轮到正确宽度 —— 用户那个相册因此花掉 6 次探测
+    # (photos/photos2..5 × 05d 全灭, 才试到 photos2+04d)。把上次命中的宽度
+    # 提到首位后, 一轮就中。
+    #
+    # ⚠️ 只是**排序**提示: 全部候选组合仍然真探一遍, 画像错了(比如另一个相册
+    # 宽度不同)最多多花一次探测, 不会让本来能采的相册采不到。
+    try:
+        from core.cdn_profile import preferred_seq_format
+
+        fav_fmt = preferred_seq_format(site.name)
+    except Exception:
+        fav_fmt = None
+    if fav_fmt and fav_fmt in fmts and fmts[0] != fav_fmt:
+        fmts = [fav_fmt] + [f for f in fmts if f != fav_fmt]
     # 预算默认 = 全部组合数。候选基址是一份"可能命中"的清单, 漏试任何一个都等于
     # 把那个相册判成不存在。旧版把预算写死 6(按"3 基址 × 2 宽度"定的), 候选一扩到
     # photos4/photos5 就会在还没试到 photos2+4 位 之前耗光, 静默退回默认基址 ->
@@ -597,9 +792,10 @@ def _resolve_base(site, gid, session, media, log=None, hint=None, hints=None,
                 return default, default_fmt
             spent += 1
             if _try(c, fmt) == PROBE_OK:
-                if log and (c != default or fmt != default_fmt):
-                    log(f"CDN 探测命中: 基址 {c}, 序号格式 {fmt}")
-                return c, fmt
+                # 探测命中也要记进画像 —— 这条正是"首次遇到新子路径"时唯一能学到
+                # 东西的时机。只记线索命中(上面那支)的话, 画像永远只覆盖用户手动
+                # 粘过直链的相册, 对"自动探索"一点帮助都没有。
+                return _hit(c, fmt, "探测命中")
             if log:
                 log(f"CDN 探测未命中: {c} (序号格式 {fmt})")
     return default, default_fmt

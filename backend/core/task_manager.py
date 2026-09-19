@@ -905,6 +905,15 @@ class TaskManager:
                     )
                     return
 
+            # 感知去重(可选, 默认开): sha256 认不出"换尺寸/重压缩后仍是同一张",
+            # 而图集站上这正是最常见的重复形态。**只标记不删除** —— 指纹会误判,
+            # 删文件是不可逆的, 出错的代价由用户承担(见 core/phash.py 三条约束)。
+            # 放在尺寸终检**之后**: 被判为广告的图已经删了, 不必再为它解码一次。
+            if filters.dedup_perceptual and (r["type"] or "").lower() == "image":
+                self._mark_perceptual_dup(
+                    task_id, rid, final_path, r["url"], filters.dedup_threshold
+                )
+
             self._publish_resource(task_id, rid, "done")
         except TaskCancelled:
             # 下载中途被叫停: 半成品留着没意义且会被误认为已完成, 直接删掉
@@ -919,6 +928,42 @@ class TaskManager:
             db.update_resource(rid, status="failed")
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"fail {r['url']}: {e}", "error")
+
+    def _mark_perceptual_dup(self, task_id, rid, path, url, threshold):
+        """算 dHash, 并在**本任务内**找出最接近的一张, 只做标记。
+
+        绝不删文件、绝不改 status —— 见 `core/phash.py` 的约束 1。标记到
+        `resources.duplicate_of`, 详情页与 manifest 会显示出来, 由人决定。
+        整个函数**不允许抛异常**: 指纹是优化, 不是流程的一部分, 一个附件能力
+        把下载搞挂是本项目反复踩过的坑, 所以这里自己兜住所有分支。
+        """
+        try:
+            from core import phash
+
+            got = phash.dhash(path)
+            if not got:
+                # 算不出(ffmpeg 不在 / 解码失败)就当作"没有指纹", 静默放行。
+                # 这里刻意**不写日志**: 一个 300 张的相册会刷 300 行同样的
+                # "算不出指纹", 真正的错误会被淹没。要排查就单跑 phash.dhash()。
+                return
+            known = db.task_phashes(task_id, exclude_id=rid)
+            db.update_resource(rid, phash=got)
+            hit = phash.find_duplicate(got, known, threshold=threshold)
+            if not hit:
+                return
+            other_id, dist = hit
+            db.update_resource(rid, duplicate_of=other_id)
+            self._safe_log(
+                task_id,
+                f"perceptual dup {url}: 与资源 #{other_id} 疑似同一张"
+                f"(dHash 距离 {dist}/{64}, 阈值 {threshold}; 文件已保留未删除)",
+                "warn",
+            )
+        except TaskCancelled:
+            # 与其它分支一致: 取消信号必须原样穿透, 不能被 except Exception 吞掉
+            raise
+        except Exception:
+            return
 
     @staticmethod
     def _infer_name(resources):

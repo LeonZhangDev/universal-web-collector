@@ -45,6 +45,9 @@ const collectorLabel = {
 // 自动识别的结论。**必须回显给用户并可覆盖** —— 悄悄生效的自动识别, 一旦
 // 猜错用户连"该去哪里改"都无从下手, 只会以为站点坏了。
 const resolved = ref(null);
+// 手选采集器时后端给的**软**提示(目前只有"ID 形状不像本站"这一种)。它不是错误:
+// 任务照常创建, 只是提醒用户多半粘错了链接。所以单独一个 ref, 不复用 errorMsg。
+const manualWarning = ref("");
 // 实际会用的采集器: 手动指定 > 已识别 > generic(让后端报错)
 const effectiveCollector = computed(() => {
   if (collector.value !== "auto") return collector.value;
@@ -145,6 +148,10 @@ const maxSize = ref({ num: "", unit: "MB" });
 // 只有量宽高才认得出。留空 = 不启用(默认不启用: 相册里也有竖构图小图)。
 const minWidth = ref("");
 const minHeight = ref("");
+// 感知去重(默认开): 标出"换尺寸/重压缩后仍是同一张"的图。**只标记不删除** ——
+// dHash 会误判, 删文件不可逆, 出错的代价由用户承担(见 backend/core/phash.py)。
+// 它是"只看不删", 所以默认开也安全; 关掉的理由只有一个: 嫌每张图多一次本地解码。
+const dedupPerceptual = ref(true);
 
 const LS_KEY = "uwc.create.prefs";
 const UNITS = ["B", "KB", "MB", "GB"];
@@ -194,6 +201,9 @@ function buildFilters() {
   if (mw) f.min_width = mw;
   const mh = dimVal(minHeight.value);
   if (mh) f.min_height = mh;
+  // 只有**关掉**时才把开关发上去。默认开是后端定的, 前端不该复制一份默认值 ——
+  // 两边各写一份, 迟早会出现"界面显示开、实际关"这种谁都不知道该信谁的状态。
+  if (!dedupPerceptual.value) f.dedup_perceptual = false;
   return f;
 }
 
@@ -219,13 +229,14 @@ async function autoResolve() {
 
 watch([url, collector], () => {
   resolved.value = null;
+  // 换了输入或换了采集器, 上一条形状提示就过期了 —— 留着它会指向另一个 URL
+  manualWarning.value = "";
   clearTimeout(resolveTimer);
   resolveTimer = setTimeout(autoResolve, 300);
 });
 
 const resolveHint = computed(() => {
-  if (collector.value !== "auto" || !url.value.trim() || !resolved.value) return null;
-  const r = resolved.value;
+  if (collector.value !== "auto" || !url.value.trim() || !resolved.value) return null;  const r = resolved.value;
   if (!r.collector) return { kind: "bad", text: "无法识别该输入, 请手动选择采集器" };
   const name = collectorLabel[r.collector] || r.collector;
   if (r.ambiguous) return { kind: "warn", text: `识别结果不唯一: ${r.reason}` };
@@ -258,6 +269,7 @@ function savePrefs() {
         maxSize: maxSize.value,
         minWidth: minWidth.value,
         minHeight: minHeight.value,
+        dedupPerceptual: dedupPerceptual.value,
         showFilters: showFilters.value,
       })
     );
@@ -289,6 +301,9 @@ function loadPrefs() {
     if (p.maxSize) maxSize.value = { ...maxSize.value, ...p.maxSize };
     minWidth.value = p.minWidth || "";
     minHeight.value = p.minHeight || "";
+    // 只在**存过**时才覆盖: 老版本没有这个键, `!!undefined` = false 会把
+    // 默认开的去重悄悄变成关 —— 用户从没碰过这个开关, 却发现它自己关了。
+    if (p.dedupPerceptual !== undefined) dedupPerceptual.value = !!p.dedupPerceptual;
     showFilters.value = !!p.showFilters;
   } catch (e) {
     /* 本地数据损坏就用默认值 */
@@ -323,7 +338,7 @@ async function submit() {
   errorMsg.value = "";
   try {
     const f = buildFilters();
-    await createTask(url.value.trim(), collector.value, {
+    const res = await createTask(url.value.trim(), collector.value, {
       download_dir: downloadDir.value || null,
       filters: Object.keys(f).length ? f : null,
       // 画质/媒体/命名只对图集采集器有意义, 其他采集器不传, 免得塞无意义参数
@@ -333,6 +348,9 @@ async function submit() {
       album_tags_dir: isGallery.value ? albumTagsDir.value : null,
       ...aggregateOpts(),
     });
+    // 手选采集器时后端只做**软校验**(形状不像本站 ID 就提醒), 任务是照常创建的。
+    // 所以这条提示不能塞进 errorMsg —— 那会让人以为创建失败了。
+    manualWarning.value = res?.warning || "";
     url.value = "";
     savePrefs();
     await refresh();
@@ -739,6 +757,13 @@ onUnmounted(() => {
       <span :title="resolveHint.reason || ''">{{ resolveHint.text }}</span>
     </div>
 
+    <!-- 手选采集器的软提示: 与"识别结果"分两行, 因为它们的性质不同 ——
+         上面那行是后端的判断, 这行是"你多半粘错了, 但我不拦你"。 -->
+    <div v-if="manualWarning" class="dir-row resolve-row warn">
+      <span class="lbl">提示</span>
+      <span>{{ manualWarning }}</span>
+    </div>
+
     <div class="dir-row">
       <span class="lbl">下载目录</span>
       <input
@@ -951,6 +976,19 @@ onUnmounted(() => {
         <input v-model="minHeight" class="num" type="text" placeholder="最小高" />
         <span class="tip">
           像素, 留空不限。横幅/按钮/信标最有效的判别; 下载后按文件头实测, 判不出则放行
+        </span>
+      </div>
+
+      <div class="frow">
+        <label>重复检测</label>
+        <label class="chk" style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input v-model="dedupPerceptual" type="checkbox" @change="savePrefs" />
+          <span>感知去重</span>
+        </label>
+        <span class="tip">
+          默认开。向量出"换尺寸/重新压缩后仍是同一张"的图, 在详情页标出
+          <b>疑似重复</b>并记进 manifest —— <b>只标记, 绝不自动删除</b>。
+          每张图多一次本地解码, 嫌慢可关掉(sha256 精确去重不受影响)
         </span>
       </div>
     </div>

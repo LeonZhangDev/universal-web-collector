@@ -137,6 +137,26 @@ XCHINA = GallerySite(
     # 站点若改 ID 格式, 只改这一行; 手选采集器时不做此校验。
     gid_shape=r"[0-9a-f]{8,}",
     page_tail=r"^\d+$",
+    # 自检样本: 下面每一条都必须被解析出**同一个** gid, 且不得由某条 pattern
+    # 单独配出不同结果。`tests/test_gallery.py` 会跑 `check_site()` 断言为空。
+    #
+    # 为什么值得写死这几条: `parse_gid` 取**首个命中**的 pattern, 新加/改一条
+    # 正则时若不慎也能匹配旧 URL, 就会静默改变已有行为 —— 某个相册突然采空,
+    # 而日志里一切正常。把每种输入形态钉成一条断言, "改一行正则"的副作用就
+    # 从"等用户报障"变成了"跑测试立刻红"。
+    id_samples=[
+        ("6aa5136f606fe", "6aa5136f606fe"),
+        ("https://img.xchina.io/photos/6aa5136f606fe/00001.jpg", "6aa5136f606fe"),
+        # photos2 + 4 位序号: 用户实际报障的那个相册, 专门留一条防回归
+        ("https://img.xchina.io/photos2/69ad45698f836/0001.jpg", "69ad45698f836"),
+        ("https://img.xchina.io/photos/6a3654854fd25/00001.mp4", "6a3654854fd25"),
+        ("https://img.xchina.io/photos/6aa5136f606fe/00001_1200x0.webp",
+         "6aa5136f606fe"),
+        ("https://xchina.co/photo/id-6aa5136f606fe.html", "6aa5136f606fe"),
+        # 末段 10.html 是页码, 必须仍解析出相册 ID 而不是 "10"
+        ("https://xchina.co/photo/id-6aa5136f606fe/10.html", "6aa5136f606fe"),
+        ("https://xchina.co/photoShow.html?id=6aa5136f606fe", "6aa5136f606fe"),
+    ],
     input_forms=[
         "图片/视频直链 https://img.xchina.io/photos/{id}/00001.jpg|.mp4",
         "相册页 https://xchina.co/photo/id-{id}.html",

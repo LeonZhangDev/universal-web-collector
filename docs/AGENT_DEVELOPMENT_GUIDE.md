@@ -1309,3 +1309,66 @@ segments, duration, encrypted, key_url, ...)`:
   `resource_roots.image = {base: photos2, seq_format: {seq:04d}, source: probe,
   site_default: photos}`
 
+
+# V24 聚合页采集器(模特/演员/系列/索引) ✅ 已完成(2026-09-19)
+
+## 1. 目标与设计
+
+一次把"整个模特/整个系列"的相册与视频页收进队列, 再逐个**委派**给既有
+`xchina_gallery` / `xchina_video`。采集器本身**不碰下载内核** —— 它只发现
+子页面 URL, 完全复用现有两条采集链路。
+
+**核心决策: URL 驱动抽取, 不是 DOM 选择器。** 从 HTML 里正则出所有 `<a href>`,
+按 URL 模式(`/photo/id-*`、`/video/id-*`、`/model/id-*`…)分类。理由: 这是个
+"以 URL 为主键"的站点, 类名会改、结构会变, 但 URL 语义稳定。用 DOM 选择器的话
+站点一改版就静默采到 0 个 —— 本项目的头号忌讳。
+
+## 2. 真站实测入口结构(2026-09, 必须复用这份而不是猜)
+
+| 形态 | URL | HTTP 可达性 |
+|---|---|---|
+| 模特/演员落地页 | `/model/id-{id}.html`、`/actor/id-{id}.html` | **纯 HTTP 200** |
+| 索引页 | `/models.html`、`/models/type-{n}.html` | 200 |
+| 系列页 | `/photos/series-{id}.html`、`/videos/series-{id}.html` | **403 CF** |
+| 全量列表页 | `/videos/model-{id}.html`、`/photos/model-{id}.html` | 403 CF(可降级 headless) |
+
+⚠️ **落地/索引页开放, 全量列表页 CF 保护** 是本站的规律。我原本**猜**的
+`/model/xxx`、`/tags/xxx`、`/series/xxx`、`/photos/xxx` 实测全是 **404** ——
+再次印证"宁可先探也不猜"。
+
+## 3. 三个关键坑(都由测试或真站验证暴露)
+
+- ⚠️ **归一化只归内容页**: 相册的 `/10.html` 是**同一相册的第 10 页**, 必须
+  归一化到主页(否则一个相册被当 N 个条目, 重复下载又白吃 `max_items`);
+  但**列表页的分页是不同内容**, 归了会漏采。二者的判据是 URL 模式, 不是"有数字"。
+- ⚠️ **闸门要在"追加时"生效**: 第一版 `max_items` 只在进入页面时检查, 追加时
+  从不截断 → 闸门形同虚设。改成每追加一条就判一次合计上限。
+- ⚠️ **截断必须说出来**: 到层数上限/条目上限时, 日志与 `album.json` 都要写明
+  "还有 N 个未展开"。悄悄少采最容易被误当成"站点只有这些"。
+
+## 4. 口径一致性(本项目的铁律)
+
+`preview` 与 `crawl` 必须同源。本轮修掉两处不一致:
+- `group`(目录名): `crawl` 用页面标题推出的模特名, `preview` 却回退 gid →
+  **预告的目录名与最终落盘目录名不一样**。改成共用同一套。
+- `max_items`: `crawl` 读 `options["max_items"]`, `preview` 只读参数 →
+  用户设 5、预览却按 12 展开。改成取两者较小值, 并以 options 为准。
+
+## 5. 日志回调签名(踩过两次的坑)
+
+采集器会用 `log(msg, "warn")` 标出"这条要显眼"。而 task_manager 注入的
+`crawl_log(m)`、API 预览的 `logs.append` 都**只收一个参数** —— 两参调用会抛
+`TypeError`, **把所有采集工作做完后、写汇总那一刻崩掉整个任务**。
+两处适配器都改成接受可选 `level` 参数。原则: **日志绝不该有能力让功能失败。**
+
+## 6. 验证(2026-09-19)
+
+- `pytest` -> **399 用例**(新增 `test_xchina_aggregate` 46 项 + API 选项校验)
+- `verify_output` 33 / `verify_hls` 18 / `vite build` 全过
+- 真站有界预览(单请求, 不激怒被收紧的 CF): `group=艾玛`(模特名而非 gid)、
+  `max_items=2` 生效、截断如实标注, 0.9 秒返回
+- 真站端到端 crawl: **119 个资源**, 三层命名空间 `艾玛/阁楼监禁…/00001.jpg`,
+  页面自报 119 张与枚举结果**完全一致**
+- 自动识别 12 形态复核: 6 种聚合形态 → `xchina_aggregate`, 相册/视频页/直链/
+  裸 ID 各归其位, `/tag/some-tag` 与非本站域落 `generic`, 全部无歧义
+

@@ -17,9 +17,10 @@ core/filters.py           "有效资源"唯一定义 = match_resource()
 core/imageinfo.py         文件头读尺寸（纯 Python 零依赖）
 core/manifest.py          manifest.json + album.json sidecar（附属产物失败只记 warn）
 collectors/gallery_base.py    SequenceGallerySpider + GallerySite + MediaType
-collectors/album_meta.py      相册页元信息（headless）+ CF 熔断/登录态隔离
+collectors/album_meta.py      相册页元信息（headless）+ CF 熔断/登录态隔离 + load_page_html
 collectors/hls.py             m3u8 健全性校验/过期感知/体积估算
 collectors/scores.py          识别分数阶梯（单独模块，防循环依赖）
+collectors/xchina/aggregate.py 聚合页采集器（模特/系列/索引，委派给 gallery/video）
 downloaders/base.py           会话/重试/抖动/429；ratelimit.py 站点级并发+间隔+冷却
 ```
 
@@ -61,6 +62,9 @@ downloaders/base.py           会话/重试/抖动/429；ratelimit.py 站点级�
 3. **库里存真名不存 `auto`**；无法识别直接 400（不悄悄兜底 generic）。
 4. 正则要**锚定 host**，且**锚定到"gid 后紧跟带媒体扩展名的文件名"**：`/photos/featured/0001.jpg`
    会把路径词 `featured` 当 gid。序号用 `[^/?#]+` 而非 `\d+`。
+5. **聚合页**（`/model/id-*`、`/models*`、`/*/series-*`、`/photos|videos/model-*`）→ `xchina_aggregate`
+   （100）。**URL 驱动抽取，绝不 DOM 选择器**；归一化只归内容页（`/10.html` 是相册分页）。
+   详见 `PITFALLS.md` 与 README。
 
 ## 视频：签名 m3u8 的占位陷阱
 - ⚠️ 签名过期/错 → 站点回 **200 + 语法合法的 m3u8**，指向 `/fallback/placeholder.ts`

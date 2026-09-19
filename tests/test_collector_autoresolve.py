@@ -240,3 +240,85 @@ def test_pick_collector_treats_blank_as_auto():
     assert T._pick_collector(ALBUM_PAGE, None)[0] == "xchina_gallery"
     with pytest.raises(HTTPException):
         T._pick_collector("not a url", "")
+
+
+# ---- 聚合页: 选项必须"创建 / 预览 / 订阅"三处一致 ----
+
+AGG = "https://xchina.co/model/id-601190f157fe7.html"
+
+
+def test_aggregate_url_is_claimed_by_auto(client):
+    app, _ = client
+    got = app.get("/collectors/resolve", params={"url": AGG}).json()
+    assert got["collector"] == "xchina_aggregate"
+    assert got["ambiguous"] is False
+
+
+def test_aggregate_depth_out_of_range_is_400(client):
+    """越界值必须报错而不是被悄悄夹到边界 —— 夹过的值用户以为自己设对了。"""
+    app, _ = client
+    for bad in (0, -1, 99):
+        r = app.post("/tasks/create", json={"url": AGG, "aggregate_depth": bad})
+        assert r.status_code == 400, bad
+        assert "aggregate_depth" in r.json()["detail"]
+
+
+def test_aggregate_options_reach_task_options(client):
+    """`aggregate_depth`/`max_items` 要真落进 options, 否则采集器拿不到。"""
+    app, db = client
+    created = app.post(
+        "/tasks/create",
+        json={"url": AGG, "aggregate_depth": 2, "max_items": 30},
+    ).json()
+    import json as _json
+
+    row = db.get_task(created["task_id"])
+    opts = _json.loads(row["options"] or "{}")
+    assert opts["aggregate_depth"] == 2
+    assert opts["max_items"] == 30
+
+
+def test_watch_shares_the_same_option_builder(client, monkeypatch):
+    """订阅原先手抄了一份校验, 于是 album_tags_dir 这类新选项会被静默丢掉。
+
+    订阅是长期反复跑的, 悄悄少一个选项比直接报错难查得多 —— 现在三处
+    共用 `_gallery_options`。
+    """
+    app, db = client
+    monkeypatch.setattr(T.task_manager, "submit", lambda tid: None)
+    got = app.post(
+        "/watches",
+        json={
+            "url": AGG,
+            "interval_minutes": 60,
+            "aggregate_depth": 3,
+            "max_items": 7,
+            "album_tags_dir": True,
+            "run_now": False,
+        },
+    )
+    assert got.status_code == 200, got.text
+    import json as _json
+
+    row = db.get_watch(got.json()["id"])
+    opts = _json.loads(row["options"] or "{}")
+    assert opts["aggregate_depth"] == 3
+    assert opts["max_items"] == 7
+    assert opts["album_tags_dir"] is True
+
+
+def test_watch_rejects_bad_aggregate_depth(client):
+    """订阅与创建共用构造器, 校验也必须一致(否则'创建被拒、订阅静默通过')。"""
+    app, _ = client
+    r = app.post("/watches", json={"url": AGG, "aggregate_depth": 0,
+                                  "interval_minutes": 60})
+    assert r.status_code == 400
+    assert "aggregate_depth" in r.json()["detail"]
+
+
+def test_config_exposes_aggregate_limits(client):
+    """前端要拿它给输入框设上限, 硬编码在两端必然漂移。"""
+    app, _ = client
+    cfg = app.get("/config").json()
+    assert cfg["aggregate_max_depth"] >= 1
+    assert cfg["aggregate_max_items"] >= 1

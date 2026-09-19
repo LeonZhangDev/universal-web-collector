@@ -139,6 +139,23 @@ worker 之后才收拾现场。
 - `video.py`：引擎分发**前**先 `_preflight_hls()`（挡过期/占位/无密钥）；
   `engine=ffmpeg` 无二进制时先于预检 fail-fast（确定性本地错不该被网络错掩盖）。
 
+## 聚合页采集器 `xchina_aggregate`（补充）
+
+一次收"整个模特/系列"的子页面 URL，再委派给 `xchina_gallery`/`xchina_video`。
+- **URL 驱动抽取，绝不用 DOM 选择器**：正则 `<a href>` 后按 URL 模式分类。类名会改、
+  URL 语义稳定；DOM 选择器改版即静默采 0 个。
+- 真站结构（2026-09，**别猜**）：`/model/id-*`、`/actor/id-*` 落地页 **纯 HTTP 可读**；
+  `/models.html`、`/models/type-*` 索引 200；`/photos|videos/series-*`、`/videos|photos/model-*`
+  全量列表页 **403 CF**（可降级 headless）。我猜的 `/model/xxx`、`/tags/`、`/series/` 全 404。
+- ⚠️ **归一化只归内容页**：相册 `/10.html` 是同一相册的分页 → 归主页；列表页的分页是
+  **不同内容** → 不归（归了会漏采）。
+- ⚠️ **`max_items` 闸门必须在"追加时"判**（只在进页面时判 → 形同虚设）。
+- ⚠️ **截断必须说出来**（"还有 N 个未展开"写进日志与 `album.json`）。
+- ⚠️ `preview` 与 `crawl` **同源**：`group`（目录名）与 `max_items` 必须共用同一套，
+  否则预告的目录名/数量与实际落盘不符。
+- ⚠️ 日志回调：`log(msg, "warn")` 两参调用会给只收一参的 `crawl_log`/`logs.append` 抛
+  `TypeError`，**在采集全做完后写汇总那刻崩掉整个任务**。适配器必须收可选 `level`。
+
 ## 测试隔离（补充）
 
 - `TaskManager.shutdown(wait=True)`：测试必须等 worker 真退出，否则随机失败（生产 `wait=False`）。

@@ -717,8 +717,12 @@ class TaskManager:
             # "卡住了"取消掉。节流到 5 秒一次, 避免每条日志都写库。
             beat = [0.0]
 
-            def crawl_log(m):
-                self._safe_log(task_id, m)
+            def crawl_log(m, level="info"):
+                # ⚠️ 必须收第二个可选参数: 采集器会用 `log(msg, "warn")` 表达
+                # "这条要显眼一点"(如"有 3 个子页面没展开")。只收一个参数的话,
+                # 那行日志会在**采集全部做完之后**抛 TypeError 把整个任务搞崩 ——
+                # 明明资源都发现了, 用户却看到 failed。宁可丢掉等级也不能丢任务。
+                self._safe_log(task_id, m, level)
                 now = time.time()
                 if now - beat[0] >= 5:
                     beat[0] = now

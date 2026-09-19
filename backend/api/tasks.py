@@ -1,3 +1,4 @@
+import inspect
 import io
 import json
 import queue
@@ -71,7 +72,7 @@ def _validate_download_dir(value):
 
 
 def _gallery_options(filters=None, quality=None, media=None, album_title=None,
-                     album_tags_dir=None):
+                     album_tags_dir=None, max_items=None, aggregate_depth=None):
     """收集并校验采集器相关 options(**创建任务与预览共用**)。
 
     共用是有意的: 否则"预览通过、创建却被拒"(或反过来)这种不一致
@@ -111,7 +112,31 @@ def _gallery_options(filters=None, quality=None, media=None, album_title=None,
         options["album_title"] = album_title
     if album_tags_dir is not None:
         options["album_tags_dir"] = bool(album_tags_dir)
+    # 聚合页闸门。上界是保护而不是限制意志: 一个索引页挂着上百个模特, depth=3
+    # 就是几百次页面读取, 站点会先把我们封掉。要更多就分批来。
+    if max_items is not None:
+        n = int(max_items)
+        if not 1 <= n <= AGGREGATE_MAX_ITEMS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"max_items 应在 1~{AGGREGATE_MAX_ITEMS} 之间: {max_items}",
+            )
+        options["max_items"] = n
+    if aggregate_depth is not None:
+        d = int(aggregate_depth)
+        if not 1 <= d <= AGGREGATE_MAX_DEPTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"aggregate_depth 应在 1~{AGGREGATE_MAX_DEPTH} 之间: {aggregate_depth}",
+            )
+        options["aggregate_depth"] = d
     return options
+
+
+#: 聚合页单次展开上限。这不是"限制用户", 而是防止一个索引页(上百个模特)
+#: 乘上 depth 之后变成几百次页面读取 —— 那会先把站点惹毛, 结果是全都采不到。
+AGGREGATE_MAX_ITEMS = 500
+AGGREGATE_MAX_DEPTH = 3
 
 
 #: 采集器处的 "auto" = 让后端按 URL 挑一个。
@@ -143,6 +168,8 @@ def create(payload: TaskCreateIn):
         media=payload.media,
         album_title=payload.album_title,
         album_tags_dir=payload.album_tags_dir,
+        max_items=payload.max_items,
+        aggregate_depth=payload.aggregate_depth,
     )
 
     task_id = db.create_task(payload.url, collector, download_dir, options)
@@ -160,6 +187,8 @@ class PreviewIn(BaseModel):
     album_tags_dir: Optional[bool] = None
     # 抽样上限: 预览不该因为"想看全"把接口拖成几分钟
     max_items: int = 12
+    # 聚合页采集器: 还能再往下钻几层(模特索引 -> 模特 -> 相册 = 2 层)
+    aggregate_depth: Optional[int] = None
 
 
 @router.post("/tasks/preview")
@@ -186,11 +215,35 @@ def preview(payload: PreviewIn):
         media=payload.media,
         album_title=payload.album_title,
         album_tags_dir=payload.album_tags_dir,
+        aggregate_depth=payload.aggregate_depth,
     )
     limit = max(1, min(int(payload.max_items or 12), 50))
     logs = []
+
+    def sink(msg, level="info"):
+        """收集预览日志。
+
+        ⚠️ 必须收第二个可选参数: 采集器会用 `log(msg, "warn")` 标出"这条要显眼"。
+        只收一个参数的话, 那行日志会抛 TypeError, 把整个预览请求变成 500 ——
+        **日志不该有能力让功能失败**。
+        """
+        logs.append(f"[{level}] {msg}" if level != "info" else str(msg))
+
+    # 按签名注入, 与 task_manager._crawl 同一套思路: 预览不是图集类独有的能力,
+    # 硬编码参数会让新采集器(如聚合页)一接进来就 TypeError。
     try:
-        data = fn(payload.url, options=options, log=logs.append, max_items=limit)
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs = {}
+    if "options" in params:
+        kwargs["options"] = options
+    if "log" in params:
+        kwargs["log"] = sink
+    if "max_items" in params:
+        kwargs["max_items"] = limit
+    try:
+        data = fn(payload.url, **kwargs)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     data["logs"] = logs
@@ -230,6 +283,10 @@ def get_config():
         "default_media": DEFAULT_MEDIA,
         "album_titles": list(ALBUM_TITLE_MODES),
         "default_album_title": DEFAULT_ALBUM_TITLE,
+        # 聚合页闸门的可选上限, 前端拿它渲染输入框的 max 属性。
+        # 与后端校验共用同一个常量, 避免"前端允许 999 后端只收 500"。
+        "aggregate_max_items": AGGREGATE_MAX_ITEMS,
+        "aggregate_max_depth": AGGREGATE_MAX_DEPTH,
     }
 
 
@@ -487,6 +544,10 @@ class WatchIn(BaseModel):
     quality: Optional[str] = None
     media: Optional[str] = None
     album_title: Optional[str] = None
+    album_tags_dir: Optional[bool] = None
+    # 聚合页: 一次巡检展开的范围(与创建任务同一套选项)
+    max_items: Optional[int] = None
+    aggregate_depth: Optional[int] = None
     run_now: bool = True
 
 
@@ -499,29 +560,17 @@ def create_watch(payload: WatchIn):
     collector, resolved = _pick_collector(payload.url, payload.collector)
     if payload.interval_minutes < 1:
         raise HTTPException(status_code=400, detail="interval_minutes 至少为 1")
-    options = {}
-    if payload.quality:
-        if payload.quality not in QUALITY_KEYS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"quality 非法: {payload.quality}. 可选: {', '.join(QUALITY_KEYS)}",
-            )
-        options["quality"] = payload.quality
-    if payload.media:
-        if payload.media not in MEDIA_KEYS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"media 非法: {payload.media}. 可选: {', '.join(MEDIA_KEYS)}",
-            )
-        options["media"] = payload.media
-    if payload.album_title:
-        if payload.album_title not in ALBUM_TITLE_MODES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"album_title 非法: {payload.album_title}. "
-                       f"可选: {', '.join(ALBUM_TITLE_MODES)}",
-            )
-        options["album_title"] = payload.album_title
+    # 与创建任务/预览**共用**同一个选项构造器。原先这里手抄了一份校验,
+    # 结果是 album_tags_dir 这类新选项在前端传了却被静默丢掉 —— 订阅会长期
+    # 反复跑, 悄悄少一个选项比直接报错难查得多。
+    options = _gallery_options(
+        quality=payload.quality,
+        media=payload.media,
+        album_title=payload.album_title,
+        album_tags_dir=payload.album_tags_dir,
+        max_items=payload.max_items,
+        aggregate_depth=payload.aggregate_depth,
+    )
     download_dir = _validate_download_dir(payload.download_dir)
     if download_dir:
         options["download_dir"] = download_dir

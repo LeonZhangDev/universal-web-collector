@@ -40,6 +40,7 @@ const collectorLabel = {
   xchina: "XChina 页面(浏览器抓取)",
   xchina_gallery: "XChina 图集/视频相册(相册 ID / 相册页 URL 均可)",
   xchina_video: "XChina 视频页(自动过 Cloudflare 抓带签名 m3u8)",
+  xchina_aggregate: "XChina 聚合页(模特 / 演员 / 系列 / 索引页, 展开出多个相册)",
 };
 // 自动识别的结论。**必须回显给用户并可覆盖** —— 悄悄生效的自动识别, 一旦
 // 猜错用户连"该去哪里改"都无从下手, 只会以为站点坏了。
@@ -57,7 +58,9 @@ const urlPlaceholder = computed(() =>
       ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX.html) / 任意一张图片或视频 URL 都行"
       : effectiveCollector.value === "xchina_video"
         ? "视频页 URL(https://xchina.co/video/id-XXX.html) 或带签名的 m3u8 直链"
-        : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
+        : effectiveCollector.value === "xchina_aggregate"
+          ? "聚合页 URL: 模特/演员 /model/id-XXX.html、索引 /models.html、全量列表 /videos/model-XXX.html"
+          : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
 );
 const creating = ref(false);
 const errorMsg = ref("");
@@ -76,9 +79,12 @@ const qualities = ref(["original", "1200", "800", "600"]);
 const quality = ref("original");
 const isGallery = computed(() => effectiveCollector.value === "xchina_gallery");
 const isVideo = computed(() => effectiveCollector.value === "xchina_video");
-// 预览面板对图集与视频都展示(都是"先读页面再决定采什么"); 但画质/媒体/目录命名
-// 那些选项只对图集有意义, 视频采集器不需要
-const isGalleryLike = computed(() => isGallery.value || isVideo.value);
+const isAggregate = computed(() => effectiveCollector.value === "xchina_aggregate");
+// 预览面板对图集/视频/聚合页都展示(都是"先读页面再决定采什么"); 但画质/媒体/
+// 目录命名那些选项只对图集有意义, 视频与聚合页用不上
+const isGalleryLike = computed(
+  () => isGallery.value || isVideo.value || isAggregate.value
+);
 const qualityLabel = {
   original: "原图 (画质最高)",
   1200: "1200px WebP",
@@ -110,6 +116,20 @@ const albumTitleLabel = {
 // 相册名外面再套一层站点标签目录: 丝袜-情趣内衣/相册名/00001.jpg。
 // 标签来自相册页(实测该类站每册 3~6 个), 只取前 3 个 —— 再多只会把路径撑长。
 const albumTagsDir = ref(false);
+
+// ---- 聚合页 (模特/系列/索引页) ----
+// 「展开层数」是从入口页再往下钻几层去找内容链接; 「条目上限」是相册+视频页
+// 的**合计**上限。两者到顶都会在预告里标成"下限"而不是静默截断。
+const aggregateDepth = ref(1);
+const aggregateMax = ref(50);
+// 只有聚合页才带这两个参数, 免得给别的采集器塞无意义选项(与画质/媒体的处理一致)
+function aggregateOpts() {
+  if (!isAggregate.value) return {};
+  return {
+    aggregate_depth: Number(aggregateDepth.value) || 1,
+    max_items: Number(aggregateMax.value) || 50,
+  };
+}
 
 // ---- 过滤条件 ----
 const resourceTypes = ref(["image", "video", "audio", "doc", "text"]);
@@ -311,6 +331,7 @@ async function submit() {
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
       album_tags_dir: isGallery.value ? albumTagsDir.value : null,
+      ...aggregateOpts(),
     });
     url.value = "";
     savePrefs();
@@ -346,6 +367,7 @@ async function runPreview() {
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
       album_tags_dir: isGallery.value ? albumTagsDir.value : null,
+      ...aggregateOpts(),
     });
   } catch (e) {
     previewError.value = e.response?.data?.detail || String(e);
@@ -359,6 +381,14 @@ const previewSummary = computed(() => {
   const p = preview.value;
   if (!p) return "";
   const mark = p.sampled ? "≥" : "";
+  // 聚合页的 photos/videos 是**子页面数量**(要展开几个相册), 不是文件数。
+  // 沿用"N 张图 + M 段视频"的文案会严重误导(用户以为只下 12 个文件)。
+  if (p.kind === "aggregate") {
+    const bits = [];
+    if (p.photos != null) bits.push(`${mark}${p.photos} 个相册`);
+    if (p.videos != null) bits.push(`${mark}${p.videos} 个视频页`);
+    return bits.join(" + ") || "数量未知";
+  }
   const bits = [];
   if (p.photos != null) bits.push(`${mark}${p.photos} 张图`);
   if (p.videos != null) bits.push(`${mark}${p.videos} 段视频`);
@@ -533,6 +563,7 @@ async function addWatch() {
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
       album_tags_dir: isGallery.value ? albumTagsDir.value : null,
+      ...aggregateOpts(),
     });
     watchUrl.value = "";
     await loadWatches();
@@ -770,6 +801,20 @@ onUnmounted(() => {
       <span class="tip" v-else>关闭时直接用相册名当目录</span>
     </div>
 
+    <div class="dir-row" v-if="isAggregate">
+      <span class="lbl">展开范围</span>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+        层数
+        <input class="num" type="number" min="1" max="3" v-model.number="aggregateDepth" />
+        条目上限
+        <input class="num" type="number" min="1" max="500" v-model.number="aggregateMax" />
+      </label>
+      <span class="tip">
+        从入口页往下钻几层找相册; 条目上限是相册+视频页的合计上限。
+        到顶时预告里的数量只会是下限, 并会明确提示
+      </span>
+    </div>
+
     <div
       v-if="isGalleryLike && (previewing || preview || previewError)"
       style="display:flex;flex-direction:column;gap:5px;font-size:13px;line-height:1.6;
@@ -777,21 +822,30 @@ onUnmounted(() => {
              border:1px solid rgba(127,127,127,0.35)"
     >
       <div v-if="previewing">
-        {{ isVideo ? "正在打开视频页并捕获播放列表…" : "正在读取相册页…" }}
+        {{
+          isAggregate
+            ? "正在展开聚合页(数一数下面有哪些相册)…"
+            : isVideo
+              ? "正在打开视频页并捕获播放列表…"
+              : "正在读取相册页…"
+        }}
       </div>
       <div v-else-if="previewError" style="color:#c0392b">
         预览失败: {{ previewError }}
       </div>
       <template v-else>
         <div>
-          <b>将保存到</b>
+          <b>{{ isAggregate ? "将展开到" : "将保存到" }}</b>
           <code>{{ preview.group }}</code>
-          <span class="tip" v-if="!isVideo">
+          <span class="tip" v-if="!isVideo && !isAggregate">
             （命名方式: {{ albumTitleLabel[preview.album_source] || preview.album_source }}）
+          </span>
+          <span class="tip" v-if="isAggregate">
+            （聚合页只发现子页面, 每个相册按图集采集器的规则各自命名）
           </span>
         </div>
         <div>
-          <b>本次将采集</b> {{ previewSummary }}
+          <b>{{ isAggregate ? "本次将展开" : "本次将采集" }}</b> {{ previewSummary }}
           <span v-if="preview.video_bytes">
             · 视频合计 {{ fmtSize(preview.video_bytes) }}
           </span>
@@ -807,13 +861,18 @@ onUnmounted(() => {
           <span v-if="preview.maker" class="tip">· 厂牌 {{ preview.maker }}</span>
         </div>
         <div v-if="preview.sample_files && preview.sample_files.length">
-          <b>文件名示例</b> <code>{{ preview.sample_files.join("  ,  ") }}</code>
+          <b>{{ isAggregate ? "相册示例" : "文件名示例" }}</b>
+          <code>{{ preview.sample_files.join("  ,  ") }}</code>
         </div>
         <div v-if="previewRoot" class="tip">
           资源路径 <code>{{ previewRoot }}</code>
         </div>
         <div v-if="preview.sampled" class="tip">
-          数量来自抽样枚举（相册页读不到），实际可能更多
+          {{
+            isAggregate
+              ? "已达展开上限，上面的数量只是下限"
+              : "数量来自抽样枚举（相册页读不到），实际可能更多"
+          }}
         </div>
         <div v-if="preview.warning" class="preview-warn">
           {{ preview.warning }}

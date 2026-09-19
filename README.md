@@ -107,6 +107,9 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | `6aa513208a506`(纯图集 ID) | `xchina_gallery` (分数 10) |
 | `https://xchina.co/video/id-6aaa517d3f106.html` | `xchina_video` (分数 100, 视频页) |
 | `https://video.xchina.download/m3u8/abc/720.m3u8?expires=...&md5=...` | `xchina_video` (分数 50, 带签名 m3u8) |
+| `https://xchina.co/model/id-601190f157fe7.html` | `xchina_aggregate` (分数 100, 模特/演员落地页) |
+| `https://xchina.co/models.html` / `/models/type-7.html` | `xchina_aggregate` (分数 100, 索引页) |
+| `https://xchina.co/videos/model-601190f157fe7.html` | `xchina_aggregate` (分数 100, 全量列表页) |
 | `https://example.com/a/b` | `generic`(没有专用采集器认领) |
 | `随便打几个字` | 无法识别 -> 400 "请手动选择采集器" |
 
@@ -173,6 +176,44 @@ inspect_playlist(m3u8):
 ffmpeg 原生处理拉钥+解密+remux, 端到端实测产出 27.1MB / 5:05 的真视频, 退出码 0
 (而非那个 603KB 占位片)。所以**解密走 ffmpeg, 零新增依赖**。
 
+### 聚合页采集(整模特 / 整系列一次下完)
+
+粘贴模特页或索引页, 采集器**先枚举出下面的相册与视频页, 再逐个委派给对应的
+子采集器** —— 采集器只负责"发现有哪些内容页", 资源的枚举与下载仍由各站原有
+采集器完成, 不重复实现:
+
+```bash
+# 模特落地页 / 索引页 / 全量列表页 都行
+curl -X POST localhost:8000/tasks/create -H 'Content-Type: application/json' \
+  -d '{"url":"https://xchina.co/model/id-601190f157fe7.html","max_items":50}'
+```
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `aggregate_depth` | `1` | 向下展开几层; 索引页挂的是落地页, 要拿全量得 ≥2 |
+| `max_items` | `50` | **条目总数**上限(相册 + 视频页合计), 先截断再委派 —— 避免为一堆用不到的子页面去开浏览器 |
+
+落盘目录会多套一层聚合层父目录(取页面标题, 拿不到回退 URL 里的 ID):
+
+```
+艾玛/阁楼监禁 把美乳艾玛锁在家中阁楼的小房间里/00001.jpg
+└─ 模特名(聚合层)  └─ 相册名(子采集器)              └─ 序号
+```
+
+三条设计要点:
+
+1. **URL 驱动抽取, 不是 DOM 选择器** —— 只按链接路径形态(`/photo/id-*` 是相册、
+   `/video/id-*` 是视频、`/photos/model-*` 是更深的列表)归类。站点改版换 div
+   结构不影响; 真改了 URL 形态也会**采到 0 个并报错**, 而不是静默采空。
+2. **单个子页面失败不拖垮整任务** —— 60 个相册里坏 1 个是常态, 失败的跳过并
+   在日志里点名, 其余照常下载。
+3. **截断必须说出来** —— 触顶时预告标 `sampled`(数量只是下限)并给可行动提示;
+   到层数上限时写明"还有 N 个更深入口未展开"。悄悄少采最容易被误当成"站点只有这些"。
+
+⚠️ 实测该站的分工是: **落地/索引页开放(纯 HTTP 可读), 全量列表页受 Cloudflare
+保护**(headless 能过, 但代价是每次几十秒)。采集器按此自动选择纯 HTTP 或浏览器,
+并共用同一套域级熔断。
+
 ### 创建前预告(推荐先看一眼)
 
 ```bash
@@ -210,7 +251,7 @@ curl -X POST localhost:8000/tasks/preview \
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (347 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源)
+make test           # pytest (399 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -262,6 +303,22 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
     带签名 m3u8(无需解析 DOM/JS); 也认迅雷那样的 m3u8 直链。下载前强制做播放列表
     健全性校验(过期/占位/无密钥一律拒绝), AES-128 解密走 ffmpeg
     (零新增依赖; 密钥与分片均无需签名, 只有 playlist 那一层设防)
+  - `xchina_aggregate` XChina 聚合页(模特/演员/系列/分类索引): 一次把**整个模特**
+    或**整个系列**的相册与视频页收进队列, 再逐个**委派**给 `xchina_gallery` /
+    `xchina_video`。可识别的入口(2026-09 实测):
+    - `/model/id-{id}.html`、`/actor/id-{id}.html` 落地页(纯 HTTP 可读)
+    - `/models.html`、`/models/type-{n}.html` 索引页
+    - `/photos/series-{id}.html`、`/videos/series-{id}.html`
+    - `/videos/model-{id}.html`、`/photos/model-{id}.html` 全量列表页
+    - ⚠️ **URL 驱动抽取, 不是 DOM 选择器**: 靠 URL 模式认内容链接, 站点改版
+      (class 改名)不会让采集器静默采到 0 个
+    - `aggregate_depth` 控制展开层数(默认 1), `max_items` 是**合计**上限;
+      被截断时日志与 `album.json` 都会明说"还有 N 个未展开", 绝不悄悄少采
+    - 落地页多为**纯 HTTP 可达**, 更深的系列/全量列表页受 Cloudflare 保护,
+      复用 `album_meta.load_page_html` 的"纯 HTTP 优先 + 失败降级 headless"
+      与整套域级熔断/登录态隔离
+    - ⚠️ 只归内容页: 相册的 `/10.html` 分页是**同一相册的不同页**, 归一化到
+      主页; 列表页的分页是**不同内容**, 不做归一化(归了会漏采)
 - 资源类型: image / video / audio / doc / text, 对应下载器
 - 资源过滤("什么是有效资源"的唯一定义在 `core/filters.py::match_resource`):
   类型/扩展名黑白名单/URL关键词/大小区间/图片体积下限/广告位识别,

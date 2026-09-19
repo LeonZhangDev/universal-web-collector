@@ -59,6 +59,12 @@ class TaskCreateIn(BaseModel):
     album_title: Optional[str] = None
     # 在相册名之外再套一层站点标签目录(如 丝袜-情趣内衣/相册名/...)
     album_tags_dir: Optional[bool] = None
+    # 聚合页采集器(xchina_aggregate): 一次最多展开多少个条目(相册 + 视频页)。
+    # 模特页可能挂几十个相册、索引页挂着上百个模特 —— 不设闸门就是几万条资源。
+    max_items: Optional[int] = None
+    # 聚合页采集器: 还能再往下钻几层。默认 1(落地页 -> 它的相册);
+    # 索引页要连模特一起展开时才需要 2。
+    aggregate_depth: Optional[int] = None
 
 
 class TaskCreateOut(BaseModel):

@@ -422,7 +422,7 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT, page_url=""):
 
 
 def _load_html(url, log=None, storage_state=None, timeout_ms=30000,
-               wait_ms=25000, step_ms=800):
+               wait_ms=25000, step_ms=800, markers=None, ready_label="相册页"):
     """用 headless Chromium 打开页面, 等 Cloudflare 挑战解开后取 HTML。
 
     ⚠️ 判定"页面好了没"不能用标题, 只能看**正文里有没有相册页的标记**。
@@ -470,13 +470,13 @@ def _load_html(url, log=None, storage_state=None, timeout_ms=30000,
                     html = page.content()
                 except Exception:
                     html = ""      # 正在导航: 执行上下文已销毁, 下一轮再读
-                if html and _looks_ready(html):
+                if html and _looks_ready(html, markers):
                     return html
                 page.wait_for_timeout(step_ms)
                 waited += step_ms
             if log:
-                log(f"相册页 {wait_ms}ms 内未就绪"
-                    f"({'仍是 Cloudflare 拦截页' if _is_challenge(html) else '未出现相册页标记'})")
+                log(f"{ready_label} {wait_ms}ms 内未就绪"
+                    f"({'仍是 Cloudflare 拦截页' if _is_challenge(html) else '未出现预期标记'})")
             return None
         finally:
             try:
@@ -485,13 +485,21 @@ def _load_html(url, log=None, storage_state=None, timeout_ms=30000,
                 browser.close()
 
 
-def _looks_ready(html):
-    """正文是否已经是一个可用的相册页(挡掉挑战页/登录页/"导航中")。"""
+def _looks_ready(html, markers=None):
+    """正文是否已经是一个可用的页面(挡掉挑战页/登录页/"导航中")。
+
+    `markers`: 页面"就绪"的特征串, 命中**任一**即算就绪。默认是相册页的标记;
+    聚合/列表页要传自己的(它们不含 `photo-items`), 否则会被判成"永远没就绪",
+    白白轮询满 `wait_ms` 才失败。
+    """
     if not html or _is_challenge(html):
         return False
     if not _TITLE_RE.search(html):
         return False
-    return any(m in html for m in _READY_MARKERS)
+    ms = _READY_MARKERS if markers is None else tuple(markers)
+    if not ms:
+        return True
+    return any(m in html for m in ms)
 
 
 _PW_OK = None
@@ -537,6 +545,95 @@ def _validate(meta, gid):
     if gid and meta.get("obj_id") and meta["obj_id"] != gid:
         return f"页面 objId={meta['obj_id']} 与图集 {gid} 不一致"
     return None
+
+
+def _http_get(url, log=None, timeout=25):
+    """一次普通 HTTP GET; 非 4xx/5xx 才返回正文, 否则空串。
+
+    为什么值得先试: 实测该站**索引页/落地页是开放的**(`/models.html` 返回 200),
+    只有全量列表页才被 Cloudflare 挡。先走这一步, 常见的索引页就**完全不用开
+    浏览器** —— 而开一次 headless 要几秒到几十秒, 还会把域推向熔断。
+    """
+    try:
+        import requests
+    except Exception:
+        return ""
+    headers = {
+        "User-Agent": settings.user_agent,
+        # ⚠️ 该站的 WAF 会校验 Accept: 缺它或写成 `*/*` 直接 403(见项目记忆)。
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    proxies = None
+    if settings.proxy:
+        proxies = {"http": settings.proxy, "https": settings.proxy}
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout, proxies=proxies)
+    except Exception as e:
+        if log:
+            log(f"纯 HTTP 打开 {url} 失败: {type(e).__name__}: {e}")
+        return ""
+    if r.status_code >= 400:
+        if log:
+            log(f"纯 HTTP 返回 {r.status_code}, 该页需要浏览器")
+        return ""
+    return r.text or ""
+
+
+def load_page_html(url, markers=None, log=None, http_first=True, ready_label="页面"):
+    """通用页面加载: 先纯 HTTP, 拿不到再用 headless 过 Cloudflare。
+
+    返回 `(html, source)`, `source` ∈ {"http", "browser"}; 读不到返回 `(None, None)`。
+
+    与 `fetch_album_meta` **共用同一套域级熔断与登录态隔离**: 相册页刚把某域
+    跳闸, 这里也立刻省下那次浏览器 —— 两条链路不会各敲各的(见模块文档"长期对策")。
+
+    `markers`: 页面就绪的特征串(命中任一即可), 必须传**该页真正有的**东西,
+    否则会一路轮询到超时才失败。空元组表示只要求"有 title 且不是挑战页"。
+    """
+    if not url:
+        return None, None
+    markers = tuple(markers or ())
+
+    if http_first:
+        html = _http_get(url, log=log)
+        if _looks_ready(html, markers):
+            return html, "http"
+
+    left = cooldown_left(url)
+    if left > 0:
+        if log:
+            log(f"该域熔断冷却中(还剩 {left}s), 不再开浏览器, 降级处理")
+        return None, None
+    # 没装浏览器是**环境问题**, 不能计进 CF 熔断: 否则一次依赖缺失会把
+    # 该域拉黑, 之后装好了也读不到(熔断是给"对方在拦我"用的)。
+    if _playwright_missing():
+        if log:
+            log("未安装 Playwright, 无法用浏览器读取该页; 降级处理")
+        return None, None
+
+    attempts = [None]
+    state = _storage_state(url)
+    # 已判失效的登录态别再拿出来招 `Attention Required!`(永久拒绝、不自愈)
+    if state and not is_stale_state(url):
+        attempts.append(state)
+
+    for i, storage in enumerate(attempts):
+        html = _load_html(url, log=log, storage_state=storage,
+                          markers=markers, ready_label=ready_label)
+        if _looks_ready(html, markers):
+            note_success(url)
+            if i and log:
+                log("匿名读取未就绪, 带已保存登录态重试成功")
+            return html, "browser"
+        info = note_failure(url, html=html, used_state=bool(storage))
+        if storage and info["stale_state"] and log:
+            log("带登录态仍被拒(Attention Required!), 已标记该登录态失效; "
+                "请到「登录态」区重新登录")
+        if info["cooldown"]:
+            if log:
+                log(f"连续 {info['fails']} 次未就绪, 该域进入 {info['cooldown']}s 冷却")
+            break
+    return None, None
 
 
 def fetch_album_meta(url, split=DEFAULT_TITLE_SPLIT, log=None, use_cache=True,

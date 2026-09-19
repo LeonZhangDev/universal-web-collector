@@ -220,8 +220,13 @@ class VideoDownloader:
             raise RuntimeError("播放列表没有任何分片")
         # 加密流必须用 ffmpeg 解密: 内置分片器只会把密文 .ts 拼在一起, 得到垃圾文件
         if info["encrypted"] and not pull_with_ffmpeg:
+            method = next(
+                (k.get("method") for k in (info.get("keys") or []) if k.get("method")),
+                "AES-128",
+            )
+            n_keys = len(info.get("keys") or []) or 1
             raise RuntimeError(
-                "播放列表声明 AES-128 加密, 内置分片器无法解密; "
+                f"播放列表声明 {method} 加密({n_keys} 把密钥), 内置分片器无法解密; "
                 f"请安装 ffmpeg 或改用 video_engine=ffmpeg(当前 engine={engine}, "
                 f"ffmpeg={'可用' if ff else '未找到'})"
             )
@@ -388,7 +393,22 @@ class VideoDownloader:
         args = []
         for k, v in headers.items():
             args += ["-headers", f"{k}: {v}\r\n"]
-        self._run_ffmpeg([ff, "-y", "-nostats", *args, "-i", url, "-c", "copy", str(path)])
+        # 网络加固: 一部长片可以上千个分片, 几分钟里必然遇到几次瞬断。不重连的话
+        # 一次抖动就得从头再来 —— 而这期间那把短命签名可能已经过期了(实测约 30 分钟)。
+        # `-reconnect_streamed 1` 针对非 seekable 流(正是 HLS), 缺了它重连不生效。
+        net = [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "10",
+        ]
+        # `allowed_extensions` 默认只放行一份白名单扩展名; 正规站点都是 .ts/.m4s,
+        # 但有些 CDN 用 .jpg/.php 之类的伪装分片 URL, 默认值会直接拒绝拉取。
+        # 放在 -i 之前(它是 demuxer 选项)。
+        self._run_ffmpeg([
+            ff, "-y", "-nostats", *args, *net,
+            "-allowed_extensions", "ALL",
+            "-i", url, "-c", "copy", str(path),
+        ])
 
     def _ffmpeg_remux(self, src, dst, ff):
         self._run_ffmpeg(

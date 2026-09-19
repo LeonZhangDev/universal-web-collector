@@ -12,7 +12,8 @@ from core import events
 from core.cancel import TaskCancelled  # noqa: F401  (下载层要识别它, 在这里重导出)
 from core.config import settings
 from core.filters import Filters, probe_size
-from core.manifest import manifest_enabled, write_manifest
+from core.imageinfo import fmt_dimensions, image_dimensions
+from core.manifest import manifest_enabled, write_manifest, write_sidecar
 from core.naming import build_context, render, safe_relative
 from downloaders.file import FileDownloader
 from downloaders.image import ImageDownloader
@@ -494,6 +495,34 @@ class TaskManager:
             # manifest 是附属产物, 写不出来不能让任务失败
             self._safe_log(task_id, f"manifest 生成失败: {e}", "warn")
 
+    def _write_sidecar(self, task_id, resources):
+        """把"这次采集采的是什么"写成 album.json(集合级元数据)。
+
+        与 manifest.json 的分工: manifest 是文件级(一行一个资源), 这份是集合级
+        (目录名/厂牌/标签/实际生效的资源根)。采集器把描述挂在每条资源的
+        `task_meta` 上(同一个 dict 引用), 这里取第一份即可。
+
+        落盘归任务层管是刻意的 —— 采集器的职责只有"发现"。见 README 的铁律。
+        """
+        meta = None
+        for r in resources or []:
+            meta = r.get("task_meta")
+            if meta:
+                break
+        if not meta:
+            return None
+        task = db.get_task(task_id)
+        if not task:
+            return None
+        try:
+            return write_sidecar(
+                task, meta, self._out_dir(task_id), resources=resources,
+                log=lambda m, level="info": self._safe_log(task_id, m, level),
+            )
+        except Exception as e:
+            self._safe_log(task_id, f"album.json 生成失败: {e}", "warn")
+            return None
+
     def _out_dir(self, task_id):
         """任务输出目录: 优先任务自定义目录, 回退全局 download_dir。
 
@@ -624,6 +653,9 @@ class TaskManager:
             if name:
                 db.update_task(task_id, name=name)
                 self._publish_task(task_id)
+            # 采集已完成, 此刻就知道"采的是什么"了 —— 不必等下载结果,
+            # 这样即使后面下载全失败, sidecar 里仍有排查所需的资源根信息。
+            self._write_sidecar(task_id, resources)
             if reused:
                 self._safe_log(task_id, f"incremental: 复用已下载 {reused} 个, 跳过重复传输")
             if filters.active:
@@ -832,9 +864,12 @@ class TaskManager:
                     "content_type": info.get("content_type")}
             meta = {k: v for k, v in meta.items() if v}
             existing = db.find_by_hash(sha)
+            owned = True
             if existing and existing["local_path"] != str(path):
                 Path(path).unlink(missing_ok=True)
                 final_path = existing["local_path"]
+                # 复用别的任务的文件: 不能因为本任务的新规则去删它
+                owned = False
                 db.update_resource(rid, status="done", hash=sha, local_path=final_path, **meta)
                 self._safe_log(task_id, f"dedup {r['url']} -> {final_path}")
             else:
@@ -844,6 +879,28 @@ class TaskManager:
             size = file_size(final_path)
             if size is not None:
                 db.update_resource(rid, size=size)
+
+            # 尺寸终检(可选): 广告横幅(728x90)、按钮(88x31)、信标(1x1)的文件名
+            # 和体积都可能"正常", 只有量宽高才认得出。放在**下载后**是有意的 ——
+            # 那时手上是完整文件, 零额外请求、零误判; 下载前用 Range 抓头部遇到
+            # progressive JPEG 会读不到 SOF, 于是广告照样落盘, 等于没做。
+            if filters.need_dimensions and (r["type"] or "").lower() == "image":
+                dims = image_dimensions(final_path)
+                reason = filters.match_dimensions(*dims) if dims else None
+                if reason:
+                    if owned:
+                        Path(final_path).unlink(missing_ok=True)
+                    db.update_resource(
+                        rid, status="filtered", local_path=None,
+                        note=f"{reason}; 实测 {fmt_dimensions(dims)}",
+                    )
+                    self._publish_resource(task_id, rid, "filtered")
+                    self._safe_log(
+                        task_id,
+                        f"filtered {r['url']}: {reason} (尺寸终检, 已删除文件)",
+                    )
+                    return
+
             self._publish_resource(task_id, rid, "done")
         except TaskCancelled:
             # 下载中途被叫停: 半成品留着没意义且会被误认为已完成, 直接删掉

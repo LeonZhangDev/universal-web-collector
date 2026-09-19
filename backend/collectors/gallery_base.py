@@ -171,6 +171,19 @@ class GallerySite:
     # 让采集器自己发现"资源到底在哪", 而不是写死一个 base(否则像
     # 69ad45698f836 这种在 photos2 的相册会整体判空 -> 任务 failed)。
     base_candidates: Optional[list] = None
+    # `base_candidates` 的自动展开版: base 后面接 1..N 的数字后缀
+    # (photos -> photos2 / photos3 ... / photosN)。数字后缀是这类站最常见的
+    # 分桶方式, 手写三个的话下次多出一个 photos4 就整批判空 —— 而"整批判空"
+    # 对用户只表现为"任务失败", 看不出是路径变了。显式 candidates 仍可与它并用
+    # (用于非数字后缀的情形, 如 img2.example.com)。
+    base_candidate_digits: int = 0
+    # 图集 ID 的**形状**正则(fullmatch)。只在**自动识别**时生效 —— 那时是我们
+    # 替用户做决定, 认错会去枚举一个不存在的图集(表现为"成功但 0 个资源"),
+    # 代价是静默的, 所以要用最严的判据。用户手选采集器时不校验:
+    # 他已经表过态, 而且输入形态可能是我们没见过的。
+    # 例: XChina 实测所有 gid 都是 13 位小写十六进制(6aa5136f606fe / 69ad45698f836),
+    # 于是 `[0-9a-f]{8,}` 能挡掉 /photos/featured/0001.jpg 这类"路径词被当成 ID"。
+    gid_shape: str = ""
     seq_format: str = "{seq:05d}"
     # 视频媒体: 非空即声明"该站同一 gid 下还有视频"。留空则该站只采图片。
     video_variants: list = field(default_factory=list)
@@ -255,18 +268,27 @@ def parse_gid(site, raw, strict=False):
     图集仍返回 200 + text/html, 于是被判定为"序号不存在", 连续 3 次后停止,
     最终**任务报 success 但 0 个资源** —— 用户完全看不出哪里错了。
 
-    `strict=True` 时**跳过下面的末段退路**, 只认正则配出来的 ID。它为自动
-    识别服务: `/tag/some-tag` 这种列表页的末段同样过得了 ID 字符集校验,
-    于是会被当成图集 ID 认领, 后果是去枚举一个不存在的图集 —— 又是一次
-    "成功但 0 资源"。真实采集保留退路(用户已手选采集器, 输入形态各异);
-    **替用户做决定的场合必须用 strict**, 那里猜错的代价是静默的。
+    `strict=True` 时**跳过下面的末段退路**, 只认正则配出来的 ID, 并要求它满足
+    `site.gid_shape`(站点声明的 ID 形状)。它为自动识别服务: `/tag/some-tag`
+    这种列表页的末段同样过得了 ID 字符集校验, 于是会被当成图集 ID 认领, 后果是
+    去枚举一个不存在的图集 —— 又是一次"成功但 0 资源"。真实采集保留退路(用户已手选
+    采集器, 输入形态各异); **替用户做决定的场合必须用 strict**, 那里猜错的代价是静默的。
+
+    ⚠️ 形状不符时**不再往下走退路**: 退路比形状判据更不可靠, 真要放行反而更危险。
     """
     s = (raw or "").strip()
     if not s:
         return None
+
+    def accept(gid):
+        """strict 下再验一次 ID 形状 —— 形状不符说明这大概率不是图集 ID。"""
+        if gid and strict and site.gid_shape and not re.fullmatch(site.gid_shape, gid):
+            return None
+        return gid
+
     # 纯 ID: 既没有协议也没有路径分隔符, 且字符集合法
     if "://" not in s and "/" not in s:
-        return s if _ID_CHARS.fullmatch(s) else None
+        return accept(s) if _ID_CHARS.fullmatch(s) else None
 
     patterns = list(site.id_patterns or [])
     if site.id_in_path:
@@ -274,11 +296,11 @@ def parse_gid(site, raw, strict=False):
     for pat in patterns:
         m = re.search(pat, s)
         if m and m.group(1):
-            return m.group(1)
+            return accept(m.group(1))
 
     m = re.search(rf"[?&]{re.escape(site.id_in_query)}=([0-9A-Za-z_-]{{6,}})", s)
     if m:
-        return m.group(1)
+        return accept(m.group(1))
     if strict:
         return None
 
@@ -416,12 +438,16 @@ def _seq_format_variants(fmt):
     return out
 
 
-def parse_resource_hint(site, raw):
+def parse_resource_hint(site, raw, gid=None):
     """从一条**资源直链**里直接读出 CDN 基址与序号宽度; 不是直链返回 None。
 
     用户手上的直链是本站最可靠的一份证据: 它把"这批资源放在哪个 CDN 子路径"和
     "序号补几位零"都写在 URL 里了 —— 例如 `.../photos2/69ad45698f836/0001.jpg`
     同时说明了基址是 `photos2`、宽度是 4。先采信它可以省掉一整轮探测。
+
+    gid 传入时**只接受指向该图集的直链**。这一点很关键: 相册页里常混着推荐位
+    别的相册的图, 而那些相册未必在同一个 CDN 子路径上 —— 采信了它, 枚举就会被
+    引到一条错误的路径上, 结果同样是"0 资源 -> failed"。
 
     ⚠️ 这只是**线索**不是结论: `_resolve_base` 仍会拿它去探一次, 探不通就
     退回候选探测 —— 用户也可能粘了一条失效的旧直链。
@@ -438,23 +464,70 @@ def parse_resource_hint(site, raw):
         mtype = site.media(name)
         if mtype is None:
             continue
-        root = mtype.root(site)
-        # root 本身含 scheme+host, 所以是对**整条 URL**做前缀匹配
-        m = re.match(
-            rf"^{re.escape(root)}(?P<tail>\d*)/(?P<gid>[0-9A-Za-z_-]{{4,}})"
-            rf"/(?P<seq>\d+)(?P<ext>\.[0-9A-Za-z]+)?$",
-            plain,
-        )
-        if not m:
-            continue
-        return {
-            "base": f"{root}{m.group('tail')}",
-            "seq_format": "{seq:0%dd}" % len(m.group("seq")),
-        }
+        # 遍历**全部候选根**而不是只看默认的那个: 候选里可能有完全不同的 host
+        # (如 cdn-a.io / cdn-b.io), 只看默认根会让那条直链线索被白白丢掉。
+        for root in _base_candidates(site):
+            # 根后面允许一段数字(photos -> photos2 / photos3); 序号后面用
+            # `[^/]*` 收尾而不是 `\.[0-9A-Za-z]+$`: 直链可能带变体后缀
+            # (`00046_600x0.webp`), 只认纯扩展名的话这条最有价值的线索会被丢掉。
+            m = re.match(
+                rf"^{re.escape(root)}(?P<tail>\d*)/(?P<gid>[0-9A-Za-z_-]{{6,}})"
+                rf"/(?P<seq>\d+)[^/]*$",
+                plain,
+            )
+            if not m:
+                continue
+            if gid and m.group("gid") != gid:
+                continue
+            return {
+                "base": f"{root}{m.group('tail')}",
+                "seq_format": "{seq:0%dd}" % len(m.group("seq")),
+            }
     return None
 
 
-def _resolve_base(site, gid, session, media, log=None, hint=None, budget=6):
+def _first_hint(site, gid, candidates):
+    """从若干条候选 URL 里取回第一条能解析出线索的(基址 + 序号格式)。
+
+    给"零枚举"的预览用: 那时没有枚举结果可看, 但相册实际用 4 位还是 5 位
+    直接决定了预告里那个示例文件名对不对。用户在核对命名时看到位数不符,
+    会以为采集器给文件名加错了 —— 明明是他照着错误的预告去核对的。
+    """
+    for cand in candidates:
+        hint = parse_resource_hint(site, cand, gid=gid)
+        if hint:
+            return hint
+    return None
+
+
+def _base_candidates(site, default=None):
+    """该站点可能要试的资源根列表(去重保序, 第一个是默认值)。
+
+    ⚠️ **单一来源**: `_resolve_base`(真的去探)与 `_match_score`(静态判前缀)必须
+    用同一份列表。各写一份的话, 新增一个 CDN 子路径时会出现"采集能探到、自动识别
+    却不认领"的半通状态 —— 直链被派给 generic, 预览直接报 400, 而采集本身明明好使。
+    这种"一半好一半坏"最难查, 所以候选只允许有一个出处。
+    """
+    d = default if default is not None else site.base
+    out = [d]
+    for c in (site.base_candidates or []):
+        if c and c not in out:
+            out.append(c)
+    try:
+        n = int(site.base_candidate_digits or 0)
+    except (TypeError, ValueError):
+        n = 0
+    # 从 2 起: 无后缀的那个就是 base 本身(已在列表首位), `photos1` 不是真实存在
+    # 的形态 —— 生成它只会白白多探一次。
+    for i in range(2, n + 1):
+        c = f"{d}{i}"
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def _resolve_base(site, gid, session, media, log=None, hint=None, hints=None,
+                  budget=None):
     """探测该相册真实的(CDN 基址, 序号补零宽度)。
 
     该站会按相册把资源分到不同 CDN 子路径(`photos` / `photos2` / `photos3`),
@@ -462,9 +535,14 @@ def _resolve_base(site, gid, session, media, log=None, hint=None, budget=6):
     不存在的路径 -> 全部判 missing -> **0 个资源 -> 任务 failed**, 而用户看到
     的只是"失败", 完全不知道是 CDN 路径不对。
 
-    顺序: ① 输入直链给的线索(零代价, 最可信) ② 默认宽度 × 各候选基址
-    ③ 相邻宽度 × 各候选基址。命中即停, 常见情形只花 1 次探测; `budget` 是
-    总探测次数上限, 防止一个真不存在的图集被试探十几轮。
+    线索来源按可信度排序(hints 顺序即优先级):
+
+        ① 用户输入的直链 —— 他手上最硬的一份证据
+        ② 相册页 HTML 里出现的资源直链 —— 页面自己写着真实前缀, 最强
+        ③ 候选基址 × 序号宽度 逐个探测 —— 拿不到①②时的兜底
+
+    ①②命中即停(各花 1 次探测验一下), 常见情形根本不会走到 ③。
+    `budget=None` 表示试满全部组合(见下, 别轻易调小)。
 
     全部探不到时退回默认值, 由常规的「连续缺失 -> 停止 -> 空结果判 failed」
     处理 —— 那时确实是这个图集不存在。
@@ -485,28 +563,37 @@ def _resolve_base(site, gid, session, media, log=None, hint=None, budget=6):
             state = PROBE_ERROR
         return state
 
-    # ① 直链线索: 用户已经把答案写在 URL 里了
-    h_base = (hint or {}).get("base")
-    h_fmt = (hint or {}).get("seq_format")
-    if h_base:
+    # ① ② 线索: 用户直链 + 相册页里出现的直链。去重保序, 先来的更可信。
+    all_hints = ([hint] if hint else []) + list(hints or [])
+    seen = set()
+    for h in all_hints:
+        h_base = (h or {}).get("base")
+        h_fmt = (h or {}).get("seq_format")
+        if not h_base or (h_base, h_fmt) in seen:
+            continue
+        seen.add((h_base, h_fmt))
         if _try(h_base, h_fmt) == PROBE_OK:
             if log:
-                log(f"CDN 基址采信输入直链: {h_base} (序号格式 {h_fmt})")
+                log(f"CDN 基址采信线索: {h_base} (序号格式 {h_fmt})")
             return h_base, h_fmt
         if log:
-            log(f"输入直链指向的 {h_base} 探测未命中, 改由候选探测")
+            log(f"线索指向的 {h_base} 探测未命中, 继续尝试下一条")
 
-    # ② ③ 候选组合
-    cands = [default]
-    for c in (site.base_candidates or []):
-        if c and c not in cands:
-            cands.append(c)
+    # ③ 候选组合
+    cands = _base_candidates(site, default)
+    fmts = _seq_format_variants(default_fmt)
+    # 预算默认 = 全部组合数。候选基址是一份"可能命中"的清单, 漏试任何一个都等于
+    # 把那个相册判成不存在。旧版把预算写死 6(按"3 基址 × 2 宽度"定的), 候选一扩到
+    # photos4/photos5 就会在还没试到 photos2+4 位 之前耗光, 静默退回默认基址 ->
+    # 0 资源 -> failed —— 恰恰是这整套探测要消灭的那个坑。
+    # 探测是 HEAD、不受下载级限速约束, 代价以毫秒计, 值得试满。
+    limit_probes = int(budget) if budget else len(cands) * len(fmts)
     spent = 0
-    for fmt in _seq_format_variants(default_fmt):
+    for fmt in fmts:
         for c in cands:
-            if spent >= budget:
+            if spent >= limit_probes:
                 if log:
-                    log(f"CDN 候选探测已达上限({budget}), 用默认基址")
+                    log(f"CDN 候选探测已达上限({limit_probes}), 用默认基址")
                 return default, default_fmt
             spent += 1
             if _try(c, fmt) == PROBE_OK:
@@ -518,10 +605,38 @@ def _resolve_base(site, gid, session, media, log=None, hint=None, budget=6):
     return default, default_fmt
 
 
+def _empty_hint(site, gid, medias, meta):
+    """一个资源都没枚举到时, 给出一条**能据以行动**的错误。
+
+    旧行为是返回空列表, 上层只能记一句"采集到 0 个资源"。用户只知道失败了,
+    不知道是站点换了资源路径、图集被删了, 还是自己的 media/过滤条件把资源
+    全排除了 —— 而这三者的解法完全不同。这里把"试过什么"和"下一步做什么"
+    一并说清楚, 顺带用相册页的自报数量做个对照(有自报却采不到, 就是路径问题)。
+    """
+    bases = _base_candidates(site)
+    shown = ", ".join(bases[:3]) + (f" 等 {len(bases)} 个" if len(bases) > 3 else "")
+    m = meta or {}
+    declared = ""
+    if m.get("photos") or m.get("videos_declared"):
+        bits = []
+        if m.get("photos"):
+            bits.append(f"{m['photos']} 张图")
+        if m.get("videos_declared"):
+            bits.append(f"{m['videos_declared']} 段视频")
+        declared = (" 相册页自报 " + " + ".join(bits)
+                    + ", 却一个都没枚举到 —— 基本可以断定是资源路径或序号位数变了。")
+    return (
+        f"图集 {gid} 未发现任何资源(媒体={','.join(medias)}; 试过资源基址: {shown})。"
+        + declared
+        + " 先自查 media 有没有把该媒体排除掉; 否则请把该图集任意一张真实图片的"
+          "直链粘进输入框 —— 采集器会直接从 URL 读出正确的基址与序号位数。"
+    )
+
+
 def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX,
              miss_stop=DEFAULT_MISS_STOP, session=None, proxy=None,
              min_interval=None, max_interval=None, log=None,
-             media="image", album=None, hint_url=None):
+             media="image", album=None, hint_url=None, page_hints=None, diag=None):
     """枚举图集资源, 逐个 yield 结果字典。
 
     yield::
@@ -537,6 +652,13 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
     media  决定枚举哪种媒体(见 MEDIA_KEYS); 视频没有尺寸档位, 只有一条主 URL。
     album  输出目录名(相册标题); **可含 `/` 分层**(如 "标签/相册名")。
            留空回退 gid, 保证文件名始终带一层分组目录。
+    diag   可选 dict; 会填入本次**实际生效**的资源根地址与序号格式。这是排查
+           "为什么这个相册采不到东西"的唯一线索 —— 写死基址的旧版就是在这里
+           静默采到 0 个, 而调用方看不到用的是哪条路径。
+    hint_url    用户**原始输入**, 可能是资源直链 —— 直链把基址与序号宽度直接
+                写在了 URL 里, 是最硬的一份证据。
+    page_hints  相册页 HTML 里出现的资源直链。页面自己写着真实 CDN 前缀, 所以
+                这份线索比候选探测可靠得多(而且能发现候选清单里没有的新子路径)。
     """
     mtype = site.media(media)
     if mtype is None:
@@ -559,7 +681,18 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
     # 所以: 先用默认值探第一张 —— 中了就完全不额外开销; 不中才启动候选探测。
     # hint 来自**用户原始输入**(可能是资源直链), 它把答案直接写在了 URL 里,
     # 这里乐观采信、探不中再退回候选探测(用户也可能粘了条失效的旧直链)。
-    hint = parse_resource_hint(site, hint_url)
+    # 线索按可信度: ① 用户直链 ② 相册页里出现的直链。两者都过 gid 校验 ——
+    # 页面里混着推荐位别的相册的图, 而它们未必在同一个 CDN 子路径上; 采信错了
+    # 就等于把枚举引到一条不存在的路径, 结果还是"0 资源 -> failed"。
+    hint = parse_resource_hint(site, hint_url, gid=gid)
+    if not hint:
+        for cand in (page_hints or []):
+            hint = parse_resource_hint(site, cand, gid=gid)
+            if hint:
+                if log:
+                    log(f"从相册页 HTML 读出资源路径: {hint['base']} "
+                        f"(序号格式 {hint['seq_format']})")
+                break
     resolved_base = (hint or {}).get("base") or mtype.root(site)
     fmt = (hint or {}).get("seq_format") or mtype.seq_format
     base_fixed = False  # 基址是否已经确认过(只对第一张做一次候选探测)
@@ -585,7 +718,7 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
             # —— 换成候选基址重探一次, 避免"相册存在却采到 0 个"的静默失败。
             if state != PROBE_OK and seq == start and not base_fixed:
                 base_fixed = True
-                b2, f2 = _resolve_base(site, gid, sess, media, log)
+                b2, f2 = _resolve_base(site, gid, sess, media, log, hint=hint)
                 if (b2, f2) != (resolved_base, fmt):
                     resolved_base, fmt = b2, f2
                     main = mtype.url_for(site, gid, seq, use, base=resolved_base,
@@ -642,6 +775,18 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
             if seq < start + limit:
                 _pause(min_interval, max_interval)
     finally:
+        if diag is not None:
+            default_root = mtype.root(site)
+            if resolved_base == default_root:
+                src = "default"
+            elif (hint or {}).get("base") == resolved_base:
+                src = "hint"          # 采信了用户贴的直链
+            else:
+                src = "probe"         # 靠候选探测找到的
+            diag.setdefault("roots", {})[media] = {
+                "base": resolved_base, "seq_format": fmt,
+                "source": src, "site_default": default_root,
+            }
         if own:
             sess.close()
 
@@ -703,8 +848,8 @@ def _match_score(site, raw):
     host, path = u.netloc.lower(), u.path
     # ⚠️ 不能只比 site.base: 该站会把相册分到 photos/photos2/photos3 等不同
     # CDN 子路径, 只认默认那个会让 photos2 上的直链落不进来 -> 派给 generic
-    # -> "不支持预览" 400。候选基址要一起比对。
-    for root in [site.base, *(site.base_candidates or [])]:
+    # -> "不支持预览" 400。候选基址要一起比对(与 _resolve_base 同一份列表)。
+    for root in _base_candidates(site):
         r_host, r_path = _netloc_path(root)
         if host == r_host and (path + "/").startswith(r_path + "/"):
             return SCORE_RESOURCE_URL
@@ -869,10 +1014,14 @@ class SequenceGallerySpider:
         self.plan_log(log, gid, group, medias, meta)
 
         items = []
+        diag = {}
+        # 相册页里引用的图片地址 = 页面自报的真实 CDN 前缀, 优先级仅次于用户直链
+        page_hints = (meta or {}).get("resource_urls")
         for name in medias:
             for it in discover(site, gid, quality=quality, media=name,
                                album=group, log=log, max_count=max_count,
-                               hint_url=url, proxy=opts.get("proxy")):
+                               hint_url=url, page_hints=page_hints,
+                               proxy=opts.get("proxy"), diag=diag):
                 items.append({
                     "type": it["type"],
                     "url": it["url"],
@@ -884,7 +1033,43 @@ class SequenceGallerySpider:
                     "filename": it.get("filename"),
                     "album": album,
                 })
+        if not items:
+            # 这里**必须大声失败**: 上层只会把空列表记成"采集到 0 个资源",
+            # 用户看不出到底是路径变了、图集没了, 还是 media 设窄了。
+            raise ValueError(_empty_hint(site, gid, medias, meta))
+        # 相册元信息挂到每条资源上(同一个 dict 引用, 不额外占内存), 由
+        # task_manager 落成 sidecar(album.json)。为什么不在这里直接写文件:
+        # 采集器的职责是**发现**, 落盘统一归任务层管(见 README 的铁律)。
+        task_meta = self.task_meta(site, gid, album, title_mode, medias, meta,
+                                   diag, url)
+        for it in items:
+            it["task_meta"] = task_meta
         return items
+
+    @staticmethod
+    def task_meta(site, gid, album, title_mode, medias, meta, diag, source_url):
+        """这次采集"采的是什么"的机器可读描述(落成 album.json)。
+
+        ⚠️ `roots` 是这里最有用的一项: 它记录了**实际生效**的资源根地址与序号
+        位数, 以及那个地址是怎么定下来的(hint / probe / default)。
+        "任务失败但日志看不出为什么"时, 先看这一项 —— 站点悄悄换了 CDN 子路径
+        就是靠它认出来的。
+        """
+        m = meta or {}
+        return {
+            "collector": site.name,
+            "source_url": source_url,
+            "gid": gid,
+            "album": album,
+            "album_source": title_mode,
+            "title": m.get("title") or m.get("h1") or "",
+            "maker": m.get("maker") or "",
+            "tags": list(m.get("tags") or []),
+            "media": list(medias),
+            "photos_declared": m.get("photos"),
+            "videos_declared": m.get("videos_declared"),
+            "resource_roots": dict((diag or {}).get("roots") or {}),
+        }
 
     # ---- 创建前预览 ----
 
@@ -937,13 +1122,19 @@ class SequenceGallerySpider:
         sampled = False
         sample_files = []
         counts = {}
+        diag = {}
+        # 相册页里引用的图片地址 = 页面自报的真实 CDN 前缀, 与创建时同源
+        page_hints = (meta or {}).get("resource_urls")
+        # 零枚举路径(页面自报数量)下没有 diag, 靠线索推断出同一个结论
+        hint = _first_hint(site, gid, [url, *(page_hints or [])])
         # 页面没给出可用数量 -> 退化成受限枚举; 拿不到页面时这是唯一的办法
         if photos is None and not video_items:
             sampled = True
             for name in medias:
                 got = list(discover(site, gid, quality=opts.get("quality"),
                                     media=name, album=group, log=log,
-                                    max_count=max_items, hint_url=url))
+                                    max_count=max_items, hint_url=url,
+                                    page_hints=page_hints, diag=diag))
                 counts[name] = len(got)
                 for it in got[:3]:
                     if it.get("filename"):
@@ -952,14 +1143,32 @@ class SequenceGallerySpider:
             if videos_n is None and "video" in counts:
                 videos_n = counts["video"]
 
+        # 实际生效的资源根: 枚举过的媒体由 diag 给出(它知道是采信直链、探测命中
+        # 还是用了默认值); 零枚举路径(页面自报数量)则由线索补上 —— 预览不枚举
+        # 也不能对"到底用的是哪条 CDN 路径"一无所知。
+        roots = dict(diag.get("roots") or {})
+        if hint:
+            for name in medias:
+                mtype = site.media(name)
+                if mtype is None or name in roots:
+                    continue
+                roots[name] = {
+                    "base": hint["base"], "seq_format": hint["seq_format"],
+                    "source": "hint", "site_default": mtype.root(site),
+                }
+
         if not sample_files:
-            # 没枚举也要让用户先看到"文件会长什么样"(命名是最容易出错的一环)
+            # 没枚举也要让用户先看到"文件会长什么样"(命名是最容易出错的一环)。
+            # 序号位数拿不到枚举结果时, 采信线索给的宽度 —— 曾经无论相册实际用
+            # 4 位还是 5 位都写死 00001, 用户照着预告去核对会以为命名错了。
+            fmt = ((roots.get(medias[0]) or {}).get("seq_format")
+                   or (hint or {}).get("seq_format") or "{seq:05d}")
             for name in medias[:1]:
                 mtype = site.media(name)
                 if not mtype:
                     continue
-                ext = mtype.default_ext
-                sample_files = [f"{group}/{i:05d}{ext}" for i in (1, 2)]
+                sample_files = [f"{group}/{fmt.format(seq=i)}{mtype.default_ext}"
+                                for i in (1, 2)]
 
         return {
             "collector": site.name,
@@ -984,6 +1193,13 @@ class SequenceGallerySpider:
             "page": meta is not None,
             "sampled": sampled,
             "sample_files": sample_files,
+            # 实际生效的资源根, 结构与 album.json 的 resource_roots 一致(同一套
+            # 词汇, 查问题时不用在两处翻译)。写死基址的旧版在预览这里静默显示
+            # 0 张, 用户看不到"用的是哪条路径", 于是无从判断是路径变了还是图集没了。
+            "resource_roots": roots,
+            "warning": _empty_hint(site, gid, medias, meta) if (
+                sampled and not any(counts.values())
+            ) else "",
         }
 
 

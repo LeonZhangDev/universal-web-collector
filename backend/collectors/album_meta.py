@@ -86,6 +86,7 @@ import re
 import threading
 import time
 from html import unescape
+from urllib.parse import urlparse
 
 from core.config import settings
 from core.filters import parse_size
@@ -124,6 +125,22 @@ _MAKER_RE = re.compile(
 # `\s*` 而非紧贴: 真实页面是 `</div></div>`, 但换行/缩进一变就会整块抓不到
 _TAGLIST_RE = re.compile(r'class="[^"]*tags-line[^"]*"(.*?)</div>\s*</div>', re.S | re.I)
 _TAG_ITEM_RE = re.compile(r'<div class="tag">\s*([^<]{1,40}?)\s*</div>', re.I)
+
+# 页面里出现的媒体地址。这是本站最硬的一条证据: 页面自己写着资源真实的 CDN
+# 子路径(如 img.xchina.io/photos2)与补零宽度(0001), 比任何候选探测都可靠,
+# 而且能发现候选清单里根本没有的新子路径(photos4/photos5...)。
+# 覆盖常见的懒加载属性名 —— 相册页大量用 data-src, 只看 src 会一个都抓不到。
+_MEDIA_URL_RE = re.compile(
+    r"""(?:src|data-src|data-original|data-lazy|data-echo|poster)\s*=\s*["']([^"']+)["']""",
+    re.I,
+)
+_SRCSET_RE = re.compile(r"""srcset\s*=\s*["']([^"']+)["']""", re.I)
+# 只留"看起来就是媒体"的地址: 站点 logo/图标也满足 src=..., 但它们走的是
+# /static/ 之类的路径, 不会与站点声明的资源根前缀匹配。调用方还会再用
+# parse_resource_hint 筛一遍, 所以这里宁滥勿缺。
+_MEDIA_EXT_RE = re.compile(
+    r"\.(?:jpe?g|png|webp|gif|bmp|avif|mp4|m3u8|ts)(?:[?#]|$)", re.I
+)
 
 # Cloudflare 拦截页的特征: 命中说明拿到的不是真实页面
 _CHALLENGE_HINTS = (
@@ -176,10 +193,40 @@ def _absolutize(url, base):
     return url
 
 
+def _resource_urls(html, base, limit=60):
+    """页面里出现的媒体直链(绝对化、去重、限量)。
+
+    为什么要抓它: 相册页的 HTML 里引用了本相册的真实图片地址, 于是**页面自己
+    交代了** CDN 子路径与序号补零宽度。用它可以完全跳过候选探测, 而且能发现
+    候选清单里没有的新子路径 —— 站点哪天把相册挪到 `photos7`, 这里第一时间就知道。
+
+    只做"绝对值化 + 去重 + 限量", 不做站点相关判断(那是 gallery_base 的事):
+    采集器基类知道资源根长什么样, 会拿这些 URL 逐个过 `parse_resource_hint`。
+    """
+    out, seen = [], set()
+    for m in _MEDIA_URL_RE.finditer(html or ""):
+        u = _absolutize(m.group(1), base)
+        if not u or not _MEDIA_EXT_RE.search(u) or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        if len(out) >= limit:
+            return out
+    # srcset="a.jpg 1x, b.jpg 2x" —— 取每个候选的第一段(URL)
+    for m in _SRCSET_RE.finditer(html or ""):
+        for part in (m.group(1) or "").split(","):
+            u = _absolutize(part.strip().split(" ")[0], base)
+            if not u or not _MEDIA_EXT_RE.search(u) or u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def _host_of(url):
     try:
-        from urllib.parse import urlparse
-
         return urlparse(url or "").netloc.lower()
     except Exception:
         return ""
@@ -268,7 +315,7 @@ def _is_challenge(html):
     return any(h in low for h in _CHALLENGE_HINTS)
 
 
-def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
+def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT, page_url=""):
     """从相册页 HTML 解析元信息(纯函数, 便于离线测试)。
 
     返回::
@@ -283,12 +330,17 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
           "videos_declared": 站点自报视频数("12P + 4V" 里的 4),
           "maker":  厂牌/制作方(页面上的 "FENDSON"),
           "tags":   标签列表(["丝袜", "情趣内衣", ...]),
+          "resource_urls": 页面里引用的媒体直链(绝对化, 最多 60 条),
           "challenge": 是否拿到 Cloudflare 拦截页,
         }
 
     ⚠️ `photos` / `videos_declared` 是**站点自报值**, 只用于"创建前预告"与交叉
     对照, 绝不当资源清单 —— 序号枚举才是权威(页面改版/滞后都可能对不上)。
     `videos[].size` 则实测精确(见下), 可直接用于体积过滤。
+
+    `resource_urls` 的用途见 `_resource_urls`: 它是"这站的资源到底放在哪条 CDN
+    子路径"最硬的证据, 比候选探测可靠。page_url 用于把相对地址补全(页面里的
+    `<img src="/photos2/...">` 要按页面 origin 还原)。
 
     页面结构不符合预期时**不猜**: 相应字段留空, 由调用方回退图集 ID。
     """
@@ -345,6 +397,15 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
         if parts and parts[0].strip():
             album = parts[0].strip()
 
+    # 页面引用的媒体直链。相对地址按**页面 origin** 补全 —— 站点的 var domain
+    # 可能指向 CDN 主机, 拿它当相对路径的 base 会拼出错误地址。
+    url_base = ""
+    if page_url:
+        pu = urlparse(page_url)
+        if pu.scheme and pu.netloc:
+            url_base = f"{pu.scheme}://{pu.netloc}"
+    resource_urls = _resource_urls(html, url_base or base)
+
     return {
         "title": title,
         "album": album,
@@ -355,6 +416,7 @@ def extract_album_meta(html, split=DEFAULT_TITLE_SPLIT):
         "videos_declared": videos_declared,  # 站点自报视频数
         "maker": maker,                 # 厂牌/制作方
         "tags": tags,                   # 标签列表
+        "resource_urls": resource_urls,  # 页面里的媒体直链(资源根线索)
         "challenge": _is_challenge(html),
     }
 
@@ -521,7 +583,7 @@ def fetch_album_meta(url, split=DEFAULT_TITLE_SPLIT, log=None, use_cache=True,
 
     for i, state in enumerate(attempts):
         html = _load_html(url, log=log, storage_state=state)
-        meta = extract_album_meta(html, split=split) if html else None
+        meta = extract_album_meta(html, split=split, page_url=url) if html else None
         reason = _validate(meta, gid)
         if reason is None:
             note_success(url)

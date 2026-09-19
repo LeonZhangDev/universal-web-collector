@@ -121,6 +121,10 @@ const keywords = ref("");
 const excludeKeywords = ref("");
 const minSize = ref({ num: "", unit: "KB" });
 const maxSize = ref({ num: "", unit: "MB" });
+// 尺寸下限(px): 横幅(728x90)、按钮(88x31)、信标(1x1)的文件名和体积都可能"正常",
+// 只有量宽高才认得出。留空 = 不启用(默认不启用: 相册里也有竖构图小图)。
+const minWidth = ref("");
+const minHeight = ref("");
 
 const LS_KEY = "uwc.create.prefs";
 const UNITS = ["B", "KB", "MB", "GB"];
@@ -142,6 +146,15 @@ function sizeVal(s) {
   return `${n}${s.unit}`;
 }
 
+// 像素下限: 只接受正整数。填 0 或负数等于没填 —— 放进去只会让用户以为"在过滤"
+// 而实际上后端也会把它当非法值忽略, 两边观感不一致。
+function dimVal(v) {
+  const s = String(v ?? "").trim();
+  if (!s || !/^\d+$/.test(s)) return null;
+  const n = parseInt(s, 10);
+  return n > 0 ? n : null;
+}
+
 function buildFilters() {
   const f = {};
   if (selTypes.value.length) f.types = selTypes.value;
@@ -157,6 +170,10 @@ function buildFilters() {
   if (mn) f.min_size = mn;
   const mx = sizeVal(maxSize.value);
   if (mx) f.max_size = mx;
+  const mw = dimVal(minWidth.value);
+  if (mw) f.min_width = mw;
+  const mh = dimVal(minHeight.value);
+  if (mh) f.min_height = mh;
   return f;
 }
 
@@ -219,6 +236,8 @@ function savePrefs() {
         excludeKeywords: excludeKeywords.value,
         minSize: minSize.value,
         maxSize: maxSize.value,
+        minWidth: minWidth.value,
+        minHeight: minHeight.value,
         showFilters: showFilters.value,
       })
     );
@@ -248,6 +267,8 @@ function loadPrefs() {
     excludeKeywords.value = p.excludeKeywords || "";
     if (p.minSize) minSize.value = { ...minSize.value, ...p.minSize };
     if (p.maxSize) maxSize.value = { ...maxSize.value, ...p.maxSize };
+    minWidth.value = p.minWidth || "";
+    minHeight.value = p.minHeight || "";
     showFilters.value = !!p.showFilters;
   } catch (e) {
     /* 本地数据损坏就用默认值 */
@@ -357,6 +378,21 @@ const skippedByMedia = computed(() => {
     bits.push(`${p.videos_declared} 段视频`);
   }
   return bits.join(" + ");
+});
+
+// 实际生效的资源根。这一行是"为什么采不到"的直接证据: 站点悄悄把相册挪到
+// 另一个 CDN 子路径、或换了序号位数时, 用户在这里一眼就能看出来。
+const previewRoot = computed(() => {
+  const roots = (preview.value && preview.value.resource_roots) || {};
+  const first = Object.values(roots)[0];
+  if (!first || !first.base) return "";
+  const m = /0(\d+)d/.exec(first.seq_format || "");
+  const src = { hint: "来自链接/页面", probe: "自动探测", default: "站点默认" }[
+    first.source
+  ];
+  return (
+    first.base + (m ? ` · 序号 ${m[1]} 位` : "") + (src ? ` · ${src}` : "")
+  );
 });
 
 function select(id) {
@@ -773,8 +809,14 @@ onUnmounted(() => {
         <div v-if="preview.sample_files && preview.sample_files.length">
           <b>文件名示例</b> <code>{{ preview.sample_files.join("  ,  ") }}</code>
         </div>
+        <div v-if="previewRoot" class="tip">
+          资源路径 <code>{{ previewRoot }}</code>
+        </div>
         <div v-if="preview.sampled" class="tip">
           数量来自抽样枚举（相册页读不到），实际可能更多
+        </div>
+        <div v-if="preview.warning" class="preview-warn">
+          {{ preview.warning }}
         </div>
       </template>
     </div>
@@ -841,6 +883,16 @@ onUnmounted(() => {
           <option v-for="u in UNITS" :key="u" :value="u">{{ u }}</option>
         </select>
         <span class="tip">需 HEAD 探测, 服务器不支持时自动放行</span>
+      </div>
+
+      <div class="frow">
+        <label>图片尺寸</label>
+        <input v-model="minWidth" class="num" type="text" placeholder="最小宽" />
+        <span class="sep">×</span>
+        <input v-model="minHeight" class="num" type="text" placeholder="最小高" />
+        <span class="tip">
+          像素, 留空不限。横幅/按钮/信标最有效的判别; 下载后按文件头实测, 判不出则放行
+        </span>
       </div>
     </div>
 
@@ -1166,6 +1218,16 @@ onUnmounted(() => {
   border-left: 3px solid var(--warn);
   color: var(--warn);
   font-size: 12px;
+  background: var(--panel-2);
+}
+/* 预告里的警告: 采不到东西时给的是"下一步怎么做", 不是一句冷冰冰的失败 */
+.preview-warn {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--warn);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.6;
   background: var(--panel-2);
 }
 </style>

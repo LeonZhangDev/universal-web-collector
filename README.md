@@ -193,6 +193,10 @@ curl -X POST localhost:8000/tasks/preview \
 
 自报数量**只用于预告**, 不当资源清单 —— 页面会改版、可能滞后, 序号枚举才是权威。
 
+预告还会带出 `resource_roots`(本次实际生效的 CDN 基址与序号格式)与 `warning`
+(枚举到 0 个时的可行动提示)。前者对齐 `album.json` 的同名字段: 用户在预告里
+看到的路径, 就是创建后真正会去枚举的那一条 —— 不再是黑箱。
+
 预告里的 `photos` / `videos` / `video_bytes` **只统计本次实际要采的媒体**,
 与 `media` 严格一致: `media=image` 时 `videos` 为 `null`、`video_bytes` 为 0,
 不会出现"预告说会采 4 段视频、创建后一段没下"这种口径不一致。
@@ -206,7 +210,7 @@ curl -X POST localhost:8000/tasks/preview \
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (266 用例: 含 hls 校验 / 视频采集器 / 自动识别)
+make test           # pytest (347 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -236,8 +240,18 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
     - **CDN 基址与序号宽度自动探测**: 同一站点可能把不同相册分到
       `photos` / `photos2` / `photos3`, 序号也可能是 4 位(`0001.jpg`)而非 5 位。
       写死基址会让"相册在另一个 CDN 子路径"变成 0 资源 -> failed, 而用户只看
-      到失败、看不出是路径不对。现在默认基址先用, 不中才试探候选(正常相册
-      **零额外请求**); 若输入本身是资源直链, 基址与宽度直接从 URL 里读出来
+      到失败、看不出是路径不对。三条线索按可信度依次采信:
+      ① **相册页 HTML 里引用的图片地址**(页面白给的真实前缀, 零探测)
+      ② 用户输入的资源直链(基址与宽度都写在 URL 里)
+      ③ 候选基址 × 相邻序号宽度逐个试探 —— 默认基址先用, **不中才探**,
+      所以正常相册零额外请求
+    - 候选不写死清单: 站点声明 `base_candidate_digits=5` 即自动展开
+      `photos2..photos5`(手写三个的话, 下次出现 `photos4` 就整批判空)
+    - `gid_shape` 声明 ID 形状(如 `[0-9a-f]{8,}`), 自动识别时用它当
+      "这真的是本站 ID"的判据 —— `/photos/featured/0001.jpg` 这类路径词因此
+      不会被误认领。手选采集器时不做此校验
+    - ⚠️ 一个资源根**只能有一个出处**(`_base_candidates`): 探测与自动识别共用,
+      各写一份会出现"采集能探到、识别不认领"的半通状态
     - 任务级 `proxy` 选项覆盖全局代理
     - 序号枚举型站点可继承 `collectors/gallery_base.py::SequenceGallerySpider`,
       站点只声明 URL 模板、ID 正则与探测规则; 媒体类型由 `MediaType` 声明
@@ -254,15 +268,26 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
   命中者标记 filtered 并记原因。
   - 大小过滤优先复用**采集阶段已探测到的** size(图集任务因此零额外请求), 未知才补 HEAD
   - `min_image_bytes`: 挡 1x1 跟踪像素这类体积极小的图片
+  - `min_width` / `max_width` / `min_height` / `max_height`: 按**图片真实像素**
+    过滤, 专治横幅广告(728x90 之类)。图片可下载后读文件头拿尺寸再删,
+    不会误判; 视频与文档不参与(尺寸规则只作用于 image)
   - `exclude_ad`: 按**路径分段精确匹配**识别广告位/站点装饰图(`/ad/`、`banner_*.jpg`
     `/assets/logo.png`…)。绝不做子串包含 —— 子串会把 `downloads/badges/1.jpg`
     这种正常文件误杀
+  - ⚠️ 尺寸/去重复用文件时**绝不删别人的文件**: 命中去重说明别处已有同一份内容,
+    按本任务规则删掉它等于破坏别的任务的产出
 - 429 退避: 站点说"慢一点"时按它给的 `Retry-After` 等(支持秒与 HTTP 日期),
   而不是套用普通指数退避 —— 普通退避最长 8 秒, 站点要求冷静几十秒时硬闯只会
   让封禁更久。普通失败则是指数退避 × 0.6~1.4 抖动, 避免重试风暴
 - 输出组织: 任务级命名模板(默认保留 URL 原名), 落 `<download_dir>/<task_id>/` 下的
   任意层级; 任务结束(含取消/部分失败)都会产出 `manifest.json`, 记录来源 URL、
   实际生效的下载点、Content-Type、sha256、字节数、本地相对路径与过滤原因
+- 相册元数据 sidecar: 图集任务在**下载开始前**落 `<task_id>/album.json`, 记录
+  相册名/标签/厂牌/自报张数与 `resource_roots`(本次实际生效的 CDN 基址、序号格式、
+  来源是"页面线索/输入直链/探测")。它回答的是"为什么这个相册采不到/sidecar 里
+  写的是哪条路径"—— 写死基址的旧版在这里静默采到 0 个, 用户拿不到任何线索
+- 采集到 0 个资源时抛的是**可操作错误**(列出试过的基址 + 下一步动作),
+  而不是返回空列表让上层记一句"采集到 0 个资源"
 - 增量续采: `incremental: true` 时按 URL 复用历史已下载资源, 重跑只补新增与失败;
   订阅源(watches)在此基础上按间隔自动巡检并创建任务
 - 导出: `/tasks/{id}/archive` 流式打包 ZIP(不把整包攒进内存), 前端有图库视图

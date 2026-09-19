@@ -17,13 +17,20 @@ options 结构(存 tasks.options JSON):
   "min_size": "10KB",                 # 最小文件大小(支持 500KB/2MB/1024)
   "max_size": "50MB",                 # 最大文件大小
   "min_image_bytes": "1KB",           # 图片体积下限(专治 1x1 跟踪像素/广告占位图)
-  "exclude_ad": true                  # 排除广告位/站点装饰/跟踪像素(见 _match_ad)
+  "exclude_ad": true,                 # 排除广告位/站点装饰/跟踪像素(见 _match_ad)
+  "min_width": 400,                   # 图片最小宽度(px) —— 横幅/按钮的杀手
+  "min_height": 400,                  # 图片最小高度(px)
+  "min_pixels": 300000                # 最小总像素(宽 x 高), 挡小方块与细长条
 }
 
-"什么是有效资源"三道关:
+"什么是有效资源"四道关:
 1. **长得像不像**(URL 层): 类型/扩展名/关键词, 以及广告位与站点装饰
 2. **够不够格**(体积层): min/max_size, 图片专属下限
-3. **是不是真的**(内容层): 下载后按 Content-Type 复核 —— 见 downloaders 的
+3. **尺寸对不对**(尺寸层): min_width/min_height/min_pixels。横幅(728x90)、
+   按钮(88x31)、信标(1x1)都是极端长宽比或极小尺寸, 而相册图极少是 300x250
+   —— 文件名和体积都看不出这一点, 只有量宽高才认得出。⚠️ 判定放在**下载后**
+   (见 task_manager 尺寸终检), 因为那时手上是完整文件, 零误判。
+4. **是不是真的**(内容层): 下载后按 Content-Type 复核 —— 见 downloaders 的
    require_image(越界 URL 会返回 200+html, 光看状态码会被骗)
 
 ⚠️ 第 1 关的**广告识别一律按路径分段精确匹配, 绝不做子串包含**:
@@ -236,11 +243,25 @@ class Filters:
         # 广告位/站点装饰排除。默认开: 通用采集器抓整页时, 站点 logo / 横幅 /
         # sprite 会混进资源列表, 它们"看起来是图片"但用户根本不想要。
         self.exclude_ad = _truthy(o.get("exclude_ad"), default=True)
+        # 尺寸下限(仅图片): 横幅 / 按钮 / 信标的最强判别特征。默认关 ——
+        # 相册站里总有竖构图小图, 阈值该由用户按目标站点定, 不能替他们拍板。
+        self.min_width = parse_size(o.get("min_width")) if o.get("min_width") else None
+        self.min_height = parse_size(o.get("min_height")) if o.get("min_height") else None
+        self.min_pixels = parse_size(o.get("min_pixels")) if o.get("min_pixels") else None
         # 只有配置了大小区间才需要 HEAD 探测, 避免额外的网络开销
         self.need_size = (
             self.min_size is not None
             or self.max_size is not None
             or self.min_image_bytes is not None
+        )
+
+    @property
+    def need_dimensions(self):
+        """是否需要图片尺寸终检(在**下载后**量宽高)。"""
+        return (
+            self.min_width is not None
+            or self.min_height is not None
+            or self.min_pixels is not None
         )
 
     @property
@@ -253,6 +274,7 @@ class Filters:
             or self.exclude_keywords
             or self.need_size
             or self.exclude_ad
+            or self.need_dimensions
         )
 
     def match_size(self, size):
@@ -263,6 +285,32 @@ class Filters:
             return f"太小 {fmt_size(size)} < 下限 {fmt_size(self.min_size)}"
         if self.max_size is not None and size > self.max_size:
             return f"太大 {fmt_size(size)} > 上限 {fmt_size(self.max_size)}"
+        return None
+
+    def match_dimensions(self, width, height):
+        """尺寸校验(仅图片)。通过返回 None, 否则返回原因。
+
+        拿不到尺寸(width/height 为 None)一律放行 —— 与 size 层同一个原则:
+        判不出来的时候，宁可多留一张也不误杀一张。
+        """
+        if not self.need_dimensions:
+            return None
+        try:
+            w = int(width) if width is not None else None
+            h = int(height) if height is not None else None
+        except (TypeError, ValueError):
+            return None
+        if w is None or h is None or w <= 0 or h <= 0:
+            return None
+
+        if self.min_width is not None and w < self.min_width:
+            return f"疑似广告/图标(宽 {w}px < 下限 {self.min_width}px)"
+        if self.min_height is not None and h < self.min_height:
+            return f"疑似广告/图标(高 {h}px < 下限 {self.min_height}px)"
+        if self.min_pixels is not None and w * h < self.min_pixels:
+            return (
+                f"疑似小图/横幅({w}x{h} = {w * h} 像素 < 下限 {self.min_pixels})"
+            )
         return None
 
     def match_url(self, rtype, url):
@@ -342,6 +390,16 @@ class Filters:
                 f"大小={fmt_size(self.min_size) if self.min_size is not None else '不限'}"
                 f"~{fmt_size(self.max_size) if self.max_size is not None else '不限'}"
             )
+        if self.need_dimensions:
+            # 尺寸是"下载后终检", 说明清楚: 用户看到 filtered 时有的大小已经花掉了
+            bits = []
+            if self.min_width is not None:
+                bits.append(f"宽≥{self.min_width}px")
+            if self.min_height is not None:
+                bits.append(f"高≥{self.min_height}px")
+            if self.min_pixels is not None:
+                bits.append(f"≥{self.min_pixels}像素")
+            parts.append("尺寸(" + ",".join(bits) + ", 下载后终检)")
         return "; ".join(parts)
 
 

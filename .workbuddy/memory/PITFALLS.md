@@ -1,0 +1,153 @@
+# PITFALLS.md — 完整踩坑清单
+
+`MEMORY.md` 只放每次注入必需的索引与最锋利的约束，本文件放完整细节。
+**改相册 / CDN / HLS / 限速 / headless / 预览 / 新站点接入前，先读对应小节。**
+
+---
+
+## 状态机与生命周期（补充）
+
+`_final_status()`：全成功(或仅 filtered/skipped)→success；有成功也有失败→partial；全失败→failed。
+推断"收拾干净没有"要看 `is_active()`，不是看 DB 状态——`cancel()` 立刻写 DB（界面秒响应），
+worker 之后才收拾现场。
+
+## 产出 / 命名 / 增量
+
+- `name_template`：`{site}{host}{album}{seq}{seq4}{ext}{type}{id}`，支持 `/`，含 `..` 整体拒绝。
+- 任务结束（含取消/部分失败）写 `<task_id>/manifest.json`：rel path / sha256 / size /
+  **resolved_url = 实际生效的下载点** / content_type / note。
+- 相册任务在**下载前**写 `<task_id>/album.json`（**不是** `<group>/_meta.json`）：
+  相册名/标签/厂牌 + **`resource_roots`**（实际生效的 CDN 基址、序号格式、
+  `source` = 页面线索/直链/探测、`site_default`）。任务全失败时它就是唯一的排查线索。
+- 去重靠 `resources.hash`(sha256) 跨任务复用；`incremental` 命中 `find_done_resource(url)`
+  即复用不发请求。⚠️ 尺寸/去重复用文件时**绝不删别人的文件**（那是别任务的产出）。
+- `/tasks/{id}/archive` **流式** ZIP（攒 BytesIO 等于整包压内存）。
+- 输出目录须绝对路径、禁 `..`、禁盘符根，实落 `<dir>/<task_id>/`；
+  `/files/{task_id}/{p}` 用 `is_relative_to` 锁目录。
+
+## 限速与重试（补充）
+
+两闸门**正交**：间隔闸门决定"每 N 秒发一个请求"；并发闸门只限在途数，**不摊薄间隔**。
+单次耗时 > 间隔时 `concurrency=1` 会让后续请求空等（分片场景致命）→ `domain_concurrency=3`。
+`_limiter()` 按**站点**（注册域）分桶而非 netloc；可用 config `site_groups` 覆盖。
+
+- ⚠️ 429 是"慢一点"不是"文件坏了"：按 `Retry-After`（秒 / HTTP 日期）等 + **站点级冷却**
+  （按 `site_key` 共享），别套 8 秒封顶的普通退避——站点要求冷静几十秒时硬闯只会封更久。
+- 普通失败才是 2^n × 0.6~1.4 抖动 —— 纯指数会让并发失败**集体重试**把站点/WAF 瞬间打爆。
+
+## 过滤 / 类型 / 去重（补充）
+
+四个解析器一次加载全跑：APIDetector > NetworkParser > JSStateParser > DOMParser。
+被过滤 → `status=filtered` + `note`；单资源重试＝强制下载（跳过过滤）。
+`min_image_bytes` 专治 1×1 跟踪像素/广告占位图（43~200B），真实缩略图通常 > 1KB。
+
+## m3u8 与 ffmpeg（补充）
+
+分片走**独立配置** `segment_concurrency`(4) / 间隔 0.15~0.35s，**不共用图片的 3~10 秒**
+（曾把 10 秒的视频拉成 11 分钟）。分片级重试 + 断点续传，单片失败只坏那一片。
+`video_engine`：`auto`（有 ffmpeg 就用，失败降级）/ `ffmpeg`（强制，失败不降级）/ `builtin`。
+
+- ⚠️ ffmpeg 拉流时请求由 ffmpeg 发出：**DomainLimiter 不参与、mirrors 不轮换**、
+  进度只整文件完成上报。
+- `find_ffmpeg()` 失败结果**只缓存 30s**（装好无需重启后端）。
+  本机路径：`%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe`。
+
+## ⚠️ img.xchina.io 站点特征（改动前必须重新验证）
+
+1. **不返回 404**：存在 → `200 image/jpeg`；越界 → `200 text/html`。存在性**只能看 Content-Type**。
+   `probe()` 返三态 ok/missing/error，5xx 与网络异常归 error（不与 missing 混同，否则图集被截断）。
+2. **HEAD 是可靠的**（2026-09-18 复测 4/4 返回 `Content-Type`+`Content-Length`）。曾误记成
+   "HEAD 无响应头"，那是 **curl 走系统代理时 `-I` 只回 `200 Connection Established`** 的假象。
+3. **WAF 校验 Accept**：无 Accept 或 `*/*` → **403**；含 `image/*` → 200。常量见 `core/config.py`。
+4. `xchina.co` 的 HTML 页对普通请求 **403**（Cloudflare）→ 资源发现不能依赖页面 HTML。
+5. 一图 4 个下载点（`.jpg` + `_1200x0/_800x0/_600x0.webp`）→ 天然 mirrors。
+   相册 `6aa5136f606fe` 实测 **1~142 连续无空洞**，143 起越界。
+6. `var videos[].filesize` 实测精确（"64M" ↔ 67341834B，**零请求**）；另有 h1 / tag 可用。
+   页面里的 `…date…` 可能是推荐位的，**归属未验证，别当发布日**。
+7. 视频无档位/预览变体（`.m3u8`、`_600x0.mp4` 均不存在）→ `mirrors` 为空；单视频可达 105MB。
+
+## 相册采集器 `xchina_gallery`（补充）
+
+三种输入**都必须能解析**：相册页 `https://xchina.co/photo/id-{id}[/10].html`、
+直链 `https://img.xchina.io/photos{N}/{id}/0001.jpg|.mp4`、图集 ID 本身。
+
+- 画质档 `original/1200/800/600`：选定档作主 URL，其余按邻近度作 mirrors；缺该档回退最高档。
+  ⚠️ 判断是否最高画质档要拿**变体后缀**跟 `site.variants[0]` 比，不能拿档名比
+  （曾落盘成 `00001_.jpg.jpg`）。
+- ⚠️ `base_candidate_digits=5` 自动展开 `photos2..photos5`（**从 2 起**，`photos1` 非真实形态）。
+- ⚠️ `parse_resource_hint` 的 hint 必须传**用户原始输入**；传 gid 的话直链信息早丢了。
+- 采到 0 个抛可操作错误（列出试过的基址 + 下一步动作）；预览也带 `resource_roots`/`warning`。
+- 任务级 `options.proxy` 覆盖全局 `settings.proxy`（透传到 `discover(proxy=)`）。
+
+## mirrors / 多媒体 / 命名选项（补充）
+
+- `mirrors`：主 URL 失败依次切换；切换时清半成品且**不续传**（不同 URL 内容不能拼接），
+  并按新扩展名改名。⚠️ **`require_image=True` 必开**，否则越界 URL(200+html) 会被当图存下来
+  且永不触发切换。
+- 同一 gid 下**图片与视频并存**（`6a3654854fd25` = 12 图 + 4 mp4，同名不同后缀）。
+  `options.media` = `auto`/`image`/`video`/`both`；auto **两条线索都问**
+  （相册页 `var videos` + 探一次 `00001.mp4`）——只信页面会静默漏采。
+  ⚠️ `.mp4` 对任何 Accept 都返回 206，别据此推断别的路径。
+- `options.album_title` = `clean`/`full`/`h1`/`id`（**`id` = 完全不开浏览器**）；
+  `album_tags_dir` 再套标签目录（只取前 3 个标签，`-` 连接）。
+  目录名取不到一律回退 gid（**绝不让任务失败**）。
+
+## 相册页做 headless（Cloudflare）
+
+三个坑：
+1. 首次是挑战页 `<title>Just a moment...</title>`，须轮询；
+2. **不能** `wait_for_function`（挑战靠一次导航完成，导航销毁上下文）、也**不能**按标题判就绪
+   （8s 时标题是 `Loading <url>`，`content()` 紧接着抛异常）→ 只能轮询 `page.content()`，
+   看有无 `photo-items`/`hero-title-item`/`var videos`/`objId` 标记；
+3. **先匿名、失败再带登录态**（陈旧 `cf_clearance` 会招来 `Attention Required!` 永久拒绝），
+   与 `collectors/browser.py` 相反。
+
+### 长期对策（写在 `album_meta.py` 模块文档里）
+**不投入指纹对抗**。真正的对策是让采集**不依赖那个 HTML 页**：资源发现走纯 HTTP 序号枚举，
+相册页只提供目录名/自报数量/视频体积；拿不到就降级用 gid 命名（**采集照常**）。在此之上：
+
+1. **域级熔断**：连续 3 次读不到 → 该域 10 分钟内不再开 Chromium（每次读页几十秒，
+   明知被拦还开纯属浪费，也更像扫描器）；
+2. **陈旧登录态隔离**：带登录态被拒即标记失效，`/sessions` 的 `cf_stale` 列出 → 提示重新登录；
+3. **降级可见**：日志写人话并回答"接下来会怎样"。
+
+⚠️ **被拦 ≠ 登录态失效**（匿名一样被拦），只有**带登录态**被拒才记到登录态头上。
+⚠️ **页面结构不符**（改版/objId 对不上）不计入熔断 —— 那是另一个问题。
+重登/删态后 `finish_login`、`remove_session` 会 `clear_domain_state()`，无需重启后端。
+
+## 相册页自报数据 → 创建前预览（补充）
+
+页面白给三样：`12P + 4V`、`filesize`、标签与厂牌。定位靠**图标/class 锚定**
+（`fa-image`/`fa-file`/`tags-line`），不靠 div 顺序；`_TAGLIST_RE` 对换行缩进敏感，改前用真实页面复核。
+`preview()` 有页面数据时**零序号枚举**；拿不到才受限枚举 → `sampled=true`，数量只是**下限**
+（前端显示 `≥`）。
+
+- ⚠️ 自报数量**不当资源清单**，序号枚举才是权威。
+- ⚠️ 预览与创建**共用** `_gallery_options()`，否则"预览通过、创建被拒"。
+- ⚠️ `photos`/`videos`/`video_bytes` **只统计本次真要采的媒体**，必须与 `media` 一致 ——
+  曾直接回自报总量，预告写"12 图+4 视频 251MiB"而创建后一段视频没下。
+  **预告与行为不一致比不预告更糟**。自报总量另用 `photos_declared`/`videos_declared` 带出。
+- 体积前置：`probe()` 本就读 Content-Length → 下载层过滤**优先用 `r["size"]`**，
+  真未知才 `probe_size()` ⇒ 图集任务零额外请求。⚠️ 回归表现是"每个资源平白多一次 HEAD"
+  （用例里把 `probe_size` 换成 `pytest.fail` 就能逮住）。
+
+## 视频页采集器 `xchina_video`（补充）
+
+输入 `/video/id-{gid}.html`、视频 gid、或迅雷式带签名 m3u8 直链。
+- 支持 `#EXT-X-KEY` 多密钥轮换与**相对密钥 URI**（按 playlist 路径拼绝对）。
+- ⚠️ `browser_runner` 做成**可注入依赖**，单测用假运行器 + 假 session，绝不真触网。
+- `video.py`：引擎分发**前**先 `_preflight_hls()`（挡过期/占位/无密钥）；
+  `engine=ffmpeg` 无二进制时先于预检 fail-fast（确定性本地错不该被网络错掩盖）。
+
+## 测试隔离（补充）
+
+- `TaskManager.shutdown(wait=True)`：测试必须等 worker 真退出，否则随机失败（生产 `wait=False`）。
+- ⚠️ 断言失败要 `check_eq` 打印期望/实际值 —— 只打标签的门禁排不了偶发失败。
+
+## 接入新站点
+
+新建 `collectors/<site>/spider.py` → `@register("<name>")` → 在 `collectors/__init__.py` import
+（`__init__` 末尾 import 所有 spider，spider 又要读常量 → 分数常量必须放 `scores.py` 防循环依赖）。
+**序号枚举型图集站**继承 `SequenceGallerySpider`，只声明 `GallerySite`
+（`id_patterns`/`page_tail`/`gid_shape`/URL 模板/变体/画质映射/`base_candidate_digits`），
+并可加 `match_score`。开工前按 skill `gallery-site-probe` 探测。

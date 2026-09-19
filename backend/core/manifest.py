@@ -22,6 +22,7 @@ from pathlib import Path
 from core.config import settings
 
 MANIFEST_NAME = "manifest.json"
+SIDECAR_NAME = "album.json"
 VERSION = 1
 
 
@@ -100,6 +101,26 @@ def _json_field(row, key):
         return {}
 
 
+def _log(log, msg, level="warn"):
+    """调用日志回调, 容忍只接受一个参数的回调。
+
+    这里刻意宽松: 回调形态不对是**调用方的 bug**, 但 manifest/album.json 只是
+    附属产物 —— 为了报一句"写不出来"而抛异常, 反而会把已经下载成功的任务
+    判定为失败, 本末倒置。
+    """
+    if not log:
+        return
+    try:
+        log(msg, level)
+    except TypeError:
+        try:
+            log(msg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def write_manifest(task, resources, out_dir, stats=None, error=None, log=None):
     """写 manifest.json, 返回路径。失败只记录日志, 不向上抛。
 
@@ -121,8 +142,7 @@ def write_manifest(task, resources, out_dir, stats=None, error=None, log=None):
         )
         tmp.replace(target)
     except Exception as e:
-        if log:
-            log(f"manifest 写入失败: {type(e).__name__}: {e}", "warn")
+        _log(log, f"manifest 写入失败: {type(e).__name__}: {e}")
         return None
     return target
 
@@ -136,6 +156,70 @@ def read_manifest(task_dir):
         return json.loads(p.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
+
+
+def build_sidecar(task, meta, resources=None):
+    """生成 album.json 数据结构。
+
+    与 manifest.json 的分工::
+
+        manifest.json   文件级, 一行一个资源(路径/sha256/实际下载点)
+        album.json      集合级, 一份描述整个相册(目录名/厂牌/标签/资源根)
+
+    两者都落在任务输出目录, 一起搬走仍然自解释。
+    """
+    m = dict(meta or {})
+    counts = {}
+    for r in resources or []:
+        t = r.get("type") or "other"
+        counts[t] = counts.get(t, 0) + 1
+    return {
+        "version": VERSION,
+        "task_id": task["id"] if task is not None else None,
+        "collector": m.get("collector") or (
+            task["collector"] if task is not None else None
+        ),
+        "source_url": m.get("source_url") or (
+            task["url"] if task is not None else None
+        ),
+        "finished_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "gid": m.get("gid"),
+        "album": m.get("album"),
+        "album_source": m.get("album_source"),
+        "title": m.get("title"),
+        "maker": m.get("maker"),
+        "tags": list(m.get("tags") or []),
+        "media": list(m.get("media") or []),
+        "counts": counts,
+        # 相册页**自报**数量: 只用于对照, 不当资源清单(页面会改版/滞后)
+        "photos_declared": m.get("photos_declared"),
+        "videos_declared": m.get("videos_declared"),
+        # ⚠️ 排查任务为什么采不到东西时, 先看这一项
+        "resource_roots": dict(m.get("resource_roots") or {}),
+    }
+
+
+def write_sidecar(task, meta, out_dir, resources=None, log=None):
+    """写 album.json, 返回路径。失败只记日志, 不向上抛。
+
+    与 manifest 同样的宽处理: 它是附属产物, 磁盘写满/权限问题不该把已经下载
+    成功的任务判定为失败。
+    """
+    if not meta:
+        return None
+    data = build_sidecar(task, meta, resources)
+    target = Path(out_dir) / SIDECAR_NAME
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(target)
+    except Exception as e:
+        _log(log, f"album.json 写入失败: {type(e).__name__}: {e}")
+        return None
+    return target
 
 
 def manifest_enabled(extra_options=None):

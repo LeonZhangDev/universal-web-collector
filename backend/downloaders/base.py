@@ -9,7 +9,7 @@ import requests
 
 from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
-from .ratelimit import domain_slot
+from .ratelimit import domain_slot, note_rate_limited
 
 CHUNK = 64 * 1024
 
@@ -139,10 +139,13 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             raise
         except RateLimited as e:
             last_err = e
+            # ⚠️ 只让"撞墙的这一个线程"退避是不够的: 同一批里其他线程还在按原节奏
+            # 猛冲, 站点看到的整体压力没变, 它的判断就不会变 —— 只会更快把整站封掉。
+            # 所以把这次 429 记成**站点级冷却**, 下一轮 domain_slot 会让全站一起等,
+            # 等待时长也以冷却截止时间为准(精确, 不会等两遍)。
+            note_rate_limited(url, e.wait)
             if attempt == retries:
                 raise
-            # 抖动同样要加: 一批并发请求会同时收到 429, 不抖开就是集体复燃
-            time.sleep(e.wait * random.uniform(0.8, 1.4))
         except Exception as e:
             last_err = e
             if attempt == retries:

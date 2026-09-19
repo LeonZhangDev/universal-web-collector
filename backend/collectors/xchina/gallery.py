@@ -101,12 +101,11 @@ from ..gallery_base import GallerySite, SequenceGallerySpider
 XCHINA = GallerySite(
     name="xchina_gallery",
     base="https://img.xchina.io/photos",
-    # 该站会按相册把资源分到 photos/photos2/photos3 等不同子路径: 枚举前自动试探命中
-    base_candidates=[
-        "https://img.xchina.io/photos",
-        "https://img.xchina.io/photos2",
-        "https://img.xchina.io/photos3",
-    ],
+    # 该站按相册把资源分到 photos / photos2 / photos3 ... 等不同子路径, 且**没有
+    # 规律可循**(只能按相册去试)。所以不写死清单, 而是声明"最多展开到几个数字后缀",
+    # 让 _base_candidates 自动生成 photos2..photos5 —— 手写三个的话下次出现 photos4
+    # 就会整批判空, 而用户只看到"任务失败", 根本看不出是路径变了。
+    base_candidate_digits=5,
     # 按画质从高到低
     variants=[".jpg", "_1200x0.webp", "_800x0.webp", "_600x0.webp"],
     quality_map={
@@ -119,15 +118,24 @@ XCHINA = GallerySite(
     video_variants=[".mp4"],
     video_quality_map={"original": ".mp4"},
     id_patterns=[
-        # 图片/视频直链: https://img.xchina.io/photos/{id}/00001.jpg|.mp4
-        #   (站点可能把不同相册分到 photos/photos2/photos3 等不同子路径, 见 base_candidates)
-        r"/photos\d*/([0-9A-Za-z_-]{6,})",
+        # 图片/视频直链: https://img.xchina.io/photos{数字}/{id}/00001.jpg|.mp4
+        #   ⚠️ 必须**锚定到"gid 后面紧跟一个带媒体扩展名的文件名"**, 不能只抓中间
+        #   那一段: 否则 /photos/featured/0001.jpg 会把路径词 "featured" 当成 gid,
+        #   然后去枚举一个不存在的图集 —— 又是一次"成功但 0 资源"(用户看不出哪里错)。
+        #   `[^/?#]+` 而不是 `\d+`: 序号可能带变体后缀, 如 00046_600x0.webp。
+        r"/photos\d*/([0-9A-Za-z_-]{6,})/[^/?#]+\."
+        r"(?:jpe?g|png|webp|gif|bmp|mp4|m3u8|ts)(?:[?#]|$)",
         # 相册页: https://xchina.co/photo/id-{id}.html 或 /photo/id-{id}/10.html
         #        (末段是**页码**, 不是 ID)
         r"/photo/id-([0-9A-Za-z_-]{4,})",
         # 老式: https://xchina.co/photoShow.html?id={id}
         r"/photoShow\.html\?id=([0-9A-Za-z_-]{4,})",
     ],
+    # 实测所有 gid 都是 13 位小写十六进制(6aa5136f606fe / 69ad45698f836 / 6a3654854fd25)。
+    # 自动识别时用它当"这真的是本站 ID"的判据: /photos/featured/0001.jpg 这类
+    # 路径词(featured 含 t/u/r, 非十六进制)会被挡掉, 不再被误认领。
+    # 站点若改 ID 格式, 只改这一行; 手选采集器时不做此校验。
+    gid_shape=r"[0-9a-f]{8,}",
     page_tail=r"^\d+$",
     input_forms=[
         "图片/视频直链 https://img.xchina.io/photos/{id}/00001.jpg|.mp4",

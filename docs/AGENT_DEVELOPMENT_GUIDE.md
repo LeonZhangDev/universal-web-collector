@@ -1189,3 +1189,123 @@ segments, duration, encrypted, key_url, ...)`:
 - 这两个文件同样是**先写测试才抓到 bug**: `endswith(".m3u8")` 匹配不上带 query 的
   真实 URL; `estimate_size` 的 FakeSession 漏 `head` 方法导致体积变 None
 
+
+# V21~V23 任务列表增强 + CDN/正则加固 + "有效资源"三关 ✅ 已完成(2026-09-19)
+
+## 1. 任务列表增强(V21)
+
+- **任务名** `tasks.name`: 提取后由 `_infer_name()` 从首个资源推断(图集取目录名、
+  视频取标题)回写。列表/详情优先显示它。
+- **暂停/继续**: `TaskStatus.PAUSED` + `POST /tasks/{id}/pause|resume`。
+  `pause()` 置取消标志让 worker 在**资源边界**退出; `resume()` 把
+  `downloading/skipped/failed` 复位 pending、**不重新采集、不重下已 done 的文件** ——
+  这是它相对"取消+重跑"的唯一价值, 测试要断言这一点, 不是断言状态字段变了。
+- **打包下载**: 原本是裸 `<a href>`, 无 loading 态、与其他操作交互不一致 ——
+  真实 UI bug。改成统一按钮。
+- **重试抖动**: 指数退避 × 0.6~1.4。纯指数会让一批并发失败的请求在同一时刻
+  集体重试(重试风暴), 把站点/WAF 瞬间打爆。
+- ⚠️ `match_size` 收到的 size 经 JSON/DB 往返**是字符串**, `str < int` 抛
+  `TypeError` 会把整个任务拖垮(资源全卡 pending)。`_coerce_size()` 统一转 int。
+
+## 2. CDN 基址与序号宽度(V22/V23) —— 本版最值得记的一节
+
+同一站点会把不同相册分到不同 CDN 子路径(`photos` / `photos2` / `photos3`),
+序号补零位数也不同(`0001.jpg` vs `00001.jpg`)。写死基址的后果是: 相册明明存在,
+枚举的却是另一条不存在的路径 → 全部判 missing → **0 资源 → failed**,
+而用户只看到"失败", 完全看不出是路径不对。
+
+**三条线索按可信度依次采信**(`_resolve_base`):
+
+1. **相册页 HTML 里引用的图片地址** —— 页面白给的真实前缀, 最可信, 零探测。
+   (`album_meta.extract_album_meta` 的 `resource_urls`, 用 `<img src>` 反推)
+2. **用户输入的资源直链** —— 基址与宽度都写在 URL 里了。
+3. **候选基址 × 相邻序号宽度试探** —— 默认基址先用, **不中才探**, 所以正常相册
+   零额外请求。(初版无条件预探测, 让 happy path 平白多一次请求 —— 被计数型假
+   session 当场逮住。这类"多花一次请求"的退化只有计数断言能发现。)
+
+**候选不写死清单**: 站点声明 `base_candidate_digits=5` → 自动展开 `photos2..photos5`。
+手写三个的话, 下次出现 `photos4` 就整批判空, 而用户看不出是路径变了。
+(生成时从 **2** 起: 无后缀那个就是 base 本身, `photos1` 不是真实形态, 生成它
+只会白探一次。)
+
+⚠️ **一个资源根只能有一个出处**: `_base_candidates()` 同时供 `_resolve_base`(真去探)
+与 `_match_score`(静态判前缀)使用。各写一份的话会出现"采集能探到、自动识别却不认领"
+的半通状态 —— 直链被派给 generic、预览报 400, 而采集本身明明好使。**"一半好一半坏"
+最难查**, 所以候选只允许有一个出处。
+
+### 正则设计的四条
+
+1. **锚定到"gid 后面紧跟一个带媒体扩展名的文件名"**, 不能只抓中间那一段:
+   `/photos/featured/0001.jpg` 会把路径词 `featured` 当成 gid, 然后去枚举一个
+   不存在的图集 —— 又是一次"成功但 0 资源"。
+2. 序号用 `[^/?#]+` 而不是 `\d+`: 直链可能带变体后缀(`00046_600x0.webp`)。
+3. `photos\d*` 而非 `photos`: 子路径带数字后缀是常态。
+4. **形状校验 `site.gid_shape`**(如 `[0-9a-f]{8,}`)是 `strict=True` 专属:
+   自动识别在"替用户做决定", 猜错是静默的; 手选采集器时不校验(输入形态各异)。
+   形状不符**不再往下走末段退路** —— 退路比形状判据更不可靠, 放行更危险。
+
+### 直链线索的解析要注意
+
+`parse_resource_hint(site, raw, gid=...)` 从直链读出 `(base, seq_format)`。
+⚠️ 必须传**用户原始输入**: 传 gid 的话直链里的 `photos2` / `0001` 信息早就丢了。
+线索带 gid 校验(页面里有推荐位其他相册的图), 且只当**线索**不当结论(用户可能
+粘了一条失效的旧直链), 仍会探一次, 探不通就退回候选探测。
+
+### 采不到时要说人话
+
+- 采集到 0 个资源抛 `_empty_hint()`: 列出试过的基址 + 下一步动作(如"用浏览器
+  打开一张图, 把直链粘进来"), 而不是返回空列表让上层记一句"采集到 0 个资源"。
+- 预览返回 `resource_roots`(实际生效的基址/序号格式/来源)与 `warning`;
+  任务级落 `album.json` sidecar, 字段同名。**预告里看到的路径 = 创建后真正枚举的
+  那一条**, 不再是黑箱。
+
+## 3. "什么是有效资源"三关(`core/filters.py::match_resource` 唯一定义)
+
+定义散落两处必然导致行为不一致, 所以两处接入点(提取阶段按 URL 预筛、下载前按
+真实体积/像素复核)共用它。
+
+1. **长得像不像(URL 层)**: 类型 / 扩展名黑白名单 / 关键词 / 广告位(`exclude_ad`)
+2. **够不够格(体积层)**: min/max_size、`min_image_bytes`(挡 1x1 跟踪像素)
+3. **是不是真的(内容层)**: 下载后按 Content-Type 复核(`require_image`) ——
+   越界 URL 会返回 `200 + text/html`, 光看状态码会被骗。
+
+本版新增 **像素层**: `min_width/max_width/min_height/max_height` —— 下载后读文件头
+(`core/imageinfo.py`, 纯 Python 解 PNG/JPEG/GIF/WebP/BMP)拿真实尺寸, 不符则删文件
+标 filtered。视频与文档不参与尺寸规则。
+
+⚠️ 两条容易写错的:
+- `exclude_ad` **按路径分段精确匹配**, 绝不做子串包含 —— 子串会把
+  `downloads/badges/1.jpg` 这种正常文件误杀。
+- **尺寸/去重复用文件时绝不删别人的文件**: 命中去重说明别处已有同一份内容,
+  按本任务规则删它等于破坏别的任务的产出。
+
+## 4. 429 与站点级冷却
+
+- 站点说"慢一点"时按它给的 `Retry-After` 等(秒 / HTTP 日期), **不套**普通指数
+  退避 —— 普通退避封顶 8 秒, 站点要求冷静几十秒时硬闯只会让封禁更久。
+- 冷却**按站点共享**(`site_key`), 不是按 URL: 同一站点的一个 URL 被 429,
+  其他 URL 硬闯同样会让封禁更久。
+
+## 5. 本轮踩到的坑
+
+- ⚠️ **Git Bash 给 Windows Python 传 `$PWD/...` 会造影子库**: `$PWD` 是
+  `/c/Users/...`, Windows 解析成 `C:\c\Users\...`。冒烟时表现为"服务用的库
+  和我查的不是同一个", 极易被误判成"多实例共用库"。传路径请用 `$(pwd -W)`
+  或 Windows 风格绝对路径。
+- ⚠️ **看门狗判活必须看库里的心跳**(`tasks.hb`), 不能只看进程内
+  `_LIVE_MANAGERS`。两个实例共用一个 SQLite 时, A 的看门狗看不到 B 的 worker,
+  会把一个正在枚举 114 张图的任务判成"重启遗留"标 failed —— 表面症状却是
+  `invalid transition extracting -> downloading`(状态对不上), 根因在别处。
+  长耗时枚举期间要靠采集日志回调节流刷新心跳(否则被"无进度"规则误伤)。
+- 同一文件的多处 Edit **不要并行发**(会静默丢改动, 已踩多次), 改完立刻 grep 核对。
+
+## 6. 验证(2026-09-19)
+
+- `pytest` -> **347 用例**(新增 `test_cdn_base_discovery` / `test_ad_filter` /
+  `test_image_filter` / `test_http_guard` / `test_sidecar` / `test_pause_resume`)
+- `verify_output` 33 项 / `verify_hls` 18 项 / `vite build`
+- 真实站点: 相册 `69ad45698f836`(photos2 + 4 位序号) 端到端 **114 张真图 / 56.1MB /
+  全部 JPEG 魔术字节 `ffd8ff` / success**; `album.json` 正确记录
+  `resource_roots.image = {base: photos2, seq_format: {seq:04d}, source: probe,
+  site_default: photos}`
+

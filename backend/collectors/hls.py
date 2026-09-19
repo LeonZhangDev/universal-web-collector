@@ -134,6 +134,10 @@ def parse_playlist(text, base_url=""):
     out = {
         "media": [], "count": 0, "duration": 0.0, "encrypted": False,
         "key_url": "", "iv": "", "variants": [], "target_duration": 0.0,
+        # 一次播放列表里可以出现**多把** #EXT-X-KEY(VOD 按分片换钥是合法写法)。
+        # 只记最后一把会让校验放过"拿不到的那把" —— 下到一半才炸, 而且那一段
+        # 已经落盘了, 排查成本极高。所以这里全部收下来, 由校验层逐把确认。
+        "keys": [],
     }
     if not text:
         return out
@@ -163,11 +167,25 @@ def parse_playlist(text, base_url=""):
         if line.startswith("#EXT-X-KEY:"):
             attrs = _attrs(line)
             method = (attrs.get("METHOD") or "").upper()
-            out["encrypted"] = bool(method) and method != "NONE"
-            if attrs.get("URI"):
-                out["key_url"] = _absolute(attrs["URI"], base_url)
+            enabled = bool(method) and method != "NONE"
+            if enabled:
+                out["encrypted"] = True
             if attrs.get("IV"):
                 out["iv"] = attrs["IV"]
+            # URI 可能是**相对**的(`enc.key` / `/key/enc.key`): 必须相对播放列表
+            # 自身解析。ffmpeg 对相对 URI 的处理随版本而异, 而我们自己校验时必须
+            # 拿到绝对地址才能确认"这把钥拿不拿得到"。
+            uri = _absolute(attrs.get("URI"), base_url) if attrs.get("URI") else ""
+            if enabled and uri:
+                if uri not in [k["url"] for k in out["keys"]]:
+                    out["keys"].append({
+                        "url": uri,
+                        "method": method,
+                        "iv": attrs.get("IV") or "",
+                        "keyformat": (attrs.get("KEYFORMAT") or "").upper(),
+                    })
+                if not out["key_url"]:
+                    out["key_url"] = uri
             continue
         if line.startswith("#EXT-X-STREAM-INF:"):
             prev_stream = True
@@ -230,6 +248,7 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
         "expires_at": None, "seconds_left": None, "encrypted": False,
         "key_url": "", "iv": "", "duration": 0.0, "count": 0,
         "variants": [], "segments": [], "key_bytes": 0,
+        "keys": [], "key_count": 0, "keys_checked": 0,
     }
 
     # 1) 凭证过期: 放在最前面 —— 过期 URL 通常还能返回 200(占位列表),
@@ -271,7 +290,8 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
         "encrypted": info["encrypted"], "key_url": info["key_url"],
         "iv": info["iv"], "duration": info["duration"],
         "count": info["count"], "variants": info["variants"],
-        "segments": info["media"],
+        "segments": info["media"], "keys": info["keys"],
+        "key_count": len(info["keys"]),
     })
 
     # 3) master playlist 不在这一层判伪: 它本来就不含分片, 由调用方下钻
@@ -295,34 +315,49 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
         result["reason"] = reason + "。下载它只会得到一个占位视频, 已阻止"
         return result
 
-    # 5) 加密流: 顺手确认密钥拿得到 —— 别等下完几百兆才发现解不开
+    # 5) 加密流: 顺手确认**每一把**密钥都拿得到 —— 别等下完几百兆才发现解不开。
+    #    多密钥轮换时只验一把等于没验: 拿不到的那把对应的分片会整段解不出来,
+    #    而那时文件已经落盘、任务已经报过进度, 排查得从几百兆里往外刨。
     if info["encrypted"] and check_key:
-        key_url = info["key_url"]
-        if not key_url:
+        keys = list(info["keys"])
+        if not keys and info["key_url"]:
+            keys = [{"url": info["key_url"], "method": "", "iv": "", "keyformat": ""}]
+        if not keys:
             result["kind"] = "no-key"
             result["reason"] = "播放列表声明加密但没给出密钥地址"
             return result
-        try:
-            kr = getter(key_url, headers=headers or {}, timeout=timeout)
+
+        bad = []
+        for k in keys:
+            name = k["url"].rsplit("/", 1)[-1] or k["url"]
+            try:
+                kr = getter(k["url"], headers=headers or {}, timeout=timeout)
+            except Exception as e:
+                result["keys_checked"] += 1
+                bad.append(f"{name}: {type(e).__name__}")
+                continue
             n = len(kr.content or b"")
-            result["key_bytes"] = n
+            result["keys_checked"] += 1
             if kr.status_code >= 400 or n not in (16, 24, 32):
-                result["kind"] = "bad-key"
-                result["reason"] = (
-                    f"密钥不可用(HTTP {kr.status_code}, {n} 字节; "
-                    "AES-128 应为 16 字节)"
-                )
-                return result
-        except Exception as e:
+                bad.append(f"{name} HTTP {kr.status_code} {n}B")
+            else:
+                result["key_bytes"] = n
+        if bad:
             result["kind"] = "bad-key"
-            result["reason"] = f"获取密钥失败: {type(e).__name__}: {e}"
+            result["reason"] = (
+                f"{len(bad)}/{len(keys)} 把密钥不可用({'; '.join(bad[:3])}); "
+                "AES-128 每把应为 16 字节。加密流必须拿齐全部密钥才能解密, 已阻止下载"
+            )
             return result
 
     result["ok"] = True
     result["kind"] = "ok"
     bits = [f"{info['count']} 个分片", f"时长 {_hhmmss(info['duration'])}"]
     if info["encrypted"]:
-        bits.append("AES-128 加密")
+        method = next((k["method"] for k in info["keys"] if k["method"]), "AES-128")
+        bits.append(f"{method} 加密")
+        if len(info["keys"]) > 1:
+            bits.append(f"{len(info['keys'])} 把密钥(已全部验证可达)")
     if left is not None and left < 600:
         # 不阻止(拉列表只要几秒), 但要让用户知道这条凭证快凉了
         bits.append(f"凭证仅剩 {left} 秒")

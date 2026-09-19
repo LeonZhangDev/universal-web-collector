@@ -145,3 +145,4 @@ def resolve_collector(url, fallback="generic"):
 from .generic.spider import GenericSpider  # noqa: E402,F401
 from .xchina.spider import XChinaSpider  # noqa: E402,F401
 from .xchina.gallery import XChinaGallerySpider  # noqa: E402,F401
+from .xchina.spider_video import XChinaVideoSpider  # noqa: E402,F401

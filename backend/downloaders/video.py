@@ -32,20 +32,19 @@ ffmpeg 路径由 `core/ffmpeg.py` 探测(显式配置 -> PATH -> 常见安装位
 本模块只负责"给定 URL 把字节取下来", 站点规则一律留在采集器里。
 """
 
-import re
 import shutil
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
 
 from core.cancel import TaskCancelled
 from core.config import settings
 from core.ffmpeg import find_ffmpeg
+from collectors.hls import inspect_playlist
 from .base import (
     CHUNK,
     build_headers,
@@ -152,16 +151,44 @@ class VideoDownloader:
         # remux 是另一回事, 只要 ff 在就还能用(见步骤 5)。
         pull_with_ffmpeg = bool(ff) and engine in ("auto", "ffmpeg")
 
+        # engine=ffmpeg 但找不到可执行文件: 这是确定性的本地配置错误, 应 fail-fast
+        # 优先报, 不要绕一圈网络预检才暴露(而且不能静默降级成内置器 —— 用户以为
+        # 产物是 ffmpeg 拉的, 实际不是)
+        if engine == "ffmpeg" and not ff:
+            raise RuntimeError(
+                "video_engine=ffmpeg 但未找到 ffmpeg 可执行文件; "
+                "请安装 ffmpeg, 或用 UWC_FFMPEG 显式指定路径"
+            )
+
+        # 0) 预检: 下载前先读一遍播放列表本体, 拦掉"假成功"。
+        #    签名过期/无效时站点回一个语法合法、指向占位分片的 m3u8, ffmpeg 会
+        #    一路畅通地下完并报告 success —— 用户只拿到几十秒占位画面。这里在开工
+        #    前就判定凭证是否还活着、分片是不是真的, 不通过就响亮地失败。
+        #    主 URL 失败时依次试备用下载点(镜像)。
+        leaf, info, last_err = murl, None, None
+        for cand in [murl] + [m for m in (mirrors or []) if m and m != murl]:
+            try:
+                leaf, info = self._preflight_hls(cand, headers, log)
+                break
+            except Exception as e:
+                last_err = e
+                if log:
+                    log(f"播放列表校验失败 {cand.split('/')[-1]}: {_short(e, 80)}")
+        if info is None or not info["ok"]:
+            raise RuntimeError(
+                f"m3u8 未通过校验: {_short(last_err or '空响应', 160)}"
+            )
+
         # 1) ffmpeg 一步到位(也能处理 AES-128 加密流)
         if pull_with_ffmpeg:
             path = out / f"{stem}.mp4"
             try:
-                self._ffmpeg_pull(murl, headers, path, ff)
+                self._ffmpeg_pull(leaf, headers, path, ff)
                 if progress_cb:
                     progress_cb()
                 if log:
                     log(f"ffmpeg 拉流完成: {path.name}")
-                fill_info(info, murl, "video/mp4")
+                fill_info(info, leaf, "video/mp4")
                 return path, sha256_file(path)
             except Exception as e:
                 path.unlink(missing_ok=True)
@@ -186,20 +213,18 @@ class VideoDownloader:
             settings.segment_max_interval,
         )
 
-        # 2) 解析播放列表; 主 URL 失败时依次试备用下载点
-        candidates = [murl] + [m for m in (mirrors or []) if m and m != murl]
-        segments, base, last_err = [], murl, None
-        for cand in candidates:
-            try:
-                segments = self._resolve_segments(cand, headers, limiter)
-                base = cand
-                break
-            except Exception as e:
-                last_err = e
-                if log:
-                    log(f"播放列表解析失败 {cand.split('/')[-1]}: {_short(e, 80)}")
+        # 2) 复用预检已解析的绝对化分片清单(主 URL 失败时会落到这里, 此时已是镜像)
+        segments = info["segments"]
+        base = leaf
         if not segments:
-            raise RuntimeError(f"m3u8 未解析出分片: {_short(last_err or 'empty')}")
+            raise RuntimeError("播放列表没有任何分片")
+        # 加密流必须用 ffmpeg 解密: 内置分片器只会把密文 .ts 拼在一起, 得到垃圾文件
+        if info["encrypted"] and not pull_with_ffmpeg:
+            raise RuntimeError(
+                "播放列表声明 AES-128 加密, 内置分片器无法解密; "
+                f"请安装 ffmpeg 或改用 video_engine=ffmpeg(当前 engine={engine}, "
+                f"ffmpeg={'可用' if ff else '未找到'})"
+            )
         if log:
             log(f"分片清单: {len(segments)} 个 (来源 {base.split('/')[-1]})")
 
@@ -245,29 +270,33 @@ class VideoDownloader:
         fill_info(info, base, "video/mp2t")
         return merged, sha256_file(merged)
 
-    def _resolve_segments(self, url, headers, limiter, depth=0):
-        """解析 m3u8, 返回分片 URL 列表(自动下钻 master playlist 取最高码率)。"""
-        with limiter.slot():
-            resp = self.session.get(url, headers=headers, timeout=settings.request_timeout)
-        resp.raise_for_status()
-        text = resp.text
+    def _preflight_hls(self, murl, headers, log):
+        """下载前预检播放列表, 返回 (leaf_url, info)。
 
-        if "#EXT-X-KEY:" in text and "METHOD=NONE" not in text:
-            raise RuntimeError("加密 m3u8(AES-128) 需要 ffmpeg 支持, 当前无法合并")
-
-        variants = []
-        for m in re.finditer(r"#EXT-X-STREAM-INF:([^\n]*)\n([^\n#][^\n]*)", text):
-            bw = re.search(r"BANDWIDTH=(\d+)", m.group(1))
-            variants.append((int(bw.group(1)) if bw else 0, m.group(2).strip()))
-        if variants and depth < 3:
-            best = urljoin(url, max(variants, key=lambda x: x[0])[1])
-            return self._resolve_segments(best, headers, limiter, depth + 1)
-
-        return [
-            urljoin(url, line.strip())
-            for line in text.splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
+        info.ok 为 False 时本方法**抛异常**(带人话原因), 调用方不该继续下载。
+        对 master playlist 自动下钻到最高码率的子列表, 并对叶子节点再校验一遍
+        (占位列表常藏在叶子层, 只在 master 上校验会漏)。
+        """
+        seen = set()
+        url = murl
+        for _ in range(4):
+            info = inspect_playlist(
+                url, headers=headers, session=self.session, log=log
+            )
+            if not info["ok"]:
+                raise RuntimeError(f"播放列表校验未通过: {info['reason']}")
+            # master: 没有分片、只有变体 -> 选最高码率继续下钻
+            if info["variants"] and not info["segments"]:
+                best = max(
+                    info["variants"], key=lambda v: v.get("bandwidth", 0)
+                )["url"]
+                if best in seen:
+                    raise RuntimeError("master 播放列表成环, 无法定位子列表")
+                seen.add(best)
+                url = best
+                continue
+            return url, info
+        raise RuntimeError("播放列表嵌套过深, 疑似 master 链成环")
 
     def _fetch_segments(self, segments, headers, parts_dir, limiter, progress_cb, log):
         """并发下载分片, 返回按序排列的 part 路径。

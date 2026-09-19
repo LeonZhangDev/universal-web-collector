@@ -159,6 +159,24 @@ URL 层免请求：类型白名单 / 扩展名黑白名单 / URL 关键词包含
 3. **结论必须回显且可覆盖**：`/collectors/resolve` 是纯 CPU 判定，前端失焦 300ms 后问一次。
    无法识别的输入直接 400（不悄悄兜底给 generic —— 那会在 DNS 层失败，错误信息没用）。
 
+## 视频页采集器 `xchina_video`（V20, 2026-09-19）
+输入 `https://xchina.co/video/id-{gid}.html`、视频 gid、或迅雷式带签名 m3u8 直链。
+`match_score`：`/video/` 路径=100、m3u8 直链=50，复用 `scores.py` 阶梯。
+核心模块 `collectors/hls.py`：
+- `inspect_playlist()` 下载清单做**健全性校验**，防最阴险的失败：签名过期/错 → 站点回
+  **200 + 语法合法的 m3u8** 指向 `/fallback/placeholder.ts`（603KB 真实可播放 TS），会静默下成
+  占位视频且任务报 success。`expires` 解析自 URL query（秒/毫秒都认），过期即明确失败。
+- `estimate_size()` 用「单片 HEAD 体积 × 分片数」估整段大小，让 `min_size/max_size` 对 HLS 有效
+  （`.m3u8` 的 Content-Length 只有几 KB，不估会误杀整段视频）。
+实测 `6aaa517d3f106`：`#EXT-X-KEY:AES-128` 加密，但 `/key/enc.key` **无需签名**、
+分片也无需签名（只有 playlist 设防）；ffmpeg 原生拉钥+解密+remux，端到端产出 27.1MB/5:05 真视频。
+**解密走 ffmpeg，零新增依赖**。
+⚠️ `crawl`/`preview` 监听 `.m3u8` 网络响应用 `"m3u8" in u` 而非 `endswith(".m3u8")` ——
+真实 URL 带 `?expires=...` 查询串，endswith 永远匹配不上（测试立刻抓到）。
+⚠️ `browser_runner` 做成**可注入依赖**，单测用假运行器+假 session，绝不真触网。
+`video.py`：引擎分发**前**先 `_preflight_hls()` 校验，失败抛清晰错误；`engine=ffmpeg` 无二进制时
+先于预检 fail-fast（确定性本地错不该被网络错掩盖）。
+
 ## 测试隔离 / 冒烟 / 常用命令
 - `TaskManager.shutdown(wait=True)`：测试必须等 worker 真退出，否则上用例的 worker 在下一个
   用例里继续写库 → 随机失败。生产仍 `wait=False`。

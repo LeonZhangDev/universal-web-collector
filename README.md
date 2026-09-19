@@ -105,6 +105,8 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | `https://xchina.co/photo/id-6aa513208a506.html` | `xchina_gallery` (分数 100, 相册页) |
 | `https://img.xchina.io/photos/6aa513208a506/00001.jpg` | `xchina_gallery` (分数 50, 资源直链) |
 | `6aa513208a506`(纯图集 ID) | `xchina_gallery` (分数 10) |
+| `https://xchina.co/video/id-6aaa517d3f106.html` | `xchina_video` (分数 100, 视频页) |
+| `https://video.xchina.download/m3u8/abc/720.m3u8?expires=...&md5=...` | `xchina_video` (分数 50, 带签名 m3u8) |
 | `https://example.com/a/b` | `generic`(没有专用采集器认领) |
 | `随便打几个字` | 无法识别 -> 400 "请手动选择采集器" |
 
@@ -141,6 +143,36 @@ Cloudflare 或浏览器不可用, 此时 `media=auto` 会退回一次 HTTP 探�
 12 张图 + 4 段 mp4, `00001.jpg` 与 `00001.mp4` 并存, 靠扩展名区分)。
 `auto` 会两者都采; 只要图片请显式传 `media=image`。
 
+### XChina 视频页(签名 m3u8)
+
+视频不是 `.mp4` 直链, 而是 `https://video.xchina.download/m3u8/{gid}/720.m3u8?expires=...&md5=...`
+这种**带签名、有有效期**的 HLS 播放列表; 迅雷/浏览器抓到的就是它。本工具
+原生支持, 不用 `<video>` 标签逐段拼、也不依赖外部下载器:
+
+- 粘贴 **视频页 URL** `https://xchina.co/video/id-{gid}.html` 即可: 采集器用
+  headless 浏览器过 Cloudflare, 监听播放器的网络请求**捕获**带签名 m3u8
+  (比解析 DOM/JS 可靠 —— 播放器要播就一定会请求它)。
+- 也可以直接粘贴**迅雷那种带签名 m3u8 直链**。
+- 自动识别会把它认成 `xchina_video`; 预览面板显示「1 段视频 + 估算体积」。
+
+⚠️ **最阴险的失败模式 —— 静默下成占位视频**: 签名过期或错误时, 站点**不报错**,
+而是返回 200 + 语法完全合法的 m3u8, 指向 `/fallback/placeholder.ts`(一个 603KB
+真实可播放 TS)。直接丢给 ffmpeg 会"成功"产出一个坏视频, 任务报 success。
+所以下载前强制做**播放列表健全性校验**(`collectors/hls.py`):
+
+```
+inspect_playlist(m3u8):
+  - 解析 expires: 已过期 -> 明确失败, 提示"凭据过期, 请重新获取"
+  - 分片清单: 没有任何分片(指向占位) -> 拒绝
+  - EXT-X-KEY(AES-128): 有加密但密钥不可达 -> 拒绝
+  - 通过才交给下载器
+```
+
+实测 `6aaa517d3f106` 的流: `#EXT-X-KEY:METHOD=AES-128` 加密, 但 `/key/enc.key`
+**无需 Referer/签名**, 分片也**无需签名**(只有 playlist 那一层设了防)。
+ffmpeg 原生处理拉钥+解密+remux, 端到端实测产出 27.1MB / 5:05 的真视频, 退出码 0
+(而非那个 603KB 占位片)。所以**解密走 ffmpeg, 零新增依赖**。
+
 ### 创建前预告(推荐先看一眼)
 
 ```bash
@@ -174,7 +206,7 @@ curl -X POST localhost:8000/tasks/preview \
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (245 用例)
+make test           # pytest (266 用例: 含 hls 校验 / 视频采集器 / 自动识别)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -206,6 +238,10 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
       (自带 `ctype_prefix`: 图片看 `image/`、视频看 `video/`)
     - ⚠️ ID 解析不出来时**直接报错**, 绝不猜: 猜错会去枚举一个不存在的图集,
       表现为"任务成功但 0 个资源"(曾把相册页 URL 里的页码 `10` 当成 ID)
+  - `xchina_video` XChina 视频页: headless 浏览器过 Cloudflare, 监听网络请求捕获
+    带签名 m3u8(无需解析 DOM/JS); 也认迅雷那样的 m3u8 直链。下载前强制做播放列表
+    健全性校验(过期/占位/无密钥一律拒绝), AES-128 解密走 ffmpeg
+    (零新增依赖; 密钥与分片均无需签名, 只有 playlist 那一层设防)
 - 资源类型: image / video / audio / doc / text, 对应下载器
 - 资源过滤: 类型/扩展名黑白名单/URL关键词/大小区间, 命中者标记 filtered 并记原因。
   大小过滤优先复用**采集阶段已探测到的** size(图集任务因此零额外请求), 未知才补 HEAD

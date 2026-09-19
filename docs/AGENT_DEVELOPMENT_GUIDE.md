@@ -1116,3 +1116,76 @@ if size is None:
 - 真实 create 走 auto: 库存 `xchina_gallery`(非 auto), 图集不存在时报 failed 并
   列出可接受的 URL 形态(失败是**响亮**的)
 - `verify_output` 33 项 / `verify_hls` 18 项 / `vite build` 72 modules
+
+---
+
+# V20 XChina 视频页(签名 m3u8)支持 ✅ 已完成(2026-09-19)
+
+用户给的真实样本: `https://video.xchina.download/m3u8/6aaa517d3f106/720.m3u8?expires=1789797019&md5=qKo4fsrJKvVIBp3tFwWVtA`
+(迅雷抓到的播放列表)。实测结论(决定实现方案):
+
+| 事实 | 影响 |
+| --- | --- |
+| 签名 `expires` 约 30 分钟有效 | 短命凭证, 不能像普通 URL 那样存库慢下; 但创建时若已过期必须**响亮失败** |
+| 过期/错误签名 -> **200 + 语法合法的 m3u8**, 指向 `/fallback/placeholder.ts` | 最阴险的失败: 不报错 |
+| `placeholder.ts` 是 **603KB 真实可播放 TS** | 会静默下成占位视频, 任务照报 success(本项目反复强调要杜绝的模式) |
+| `#EXT-X-KEY:METHOD=AES-128,URI="/key/enc.key"` | 分片加密, 直接拼 .ts 得到密文(首字节 `a65d69f5`, 非 TS 同步字节 `0x47`) |
+| `/key/enc.key` 无需 Referer/签名, 返回 16 字节 | 拿到 playlist 即拿到全片 |
+| `cdn.xchina.download/ts/.../*.ts` 无需签名 | 只有 playlist 那一层设防 |
+| 只有 720 一档; 1080/480/master 都返回那个 102 字节占位列表 | 无选档空间 |
+| 视频页 `xchina.co/video/id-XXX.html` 是 **403 CF 挑战页**(首页正常) | 拿 playlist 只能靠 headless |
+
+**不用 `<video>` 标签、不接迅雷**: 标签逐段拼是重复造轮子, 且拿不到签名 URL;
+本工具已有 HLS 双引擎(`video_engine`), 缺的只是"识别出链接已死"的能力。
+
+## 1. 播放列表健全性校验(`collectors/hls.py`, 新增)
+
+`inspect_playlist(url, session, log)` 下载清单做三道校验, 返回 `(ok, kind, reason,
+segments, duration, encrypted, key_url, ...)`:
+
+- `expires` 解析自 URL query(支持秒/毫秒), **已过期 -> 拒绝**, 理由写明"凭据过期, 需重新获取"
+  (数字先用 `time.time()` 兜底成合理范围, 避免 1970 之类脏值被误判)
+- 分片清单为空(只指向 placeholder) -> 拒绝 `kind=placeholder`
+- 有 `EXT-X-KEY` 但密钥 URI 不可达 -> 拒绝 `kind=no-key`
+- 下钻 master playlist 取 leaf, 直到拿到真正分片; master 本身无分片不算失败
+
+`estimate_size(segments, session, log)`: 用「单片 HEAD 体积 × 分片数」估整段大小,
+让 `min_size/max_size` 过滤对 HLS 有效(否则 `.m3u8` 的 2.5KB Content-Length 会误杀整段视频)。
+
+## 2. 下载器接线(`downloaders/video.py`)
+
+- 新增 `_preflight_hls()`: 先 `inspect_playlist` 预检, 失败**抛清晰错误**(不进引擎);
+  成功则向下钻到 leaf 播放列表。`_download_m3u8` 在引擎分发**之前**做预检。
+- ffmpeg 路径改用预检得到的 leaf URL; builtin 路径复用预检的分片清单, 删掉重复的
+  `_resolve_segments` 抓取, 并保留"加密流需 ffmpeg"守卫。
+- ⚠️ `engine=ffmpeg` 无二进制时**先于预检** fail-fast(确定性本地配置错, 不该被网络错掩盖)。
+- 端到端实测: ffmpeg 解密 AES-128 产出 **27.1MB / 5:05 真视频**(非 603KB 占位), 退出码 0。
+
+## 3. 视频页采集器(`collectors/xchina/spider_video.py`, 新增 + `@register`)
+
+- 输入 `https://xchina.co/video/id-{gid}.html` 或视频 gid, 或 m3u8 直链。
+- `match_score`: `/video/` 路径=100, m3u8 直链=50; 复用 `scores.py` 阶梯。
+- `crawl`/`preview`: `browser_runner(url, on_response)` 默认用 Playwright, **监听
+  response 事件捕获 `.m3u8`**(播放器要播就必请求, 比解析 DOM/JS 可靠)。
+  `on_response` 用 `"m3u8" in u`(真实 URL 带 `?expires=` 查询串, `endswith(".m3u8")`
+  永远匹配不上 —— 这是测试立刻抓到的 bug)。
+- 浏览器运行器做成**可注入依赖**, 单测用假运行器 + 假 session, 不真触网。
+- 产出 video 资源: `url=m3u8, headers={referer: page}, size=estimate_size(...)`,
+  `filename={clean_title}.mp4` 或退回 `{gid}.mp4`。
+- 复用 `album_meta` 的 CF 熔断 + 匿名优先(视频页也是 CF 挑战页)。
+
+## 4. 自动识别 / 前端
+
+- `/collectors/resolve` 认领视频页与 m3u8 直链 -> `xchina_video`。
+- 预览面板从 `isGallery` 扩成 `isGalleryLike`(视频也能看预览;`isVideo` 时隐藏图集专属
+  的命名方式提示与"读取相册页"文案)。图集专属选项(画质/媒体/相册标题)仍只对 `isGallery` 生效。
+- 中文名"XChina 视频页(自动过 Cloudflare 抓带签名 m3u8)"。
+
+## 5. 验证(2026-09-19)
+
+- `pytest` -> **266 用例**(`test_hls_guard` 12 + `test_xchina_video` 9, 其余继承)
+- `verify_output` 33 项 / `verify_hls` 18 项 / `vite build` 72 modules
+- 端到端 ffmpeg 解密实测真视频(27.1MB / 5:05), 非占位片
+- 这两个文件同样是**先写测试才抓到 bug**: `endswith(".m3u8")` 匹配不上带 query 的
+  真实 URL; `estimate_size` 的 FakeSession 漏 `head` 方法导致体积变 None
+

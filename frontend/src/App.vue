@@ -37,6 +37,7 @@ const collectorLabel = {
   generic: "通用网页(浏览器抓取)",
   xchina: "XChina 页面(浏览器抓取)",
   xchina_gallery: "XChina 图集/视频相册(相册 ID / 相册页 URL 均可)",
+  xchina_video: "XChina 视频页(自动过 Cloudflare 抓带签名 m3u8)",
 };
 // 自动识别的结论。**必须回显给用户并可覆盖** —— 悄悄生效的自动识别, 一旦
 // 猜错用户连"该去哪里改"都无从下手, 只会以为站点坏了。
@@ -49,10 +50,12 @@ const effectiveCollector = computed(() => {
 // 不同采集器对输入的要求不同, 提示语跟着切换
 const urlPlaceholder = computed(() =>
   collector.value === "auto"
-    ? "粘贴任意链接或图集 ID, 自动识别采集器(相册页 URL / 图片直链 / 6aa113208a506 均可)"
+    ? "粘贴任意链接或图集 ID, 自动识别采集器(相册页 / 视频页 URL / 图片直链 / 6aa113208a506 均可)"
     : effectiveCollector.value === "xchina_gallery"
       ? "相册 ID(6aa113208a506) / 相册页 URL(https://xchina.co/photo/id-XXX.html) / 任意一张图片或视频 URL 都行"
-      : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
+      : effectiveCollector.value === "xchina_video"
+        ? "视频页 URL(https://xchina.co/video/id-XXX.html) 或带签名的 m3u8 直链"
+        : "输入采集 URL, 例如 https://example.com/photoShow.html?id=xxx"
 );
 const creating = ref(false);
 const errorMsg = ref("");
@@ -70,6 +73,10 @@ const showPicker = ref(false);
 const qualities = ref(["original", "1200", "800", "600"]);
 const quality = ref("original");
 const isGallery = computed(() => effectiveCollector.value === "xchina_gallery");
+const isVideo = computed(() => effectiveCollector.value === "xchina_video");
+// 预览面板对图集与视频都展示(都是"先读页面再决定采什么"); 但画质/媒体/目录命名
+// 那些选项只对图集有意义, 视频采集器不需要
+const isGalleryLike = computed(() => isGallery.value || isVideo.value);
 const qualityLabel = {
   original: "原图 (画质最高)",
   1200: "1200px WebP",
@@ -631,7 +638,7 @@ onUnmounted(() => {
       <button
         type="button"
         class="ghost"
-        v-if="isGallery"
+        v-if="isGalleryLike"
         :disabled="previewing || !url.trim()"
         @click="runPreview"
       >
@@ -708,12 +715,14 @@ onUnmounted(() => {
     </div>
 
     <div
-      v-if="isGallery && (previewing || preview || previewError)"
+      v-if="isGalleryLike && (previewing || preview || previewError)"
       style="display:flex;flex-direction:column;gap:5px;font-size:13px;line-height:1.6;
              padding:10px 12px;margin-top:10px;border-radius:8px;
              border:1px solid rgba(127,127,127,0.35)"
     >
-      <div v-if="previewing">正在读取相册页…</div>
+      <div v-if="previewing">
+        {{ isVideo ? "正在打开视频页并捕获播放列表…" : "正在读取相册页…" }}
+      </div>
       <div v-else-if="previewError" style="color:#c0392b">
         预览失败: {{ previewError }}
       </div>
@@ -721,7 +730,7 @@ onUnmounted(() => {
         <div>
           <b>将保存到</b>
           <code>{{ preview.group }}</code>
-          <span class="tip">
+          <span class="tip" v-if="!isVideo">
             （命名方式: {{ albumTitleLabel[preview.album_source] || preview.album_source }}）
           </span>
         </div>

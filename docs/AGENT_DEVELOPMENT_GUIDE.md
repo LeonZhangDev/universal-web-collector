@@ -1734,3 +1734,40 @@ PITFALLS「跨边界耦合」类坑的根因从来不是逻辑错，而是**两�
 
 ⚠️ 这套只覆盖"运行期攒状态、测试会读"的模块。将来新模块若在导入时把别的配置也拷成常量，
 必须同步加进 `MODULE_TARGETS`，否则隔离对它失效而测试照样绿 —— 这正是守卫要兜住的漏登记。
+
+### 9.6 产物先于终态：次序本身就是契约
+
+**"任务到了终态"这句话，对消费者意味着"输出目录已经完整"。** 一旦终态先于产物可见，
+中间就有一个窗口：轮询到终态的消费者（打包、预览、`verify_output`）去读目录，而
+`manifest.json` 还没写出来。
+
+原来的 `_run` 正是反的 —— 先把任务 `transition` 成 `success`，manifest 到 `finally`
+才补写。所以 `verify_output` 会**偶发**在"manifest exists"这条上失败（实测 3 次挂 1 次）。
+它也解释了为什么这类 bug 特别难查：单跑常常绿，CI 上偶尔红，重跑又绿。
+
+修法是把次序倒过来，并让"记进 manifest 的状态"永远等于"任务最终的状态"：
+
+```python
+finally:
+    # 停止态(取消/暂停)会先于收尾落库, 以库里的为准; 否则用本次算出的终态。
+    stopped = cur["status"] if cur and cur["status"] in (CANCELLED, PAUSED) else None
+    effective = stopped or final
+    self._write_manifest(task_id, status=effective)   # 先落产物
+    self._settle_status(task_id, effective)           # 再置终态
+```
+
+两处细节，缺一个都会留坑：
+
+- **`_settle_status` 不能直接用 `_transition`**：`_transition` 开头会 `_check_cancel`，
+  而收尾跑在 `finally` 里 —— 在那里抛取消异常会顶掉真正的收尾动作（manifest、watch 结算）。
+  所以另设一个**绝不抛异常**的置态函数，迁移失败只记 warn。
+- **`status` 要覆盖着传进 `_write_manifest`**：写清单时库里还是 `downloading`，而清单该记的
+  是终态。同时用 `stopped or final` 兜住"取消恰好落在收尾窗口里"的情况，否则会出现
+  「清单说 success、任务列表显示 cancelled」。
+- **`resume` 分支也要走 `finally`**：它原先在分支里自己 `_transition(DOWNLOADING, final)`
+  再 `return` —— 同样把终态摆在了 manifest 前面。现在两个分支都只负责算 `final`，
+  置态统一交给 `finally`。
+
+回归用例不等时序碰运气：拦住"写终态"这个动作，在它发生的**那一刻**查 manifest 在不在
+（`test_sidecar.py::test_manifest_lands_before_task_is_marked_done/_failed`）。次序一反过来必红，
+与调度快慢无关 —— 验证过。

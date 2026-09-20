@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 from core import database as db  # noqa: E402
 from core import task_manager as tm  # noqa: E402
 from core.manifest import (  # noqa: E402
+    MANIFEST_NAME,
     SIDECAR_NAME,
     build_sidecar,
     write_sidecar,
@@ -235,3 +236,125 @@ def test_sidecar_is_written_before_download_finishes(tmp_db, tmp_path, monkeypat
         "sidecar 必须在下载阶段之前落盘, 否则任务全失败时就没有资源根线索了"
     )
     assert (tmp_path / "dl" / str(tid) / SIDECAR_NAME).is_file()
+
+
+# ---------------------------------------------------- 产物 / 终态次序(竞态)
+
+def _spy_terminal_writes(monkeypatch, records):
+    """拦住"写终态"这个动作, 记录那一刻输出目录里有没有 manifest。
+
+    为什么这么测: 次序 bug 的本质是**两个动作的先后**, 而先后靠 sleep 去撞是
+    碰运气(3 次挂 1 次)。这里改成确定性判据 —— 在终态真正落库的瞬间查文件
+    在不在, 与调度快慢无关, 次序一反过来必红。
+    """
+    real_update = db.update_task_status
+    terminal = ("success", "partial", "failed")
+
+    def spy(task_id, status):
+        if status in terminal:
+            out = tm.task_base_dir(db.get_task(task_id)) / str(task_id)
+            records.append((status, (out / MANIFEST_NAME).is_file()))
+        return real_update(task_id, status)
+
+    monkeypatch.setattr(db, "update_task_status", spy)
+
+
+def test_manifest_lands_before_task_is_marked_done(tmp_db, tmp_path, monkeypatch):
+    """⚠️ 终态一旦可见, 输出目录就必须是完整的(manifest 已在)。
+
+    曾经是反的: 先把任务标成 success, manifest 到 finally 才补写, 中间留了一个
+    窗口 —— 消费者/打包轮询到终态就去读目录, 而 manifest.json 还没出现。表现为
+    偶发"任务成功但 manifest 不存在"(verify_output 3 次会挂 1 次)。
+    """
+    seen = []
+    _spy_terminal_writes(monkeypatch, seen)
+
+    resources = [{"type": "image", "url": "https://x/0001.jpg", "headers": None,
+                  "mirrors": [], "size": 1, "filename": "相册/0001.jpg"}]
+    tid, out_dir = _run_task_with(monkeypatch, tmp_path, tmp_db, resources)
+
+    assert seen, "终态应经由 update_task_status 落库, 否则这条用例没测到东西"
+    assert all(ok for _, ok in seen), f"置终态的瞬间 manifest 还不存在: {seen}"
+    assert (out_dir / MANIFEST_NAME).is_file()
+
+
+def test_manifest_lands_before_task_is_marked_failed(tmp_db, tmp_path, monkeypatch):
+    """失败路径同理: 用户看到 failed 时, 也要能立刻读到 manifest 知道败在哪。"""
+    seen = []
+    _spy_terminal_writes(monkeypatch, seen)
+
+    monkeypatch.setattr(tm, "DOWNLOADS_DIR", tmp_path / "dl")
+    resources = [{"type": "image", "url": "https://x/1.jpg", "headers": None,
+                  "mirrors": [], "size": 1, "filename": "相册/1.jpg"}]
+    monkeypatch.setattr(tm, "get_collector", lambda name: _fake_spider(resources))
+
+    def boom(self, task_id, referer):
+        raise RuntimeError("下载层炸了")
+
+    monkeypatch.setattr(tm.TaskManager, "_download_all", boom)
+
+    tid = db.create_task("https://x/album", "xchina_gallery", None, {})
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    try:
+        mgr.submit(tid)
+        deadline = time.time() + 15
+        while db.get_task(tid)["status"] in tm.ACTIVE_STATES:
+            if time.time() > deadline:
+                break
+            time.sleep(0.05)
+        assert db.get_task(tid)["status"] == tm.TaskStatus.FAILED
+    finally:
+        mgr.shutdown(wait=True)
+
+    assert seen, "失败态应经由 update_task_status 落库"
+    assert all(ok for _, ok in seen), f"置 failed 的瞬间 manifest 还不存在: {seen}"
+
+
+def test_stop_in_finish_window_keeps_manifest_consistent(tmp_db, tmp_path, monkeypatch):
+    """取消恰好落在"算完终态、还没收尾"的窗口里时, manifest 不能与任务状态矛盾。
+
+    这时 `final` 已按下载结果算成 success, 但任务已被取消 —— 若照 final 写,
+    就会「清单说 success, 任务列表显示 cancelled」。以库里已落地的停止态为准。
+    """
+    from core.manifest import read_manifest
+
+    monkeypatch.setattr(tm, "DOWNLOADS_DIR", tmp_path / "dl")
+    resources = [{"type": "image", "url": "https://x/1.jpg", "headers": None,
+                  "mirrors": [], "size": 1, "filename": "相册/1.jpg"}]
+    monkeypatch.setattr(tm, "get_collector", lambda name: _fake_spider(resources))
+
+    def fake_download_all(self, task_id, referer):
+        for r in db.get_resources(task_id):
+            if r["status"] == "pending":
+                db.update_resource(r["id"], status="done", local_path="x", size=1)
+
+    monkeypatch.setattr(tm.TaskManager, "_download_all", fake_download_all)
+
+    real_final = tm.TaskManager._final_status
+
+    def final_then_stop(self, task_id):
+        status = real_final(self, task_id)
+        # 模拟: 终态刚算出来, 外部取消就落库了(收尾窗口内)
+        db.update_task_status(task_id, tm.TaskStatus.CANCELLED)
+        return status
+
+    monkeypatch.setattr(tm.TaskManager, "_final_status", final_then_stop)
+
+    tid = db.create_task("https://x/album", "xchina_gallery", None, {})
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    try:
+        mgr.submit(tid)
+        deadline = time.time() + 15
+        while db.get_task(tid)["status"] in tm.ACTIVE_STATES:
+            if time.time() > deadline:
+                break
+            time.sleep(0.05)
+    finally:
+        mgr.shutdown(wait=True)
+
+    assert db.get_task(tid)["status"] == tm.TaskStatus.CANCELLED
+    data = read_manifest(tmp_path / "dl" / str(tid))
+    assert data is not None, "停止也要留下 manifest"
+    assert data["status"] == "cancelled", (
+        f"manifest 状态必须与任务一致(实际 {data['status']})"
+    )

@@ -537,16 +537,23 @@ class TaskManager:
         return render(getattr(settings, "name_template", "") or "{name}",
                       ctx, r["url"], r["type"])
 
-    def _write_manifest(self, task_id):
+    def _write_manifest(self, task_id, status=None):
         """把任务的产出清单写到输出目录。
 
         无论成功/部分失败/取消都写: 取消时用户最需要知道"哪几个下好了"。
+
+        ⚠️ `status` 覆盖库里读到的状态: 调用方要在**置终态之前**先把清单落盘
+        (见 `_settle_status` 的注释), 那一刻库里还是 `downloading`, 但清单里该
+        记的、也是用户会看到的, 是真正的终态。
         """
         task = db.get_task(task_id)
         if not task:
             return
         if not manifest_enabled(self._options(task_id)):
             return
+        if status is not None:
+            task = dict(task)
+            task["status"] = status
         out_dir = task_base_dir(task) / str(task_id)
         try:
             write_manifest(
@@ -560,6 +567,29 @@ class TaskManager:
         except Exception as e:
             # manifest 是附属产物, 写不出来不能让任务失败
             self._safe_log(task_id, f"manifest 生成失败: {e}", "warn")
+
+    def _settle_status(self, task_id, status):
+        """把任务置为终态。收尾阶段专用, **绝不抛异常**。
+
+        ⚠️ 不能用 `_transition`: 它开头会 `_check_cancel` —— 而收尾是在 `finally`
+        里跑的, 在那里抛取消异常会顶掉真正的收尾动作(manifest/watch 结算)。
+        ⚠️ 迁移失败只记 warn 不报错: 常见于任务已被并发置成 cancelled/paused,
+        此时"保持原状态"才是对的, 硬改成 success 反而是篡改。
+        """
+        if not status:
+            return
+        cur = db.get_task(task_id)
+        if not cur or cur["status"] == status:
+            return
+        if not can_transition(cur["status"], status):
+            self._safe_log(
+                task_id,
+                f"收尾时状态已是 {cur['status']}, 不再迁移到 {status}",
+                "warn",
+            )
+            return
+        db.update_task_status(task_id, status)
+        self._safe_log(task_id, f"status -> {status}")
 
     def _write_sidecar(self, task_id, resources):
         """把"这次采集采的是什么"写成 album.json(集合级元数据)。
@@ -639,6 +669,9 @@ class TaskManager:
             pass
 
     def _run(self, task_id, resume=False):
+        #: 本次运行的终态。在 finally 里用来"先落产物、再置终态"; None = 不改状态
+        #: (取消/暂停时 cancel()/pause() 已经把状态置成 cancelled/paused 了)。
+        final = None
         try:
             task = db.get_task(task_id)
             if not task or task["status"] != TaskStatus.PENDING:
@@ -667,9 +700,9 @@ class TaskManager:
                 self._download_all(task_id, url)
                 self._check_cancel(task_id)
                 final = self._final_status(task_id)
-                self._transition(task_id, TaskStatus.DOWNLOADING, final)
                 self._set_progress(task_id, 100)
                 self._safe_log(task_id, f"task {final}")
+                # 终态交给 finally 统一处置 —— 那里保证"先落 manifest 再置终态"
                 return
 
             spider = get_collector(task["collector"])
@@ -756,23 +789,35 @@ class TaskManager:
 
             self._check_cancel(task_id)
             final = self._final_status(task_id)
-            self._transition(task_id, TaskStatus.DOWNLOADING, final)
             self._set_progress(task_id, 100)
             self._safe_log(task_id, f"task {final}")
         except TaskCancelled:
+            # cancel()/pause() 已把状态置成 cancelled/paused, 这里只补产物
+            final = None
             self._safe_log(task_id, "task cancelled by user", "warn")
         except Exception as e:
+            final = TaskStatus.FAILED
             self._safe_log(task_id, f"task failed: {e}", "error")
             self._safe_log(task_id, traceback.format_exc(limit=3).strip(), "error")
             db.update_task(task_id, error=str(e)[:500])
-            cur = db.get_task(task_id)
-            if cur and can_transition(cur["status"], TaskStatus.FAILED):
-                db.update_task_status(task_id, TaskStatus.FAILED)
-            self._publish_task(task_id)
         finally:
-            # 无论成败都产出 manifest: 取消/部分失败时, 用户最需要知道
-            # "到底哪几个下好了"
-            self._write_manifest(task_id)
+            # 生效终态 = 库里已经落地的"停止态"(取消/暂停)优先, 否则用本次算出的。
+            # ⚠️ 取消/暂停会在收尾前就把状态置成 cancelled/paused, 而 `final` 此时
+            # 仍是按下载结果算出的 success/failed —— 照它写会让「清单说 success、
+            # 任务却显示 cancelled」互相矛盾。以库里那份为准。
+            cur = db.get_task(task_id)
+            stopped = cur["status"] if cur and cur["status"] in (
+                TaskStatus.CANCELLED, TaskStatus.PAUSED
+            ) else None
+            effective = stopped or final
+
+            # ⚠️ 次序不能反: 先把产物落全(manifest 记上终态), **再**把任务标记
+            # 为终态。反过来的话会留一个窗口 —— 消费者/打包轮询到终态就去读输出
+            # 目录, 而 manifest.json 还没写出来, 表现为偶发"任务成功但 manifest
+            # 不存在"(先置终态、再到 finally 补写, verify_output 里稳定复现过)。
+            # 无论成败都产出 manifest: 取消/部分失败时用户最需要知道"哪几个下好了"。
+            self._write_manifest(task_id, status=effective)
+            self._settle_status(task_id, effective)
             self._settle_watch(task_id)
             with self._active_lock:
                 self._active.pop(task_id, None)

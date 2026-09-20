@@ -277,6 +277,17 @@ ffmpeg 解成 9x8 灰度 → 64 位 dHash，**零新增依赖**。
     隔离集中到 `tests/isolation.py`（清单式：加一处只改一个文件）；另设 session 守卫
     整轮前后比对真实目录指纹，脏写即红。守卫逻辑本身有单测（`test_changed_keys_detects_writes`
     等），并验证过"拆掉 conftest 隔离 → 全量测试立即变红"—— 否则"看起来在隔离"比不隔离更糟。
+11. ⚠️⚠️ **次序即契约：产物必须先于终态**。"任务到了终态"对消费者意味着"输出目录已完整"。
+    原来 `_run` 先把任务 `transition` 成 success、manifest 到 `finally` 才补写 —— 中间那个窗口里，
+    轮询到终态的消费者去读目录会扑空。症状是**偶发**："任务成功但 manifest 不存在"
+    （verify_output 实测 3 次挂 1 次），单跑常绿、CI 偶红、重跑又绿。
+    → 收尾次序倒过来：先 `_write_manifest(status=effective)` 再 `_settle_status`。
+    ⚠️ ① 置态不能用 `_transition`（它开头 `_check_cancel`，在 finally 抛取消会顶掉收尾）
+    → 另设绝不抛异常、迁移失败只 warn 的 `_settle_status`。
+    ⚠️ ② `status` 要覆盖着传进 `_write_manifest`（写清单时库里还是 downloading），
+    并用 `stopped or final` 兜住"取消恰好落在收尾窗口"→ 否则「清单 success、任务 cancelled」。
+    ⚠️ ③ 回归用例不等时序碰运气：拦住"写终态"动作，在那一刻查 manifest 在不在。
+    ⚠️ ④ 正常与 resume **两条分支都要走 finally** 收尾（resume 原先自己 transition+return）。
 
 ## 接入新站点
 

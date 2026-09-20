@@ -44,6 +44,10 @@ tests/test_isolation.py       7 项：隔离机制本身失效即红（含连接
 - **SQLite 写重试**：WAL 只解决读写并发，**写-写仍单写者**；`locked` 落在业务 try 里会被
   当成"资源下载失败"。`busy_timeout` + `_retry_write`（只对 locked/busy、有上限）。
 - **磁盘满**：预检 + 捕获即 `abort` 中止整任务；⚠️ 不标 cancelled（已下好的是真实成果）。
+- **次序即契约**：收尾必须**先落 manifest 再置终态**（`_write_manifest(status=…)` → `_settle_status`）。
+  反了就有"轮询到 success 但 manifest 还没写"的窗口 → 偶发"成功却没 manifest"。
+  ⚠️ `_settle_status` 不能用 `_transition`（后者 `_check_cancel`，finally 里抛会顶掉收尾）；
+  记进 manifest 的状态取 `stopped or final`（取消/暂停恰好落在收尾窗口时以库为准）。
 
 ## 状态机（最容易出事的一块）
 `pending→running→extracting→downloading→success/partial/failed`，可 `paused`/`cancelled`。

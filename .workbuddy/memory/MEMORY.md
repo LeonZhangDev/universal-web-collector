@@ -30,6 +30,8 @@ downloaders/base.py           会话/重试/抖动/429；连接池(CHUNK/超时�
 downloaders/ratelimit.py      站点级**令牌桶**+并发闸门+AIMD；⚠️吞吐由间隔决定
 main.py                       lifespan 里跑 recover_orphans；install_exception_handlers
 tests/test_cancel_guard.py    AST 门禁：try 内有取消源却没 `except TaskCancelled: raise` → 红
+tests/isolation.py            共享磁盘状态隔离清单（唯一入口）+ session 守卫真实目录指纹
+tests/test_isolation.py       7 项：隔离机制本身失效即红（含连接单例/守卫比对）
 ```
 
 ## ⚠️ 健壮性四条（V27，都踩在"静默"上）

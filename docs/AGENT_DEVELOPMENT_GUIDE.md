@@ -1704,4 +1704,33 @@ backend/downloaders/video.py        补 except TaskCancelled(门禁抓到的真�
 backend/main.py                     install_exception_handlers / lifespan
 tests/test_cancel_guard.py          新: 取消穿透 AST 门禁
 tests/test_robustness.py            新 23 项
+tests/isolation.py                  新: 共享磁盘状态隔离清单(唯一入口)
+tests/test_isolation.py             新 7 项: 隔离机制本身失效即红
 ```
+
+### 9.5 共享状态显式化：DB 与下载目录隔离（V27 收尾）
+
+PITFALLS「跨边界耦合」类坑的根因从来不是逻辑错，而是**两个用例隔着磁盘互相说话**。
+上一轮只隔离了 CDN 画像（`UWC_CDN_PROFILE`），DB 与下载目录这一轮补上 —— 它比画像
+危险得多，因为里面装的是**用户的真实任务记录**：一个忘了加夹具的新用例调一次
+`db.create_task`，用户的任务列表里就多出一条假记录，界面上看不出是谁写的。
+
+是怎么堵住的，以及为什么不能只靠夹具：
+
+1. **根因 1 — 模块级常量**：`core.database.DB_PATH`、`core.task_manager.DOWNLOADS_DIR`
+   是导入时就从 `settings` 拷出来的常量。`monkeypatch.setattr(settings, ...)` **打不到**
+   它们 —— 夹具改了 settings，测试仍在写真库。所以 `isolation.py` 的 `MODULE_TARGETS`
+   直接 `setattr` 到模块上。
+2. **根因 2 — 连接单例**：`_conn` 一旦建过就永远指向那个文件，光改 `DB_PATH` 没用，
+   后面所有写操作仍落旧库，症状是"打印 DB_PATH 正确、数据却进了上一个用例的库"。
+   → 换库同时 `setattr(db, "_conn", None)` 复位。
+3. **机制而非自觉**：`tests/isolation.py` 是**唯一登记入口**。新增一处共享状态，只改
+   这一个文件；漏登记也不再静默 —— 一道 session 级守卫 `_no_writes_to_real_dirs`
+   在整轮前后给真实目录拍指纹（size/mtime），变了就红，并提示"去 isolation.py 登记"。
+4. **守卫本身也要可证伪**：`tests/test_isolation.py` 里 `test_changed_keys_detects_writes` /
+   `test_new_task_lands_in_temp_db_not_the_users` 等 7 项，保证"失效就红"而不是"看起来在隔离"。
+   验证过：故意往真实 `downloads/` 写一个文件，pytest 立即变红；拆掉 conftest 的隔离，
+   全量测试也立即变红。
+
+⚠️ 这套只覆盖"运行期攒状态、测试会读"的模块。将来新模块若在导入时把别的配置也拷成常量，
+必须同步加进 `MODULE_TARGETS`，否则隔离对它失效而测试照样绿 —— 这正是守卫要兜住的漏登记。

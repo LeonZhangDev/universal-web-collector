@@ -15,6 +15,7 @@ from core.filters import Filters, probe_size
 from core.imageinfo import fmt_dimensions, image_dimensions
 from core.manifest import manifest_enabled, write_manifest, write_sidecar
 from core.naming import build_context, render, safe_relative
+from downloaders import ratelimit
 from downloaders.file import FileDownloader
 from downloaders.image import ImageDownloader
 from downloaders.text import TextDownloader
@@ -22,6 +23,22 @@ from downloaders.video import VideoDownloader
 from . import database as db
 
 DOWNLOADS_DIR = settings.download_dir
+
+
+def _eta(count, url):
+    """按当前站点节奏粗估"至少"要多久。
+
+    只是下界: 传输时间、重试、冷却都不算在内。写出来是为了让用户一眼看出
+    "300 个资源 × 0.5s 间隔 = 至少 2 分半", 而不是盯着进度条猜是不是卡了。
+    """
+    try:
+        lim = ratelimit._limiter(ratelimit.site_key(url))
+        secs = count * lim.interval
+    except Exception:
+        return "未知"
+    if secs < 60:
+        return f"{secs:.0f}s"
+    return f"{secs / 60:.1f} 分钟"
 
 # 删除任务时, 等 worker 收拾现场的上限(秒)。取消只置标志位, worker 需要时间
 # 退出; 但 HTTP 请求不能因为一个卡死的 worker 一直挂着, 所以给个上限。
@@ -668,6 +685,17 @@ class TaskManager:
 
             self._transition(task_id, TaskStatus.EXTRACTING, TaskStatus.DOWNLOADING)
             self._safe_log(task_id, f"output dir: {self._out_dir(task_id)}")
+            # 让"上限 2 req/s"这类阈值**看得见**。看不见的阈值会被反复误调 ——
+            # 用户以为把并发调大就会更快, 而真正顶住吞吐的是请求间隔。
+            pacing = ratelimit.describe(url)
+            if pacing:
+                self._safe_log(task_id, f"站点节奏: {pacing}")
+            if resources:
+                self._safe_log(
+                    task_id,
+                    f"待下载 {len(resources)} 个资源, 按当前节奏预计至少 "
+                    f"{_eta(len(resources), url)}",
+                )
             self._download_all(task_id, url)
 
             self._check_cancel(task_id)
@@ -869,11 +897,19 @@ class TaskManager:
             meta = {k: v for k, v in meta.items() if v}
             existing = db.find_by_hash(sha)
             owned = True
+            # 感知比对只在**任务内**进行, 所以字节级命中别的任务时, 下面那次解码
+            # 一定比不出任何东西 —— 白 spawn 一次 ffmpeg。跨任务命中就跳过它。
+            perceptual_worthwhile = True
             if existing and existing["local_path"] != str(path):
                 Path(path).unlink(missing_ok=True)
                 final_path = existing["local_path"]
                 # 复用别的任务的文件: 不能因为本任务的新规则去删它
                 owned = False
+                # ⚠️ sqlite3.Row 没有 .get(); 直接用会抛 AttributeError, 而这个
+                # 位置在 try 里 —— 异常会被当成"下载失败", 报得离真相很远
+                keys = existing.keys() if hasattr(existing, "keys") else ()
+                if "task_id" in keys and existing["task_id"] != task_id:
+                    perceptual_worthwhile = False
                 db.update_resource(rid, status="done", hash=sha, local_path=final_path, **meta)
                 self._safe_log(task_id, f"dedup {r['url']} -> {final_path}")
             else:
@@ -909,7 +945,8 @@ class TaskManager:
             # 而图集站上这正是最常见的重复形态。**只标记不删除** —— 指纹会误判,
             # 删文件是不可逆的, 出错的代价由用户承担(见 core/phash.py 三条约束)。
             # 放在尺寸终检**之后**: 被判为广告的图已经删了, 不必再为它解码一次。
-            if filters.dedup_perceptual and (r["type"] or "").lower() == "image":
+            if (filters.dedup_perceptual and perceptual_worthwhile
+                    and (r["type"] or "").lower() == "image"):
                 self._mark_perceptual_dup(
                     task_id, rid, final_path, r["url"], filters.dedup_threshold
                 )

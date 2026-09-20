@@ -387,6 +387,33 @@ def check_site(site):
         )
         if not ok:
             problems.append(f"gid_shape={shape!r} 无法匹配任何样本的期望 gid")
+
+    # 序号格式与候选位数也要检: 这两项写错的表现是"每张都判 MISSING -> 0 资源
+    # -> failed", 而用户只看到失败。`seq_format` 少写一位零就是一个字符的事。
+    for name in ("image", "video"):
+        mtype = None
+        try:
+            mtype = site.media(name)
+        except Exception:
+            mtype = None
+        if mtype is None:
+            continue
+        try:
+            rendered = mtype.seq_format.format(seq=7)
+        except Exception as e:
+            problems.append(f"{name}.seq_format={mtype.seq_format!r} 无法渲染: {e}")
+            continue
+        if "7" not in rendered:
+            problems.append(
+                f"{name}.seq_format={mtype.seq_format!r} 渲染成 {rendered!r}, 不含序号本身"
+            )
+        digits = getattr(site, "base_candidate_digits", None)
+        if digits is not None:
+            try:
+                if int(digits) < 1:
+                    problems.append(f"base_candidate_digits={digits!r} 必须 >= 1")
+            except (TypeError, ValueError):
+                problems.append(f"base_candidate_digits={digits!r} 不是整数")
     return problems
 
 
@@ -538,6 +565,24 @@ def _pause(min_s, max_s):
         time.sleep(random.uniform(lo, hi))
     elif lo:
         time.sleep(lo)
+
+
+def _sample_points(start, end, n):
+    """枚举快路径的抽样点: 首、尾 + 均匀内点。
+
+    ⚠️ **首尾必测**。"数量错一个"和"起点错一位"是最常见的两种不一致, 只抽中间
+    点会同时放过这两类错误 —— 而这两类错误都是"整批资源全错", 不是"少几张"。
+    """
+    if end <= start:
+        return [start]
+    n = max(2, min(int(n or 2), end - start + 1))
+    if n == 2:
+        return [start, end]
+    step = (end - start) / (n - 1)
+    pts = {start, end}
+    for i in range(1, n - 1):
+        pts.add(int(round(start + step * i)))
+    return sorted(pts)
 
 
 def _ext_of_url(url, default=".jpg"):
@@ -832,7 +877,8 @@ def _empty_hint(site, gid, medias, meta):
 def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX,
              miss_stop=DEFAULT_MISS_STOP, session=None, proxy=None,
              min_interval=None, max_interval=None, log=None,
-             media="image", album=None, hint_url=None, page_hints=None, diag=None):
+             media="image", album=None, hint_url=None, page_hints=None, diag=None,
+             declared_count=None):
     """枚举图集资源, 逐个 yield 结果字典。
 
     yield::
@@ -855,6 +901,20 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
                 写在了 URL 里, 是最硬的一份证据。
     page_hints  相册页 HTML 里出现的资源直链。页面自己写着真实 CDN 前缀, 所以
                 这份线索比候选探测可靠得多(而且能发现候选清单里没有的新子路径)。
+    declared_count
+                相册页**自报**的数量。给了它就可以走快路径(见下)。
+
+    为什么需要快路径
+    ----------------
+    逐张探测是 O(N) 次 HEAD, 而每次之间还要停顿 —— 300 张图约 90 秒**纯等待**,
+    传输时间反而只占 5%。页面既然把数量写在了 HTML 里, 就没有必要再一个个去问。
+
+    但它本质上是"用抽样推断全体", 所以必须守住两条:
+      ① **抽样校验** —— 首尾 + 均匀内点全过才敢跳过逐张探测; 任一不中立刻退回
+         逐张扫描(最坏情况只是多花几次抽样探测, 不会采错)。
+      ② **上界来自站点**而非猜 —— 页面没给数量时默认**不去**指数探上界, 因为
+         二分假定序号连续, 中间缺一张就会把上界定在缺口之前(**静默截断**)。
+         要启用见 config.enumeration_search 的说明。
     """
     mtype = site.media(media)
     if mtype is None:
@@ -900,6 +960,77 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
         except Exception:
             return mtype.seq_format.format(seq=n)
 
+    def _beat():
+        _pause(min_interval, max_interval)
+
+    def _probe_seq(n, variant=None):
+        """探一个序号, 判定与主循环一致(缺画质档时回退最高画质档)。"""
+        use = variant or default_variant
+        u = mtype.url_for(site, gid, n, use, base=resolved_base, seq_format=fmt)
+        st, sz, ct = probe(sess, u, ctype_prefix=mtype.ctype_prefix,
+                           accept=mtype.accept)
+        if st == PROBE_MISSING and use != top_variant:
+            fb = mtype.url_for(site, gid, n, top_variant, base=resolved_base,
+                               seq_format=fmt)
+            st2, sz2, ct2 = probe(sess, fb, ctype_prefix=mtype.ctype_prefix,
+                                  accept=mtype.accept)
+            if st2 == PROBE_OK:
+                return st2, sz2, ct2, top_variant, fb
+        return st, sz, ct, use, u
+
+    def _search_upper():
+        """指数探上界 + 二分定位末尾。⚠️ 假定序号连续(见 config.enumeration_search)。"""
+        last_ok = start
+        step = 1
+        while True:
+            n = last_ok + step
+            if n >= start + limit:
+                n = start + limit - 1
+                if n <= last_ok:
+                    return last_ok
+                st, _s, _c, _v, _u = _probe_seq(n)
+                _beat()
+                return n if st == PROBE_OK else last_ok
+            st, _s, _c, _v, _u = _probe_seq(n)
+            _beat()
+            if st == PROBE_OK:
+                last_ok, step = n, step * 2
+                continue
+            lo, hi = last_ok, n          # 已知 lo 存在、hi 不存在, 二分收窄
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                st2, _s2, _c2, _v2, _u2 = _probe_seq(mid)
+                _beat()
+                if st2 == PROBE_OK:
+                    lo = mid
+                else:
+                    hi = mid
+            return lo
+
+    def _yield_range(end, mode, sampled):
+        """按校验过的上界一次性给出整段(跳过逐张探测)。"""
+        if diag is not None:
+            diag["enumeration"] = {
+                "media": media, "mode": mode, "end": end, "sampled": sampled,
+            }
+        for n in range(start, end + 1):
+            u = mtype.url_for(site, gid, n, default_variant, base=resolved_base,
+                              seq_format=fmt)
+            others = [mtype.variants[i] for i in mtype.mirror_order(default_variant)]
+            tag = _quality_tag(mtype, default_variant)
+            yield {
+                "seq": n,
+                "type": mtype.name,
+                "url": u,
+                "mirrors": [mtype.url_for(site, gid, n, v, base=resolved_base,
+                                          seq_format=fmt) for v in others],
+                # 只有第一张探过, 其余体积交给下载层。大小过滤会自己补一次 HEAD
+                # (见 task_manager 的体积预检), 所以这里不额外发请求
+                "size": size if n == start else None,
+                "filename": f"{group}/{seq_name(n)}{tag}"
+                            f"{_ext_of_url(u, mtype.default_ext)}",
+            }
+
     try:
         miss_run = 0
         seq = start
@@ -922,6 +1053,41 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
                     state, size, ctype = probe(sess, main,
                                                ctype_prefix=mtype.ctype_prefix,
                                                accept=mtype.accept)
+
+            # ---- 快路径: 有可信上界时, 用抽样校验替代逐张探测 ----
+            if state == PROBE_OK and seq == start:
+                end, mode = None, None
+                if settings.enumeration_fast and declared_count:
+                    try:
+                        n_decl = int(declared_count)
+                    except (TypeError, ValueError):
+                        n_decl = 0
+                    if n_decl > 0:
+                        end = min(start + n_decl - 1, start + limit - 1)
+                        mode = "declared"
+                if end is None and settings.enumeration_search:
+                    end, mode = _search_upper(), "search"
+                if end and end > start:
+                    # 第一张已在本次循环里探过, 不重复探
+                    pts = [p for p in _sample_points(
+                        start, end, settings.enumeration_samples) if p != start]
+                    bad = None
+                    for p in pts:
+                        st_p, _sz, _ct, _v, _u = _probe_seq(p)
+                        _beat()
+                        if st_p != PROBE_OK:
+                            bad = p
+                            break
+                    if bad is None:
+                        if log:
+                            log(f"[{mtype.name}] 快路径({mode}): 抽样 "
+                                f"{len(pts) + 1}/{end - start + 1} 张全部命中, "
+                                f"跳过逐张探测")
+                        yield from _yield_range(end, mode, len(pts) + 1)
+                        return
+                    if log:
+                        log(f"[{mtype.name}] 快路径({mode}) 在 seq {bad} 未命中, "
+                            f"退回逐张探测")
 
             if state == PROBE_MISSING and use != top_variant:
                 # 该档位不存在 != 这张图不存在
@@ -1214,10 +1380,14 @@ class SequenceGallerySpider:
         # 相册页里引用的图片地址 = 页面自报的真实 CDN 前缀, 优先级仅次于用户直链
         page_hints = (meta or {}).get("resource_urls")
         for name in medias:
+            # 页面自报数量 -> 让 discover 走快路径(抽样校验替代逐张 HEAD)
+            declared = ((meta or {}).get("photos") if name == "image"
+                        else (meta or {}).get("videos_declared"))
             for it in discover(site, gid, quality=quality, media=name,
                                album=group, log=log, max_count=max_count,
                                hint_url=url, page_hints=page_hints,
-                               proxy=opts.get("proxy"), diag=diag):
+                               proxy=opts.get("proxy"), diag=diag,
+                               declared_count=declared):
                 items.append({
                     "type": it["type"],
                     "url": it["url"],

@@ -435,7 +435,14 @@ def probe_size(url, headers=None, timeout=None):
             proxies = {"http": settings.proxy, "https": settings.proxy}
         else:
             proxies = None
-        resp = requests.head(
+        # ⚠️ 走共享会话, 别用裸 requests.head(): 后者每次新建连接, TCP+TLS 握手
+        # 重来一遍 —— N 个资源就是 N 次握手, 而探测本身就是为了省请求。
+        # 惰性导入: core 层不该在**导入期**依赖 downloaders, 但连接池只有那一份。
+        try:
+            from downloaders.base import SESSION as _shared
+        except Exception:
+            _shared = requests
+        resp = _shared.head(
             url,
             headers=h,
             timeout=timeout or settings.request_timeout,

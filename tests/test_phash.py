@@ -355,3 +355,37 @@ def test_task_phashes_skips_unfinished_and_self(tmp_db):
     got = db.task_phashes(t)
     assert got == [(done, "00000000000000ff")], "未完成/失败的资源不参与比对"
     assert db.task_phashes(t, exclude_id=done) == []
+
+
+def test_cross_task_byte_dedup_skips_the_decode(tmp_db, tmp_path, monkeypatch):
+    """sha256 已命中**别的任务**时不再解码。
+
+    感知比对只在任务内进行, 这种情形下那次 ffmpeg 一定比不出任何东西 ——
+    300 张图就是 300 次白白的进程创建, 且都占着下载 worker。
+    """
+    monkeypatch.setattr(tm, "DOWNLOADS_DIR", tmp_path / "dl")
+    monkeypatch.setattr(tm, "DOWNLOADERS", {})
+    calls = []
+    monkeypatch.setattr(phash, "dhash", lambda p, *a, **k: calls.append(p) or None)
+
+    shared = tmp_path / "shared.png"
+    shared.write_bytes(b"fake-bytes")
+    other = db.create_task("https://fake/other", "fake", None, {})
+    db.add_resource(other, "image", "https://x/same.png", "{}", filename="same.png",
+                    status="done", local_path=str(shared), hash_value="a" * 64)
+
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    tid = db.create_task("https://fake/album", "fake", None, {})
+    db.update_task_status(tid, tm.TaskStatus.DOWNLOADING)
+    out_dir = tmp_path / "dl" / str(tid)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        rid = db.add_resource(tid, "image", "https://x/same.png", "{}",
+                              filename="same.png")
+        tm.DOWNLOADERS["image"] = lambda: FakeImageDownloader(
+            shared, "same.png", "a" * 64)
+        mgr._download_one(tid, db.get_resource(rid), None, out_dir, Filters({}))
+        assert db.get_resource(rid)["status"] == "done"
+        assert calls == [], "跨任务复用不该再解码一次"
+    finally:
+        mgr.shutdown(wait=True)

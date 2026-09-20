@@ -34,6 +34,10 @@ class Config:
     image_retries: int = 3
     video_retries: int = 3
     request_timeout: int = 30
+    # 下载专用: 拆成 (连接, 读取) 两个超时。单值会同时约束两者 —— 连接要快失败,
+    # 而读取大文件/慢链路需要长得多, 用 30s 卡读取会把大视频中途掐断。
+    connect_timeout: float = 10.0
+    read_timeout: float = 120.0
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -43,15 +47,38 @@ class Config:
     watchdog_interval: int = 30
     # 限速与代理
     domain_concurrency: int = 3
+    # 起始(也是固定模式下的)请求间隔。启用自适应后会被 AIMD 在下面两个界之间调整。
     domain_min_interval: float = 0.5
     # 请求间隔随机区间: max > min 时在区间内随机取值, 否则固定用 min。
     # 相册采集建议 3~10 秒, 模拟人工浏览节奏。
     domain_max_interval: float = 0.0
+    # ---- 自适应节流(AIMD) ----
+    # 只减不增的话, 站点被限过一次就永久卡在最慢档, 只能人工改配置恢复。
+    # 所以"增"这一半必须有: 连续成功后缓慢收紧间隔, 出问题立即翻倍放宽。
+    adaptive_throttle: bool = True
+    # 增速能达到的最快间隔(地板)。别设太小 —— 提速省下的时间远不够赔一次封禁。
+    domain_fast_interval: float = 0.1
+    # 减速能到的最慢间隔(天花板), 防止单次抖动把节奏拖到不可用时。
+    domain_slow_interval: float = 5.0
+    # 令牌桶容量: 允许短簇突发。⚠️ 它**不改变长程平均速率**, 只是在攒下来的配额里
+    # 花 —— 让"刚下完一个大文件"这类空档后面的几个请求不必干等。
+    domain_burst: int = 3
     # 主 URL 失败后是否自动切换到备用下载点(mirrors)
     mirror_fallback: bool = True
     # 枚举探测(HEAD)的间隔: 探测是轻量请求, 不必套用下载级的慢速节奏。
     # 实测该站 0.2~0.3s 一次 HEAD 连续 60 次不会被限流。
     probe_interval: float = 0.3
+    # ---- 枚举快路径 ----
+    # 相册页给出了数量时, 用**抽样校验过的区间**替代逐张探测:
+    # 300 张图从 300 次 HEAD(~90s 纯等待)降到 ~8 次。
+    enumeration_fast: bool = True
+    # 快路径的抽样点数(含首尾)。抽样全过才敢跳过逐张探测。
+    enumeration_samples: int = 6
+    # ⚠️ 页面没给数量时是否用「指数探上界 + 二分」自己找边界。
+    # 默认**关**: 它假定序号连续, 而"中间恰好缺一张"会让二分把上界定在缺口之前
+    # —— 结果是 300 张只采到 4 张的**静默截断**, 比慢更糟。打开前先确认目标站点
+    # 序号确实连续。
+    enumeration_search: bool = False
     # m3u8 分片下载: 分片是同一段视频的连续片段, 不能套用图片的慢速节奏
     # (否则 100 片 x 6.5s ≈ 11 分钟)。但仍保留节流, 避免被 WAF 判为异常。
     segment_concurrency: int = 4

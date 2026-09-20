@@ -24,7 +24,8 @@ collectors/album_meta.py      相册页元信息（headless）+ CF 熔断/登录
 collectors/hls.py             m3u8 健全性校验/过期感知/体积估算
 collectors/scores.py          识别分数阶梯（单独模块，防循环依赖）
 collectors/xchina/aggregate.py 聚合页采集器（模特/系列/索引，委派给 gallery/video）
-downloaders/base.py           会话/重试/抖动/429；ratelimit.py 站点级并发+间隔+冷却
+downloaders/base.py           会话/重试/抖动/429；连接池(CHUNK/超时元组/响应必关)
+downloaders/ratelimit.py      站点级**令牌桶**+并发闸门+AIMD；⚠️吞吐由间隔决定
 ```
 
 ## 状态机（最容易出事的一块）
@@ -49,6 +50,21 @@ downloaders/base.py           会话/重试/抖动/429；ratelimit.py 站点级�
 - ⚠️⚠️ **`FilterIn` 必须声明全部键 + `extra="allow"`**：pydantic 默认**忽略未知字段**，
   曾导致前端的 `min_width/min_height/exclude_ad/min_image_bytes` 被静默丢弃 ——
   **界面开关按了没反应，无报错无日志**。凡"模型转发给只读自己认识的键的组件"都要这样做。
+
+## 速度：⚠️ 吞吐由**间隔**决定，不由并发决定
+`domain_concurrency` 只管"同时在飞几个"，调大**不提速**；站点的长程上限 =
+`1 / domain_min_interval`。想提速要动间隔（或让 AIMD 自己收紧）。
+- 令牌桶 `domain_burst`：放大容量 = 平均速率不变、允许花掉攒下来的配额（同样的
+  礼貌、更少的干等）。**不是**提速手段。
+- AIMD：连续 8 次成功收紧一档（地板 `domain_fast_interval`），失败/429 立即翻倍
+  放宽（天花板 `domain_slow_interval`）并清零计数 —— **补上了"只减不增"的缺口**。
+- ⚠️ **不看响应延迟**（Scrapy AutoThrottle 那套在此帮倒忙）：CDN 边缘缓存与 429
+  都毫秒级返回，会被当成"服务器很闲"。只按成功与否判定。
+- ⚠️ 只有传输层/服务端失败才计入放宽；Content-Type 不合是这条 URL 的问题。
+- 任务日志会打「站点节奏 …→ 长程约 N req/s」+ 预计耗时（看不见的阈值会被反复误调）。
+- **枚举快路径**：页面给了数量 → 抽样校验（点必含首尾）后跳过逐张探测。
+  真站实测 117→**6** 次探测、61.7s→**2.6s**，资源数与逐张扫描一致。
+  L1（指数+二分）默认**关**：二分假定序号连续，中间缺一张就是静默截断。
 
 ## 去重两层（都不删用户的文件）
 | 层 | 判据 | 命中后 | 默认 |

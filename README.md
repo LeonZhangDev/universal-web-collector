@@ -316,7 +316,7 @@ python scripts/selfcheck.py --reset-profile
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (458 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检)
+make test           # pytest (477 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -451,8 +451,13 @@ URL → Browser(4解析器: API>Network>JS>DOM) → Resource → Downloader(并�
   - **降级原因可见**: 所有降级路径都往日志写人话(还要回答"接下来会怎样")
   - 被拦 ≠ 登录态失效: 只有**带着登录态**被拒才把账记到登录态头上
 - 输出目录: 支持任务级自定义目录, 文件服务按任务目录做越权校验
-- 下载限速: 站点级并发 + 请求间隔(支持随机区间, 如 3~10 秒模拟人工节奏);
-  支持 HTTP/SOCKS5 代理。并发与间隔是两个**正交**闸门, 互不影响
+- 下载限速: 站点级**令牌桶**(突发容量 `domain_burst`, 长程平均速率不变)+ 并发闸门
+  + 请求间隔(支持随机区间, 如 3~10 秒模拟人工节奏); AIMD 自适应: 连续成功缓慢收紧
+  间隔, 429/非 2xx 立即翻倍放宽(`adaptive_throttle`)。支持 HTTP/SOCKS5 代理
+  - ⚠️ **吞吐由间隔决定, 不由并发决定**。并发只管"同时在飞几个", 调大它不提速
+- 枚举快路径: 页面给了数量时用**抽样校验过的区间**替代逐张探测
+  (`enumeration_fast`)。真站实测 114 张: 探测 **117 → 6 次**, 耗时 **61.7s → 2.6s**,
+  资源数与逐张扫描完全一致。抽样不中即退回逐张扫描
 - m3u8 视频双引擎 (`video_engine`): auto 优先 ffmpeg 拉流、失败降级内置器 /
   ffmpeg 强制且不降级 / builtin 强制内置分片器
   - ffmpeg: 一步 `-c copy` 输出 .mp4(也能处理 AES-128 加密流)

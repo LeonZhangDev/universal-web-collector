@@ -9,9 +9,19 @@ import requests
 
 from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
-from .ratelimit import domain_slot, note_rate_limited
+from .ratelimit import describe, domain_slot, note_failure, note_rate_limited, note_success
 
-CHUNK = 64 * 1024
+#: 流式写入的分块。64KB 在大文件上要跑几千次 Python 层循环, 256KB 是纯收益。
+CHUNK = 256 * 1024
+
+
+def _timeout():
+    """超时拆成 (连接, 读取) 元组。
+
+    ⚠️ 单个数值会**同时**作用于连接和读取: 连接要快失败(10s 足够判断网络不通),
+    而读取大文件/慢链路需要长得多。用 30s 卡读取, 大视频会被中途掐断。
+    """
+    return (settings.connect_timeout, settings.read_timeout)
 
 
 class RateLimited(Exception):
@@ -50,7 +60,27 @@ def _retry_after(resp, default):
     return default
 
 
-SESSION = requests.Session()
+def _build_session():
+    """共享会话: 连接池按并发数定, 且池满时**等待**而非建了又丢。
+
+    urllib3 默认 `pool_maxsize=10`。并发超过它时, 默认行为是开新连接、用完丢弃,
+    同时打 "Connection pool is full, discarding connection" —— 池化收益全丢,
+    还白付一次 TCP+TLS 握手。`pool_block=True` 让它排队等空闲连接, 才是真池化。
+    """
+    sess = requests.Session()
+    size = max(10, int(settings.domain_concurrency) * 2)
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=size,
+        pool_maxsize=size,
+        pool_block=True,
+        max_retries=0,      # 重试由本项目自己管(抖动/429/冷却), 别叠两层
+    )
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+SESSION = _build_session()
 if settings.proxy:
     SESSION.proxies.update({"http": settings.proxy, "https": settings.proxy})
 
@@ -101,37 +131,45 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
 
             with domain_slot(url):
                 resp = sess.get(url, headers=req_headers, stream=True,
-                                timeout=settings.request_timeout)
-            if resp.status_code == 416:
-                fill_info(info, url, None)
-                return sha256_file(path), None
-            if resp.status_code == 429:
-                # 站点明确要求减速: 按它说的等, 而不是套普通退避
-                raise RateLimited(_retry_after(resp, float(settings.image_retries) * 5))
-            resp.raise_for_status()
+                                timeout=_timeout())
+            # ⚠️ 必须保证关闭: 416/429/内容校验这几条**提前退出**的路径都没读过响应体,
+            # 连接不会被自动归还。配合 pool_block=True 就是"泄漏到池满 → 永久阻塞",
+            # 症状是任务卡死而非报错。读完的路径 close() 是幂等的。
+            try:
+                if resp.status_code == 416:
+                    fill_info(info, url, None)
+                    return sha256_file(path), None
+                if resp.status_code == 429:
+                    # 站点明确要求减速: 按它说的等, 而不是套普通退避
+                    raise RateLimited(_retry_after(resp, float(settings.image_retries) * 5))
+                resp.raise_for_status()
 
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            if require_image and not ctype.startswith("image/"):
-                raise ValueError(
-                    f"not an image (Content-Type: {ctype or 'unknown'})"
-                )
-            if reject_ct and ctype.startswith(reject_ct):
-                raise ValueError(
-                    f"rejected Content-Type: {ctype} (疑似错误页而非媒体文件)"
-                )
-            fill_info(info, url, ctype or None)
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if require_image and not ctype.startswith("image/"):
+                    raise ValueError(
+                        f"not an image (Content-Type: {ctype or 'unknown'})"
+                    )
+                if reject_ct and ctype.startswith(reject_ct):
+                    raise ValueError(
+                        f"rejected Content-Type: {ctype} (疑似错误页而非媒体文件)"
+                    )
+                fill_info(info, url, ctype or None)
 
-            mode = "ab" if offset and resp.status_code == 206 else "wb"
-            h = hashlib.sha256()
-            if mode == "ab":
-                h.update(path.read_bytes())
-            with open(path, mode) as f:
-                for chunk in resp.iter_content(CHUNK):
-                    if chunk:
-                        f.write(chunk)
-                        h.update(chunk)
-                        if progress_cb:
-                            progress_cb()
+                mode = "ab" if offset and resp.status_code == 206 else "wb"
+                h = hashlib.sha256()
+                if mode == "ab":
+                    h.update(path.read_bytes())
+                with open(path, mode) as f:
+                    for chunk in resp.iter_content(CHUNK):
+                        if chunk:
+                            f.write(chunk)
+                            h.update(chunk)
+                            if progress_cb:
+                                progress_cb()
+            finally:
+                resp.close()
+            # 只有"2xx + 内容合规"才算一次真成功, 才计入 AIMD 增速
+            note_success(url)
             return h.hexdigest(), (ctype or None)
         except TaskCancelled:
             # 用户点了"停止": 这不是一次失败。按普通失败处理会退避重睡一轮,
@@ -150,6 +188,11 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             last_err = e
             if attempt == retries:
                 raise
+            # ⚠️ 只有"传输层/服务端"失败才算站点吃不消。内容校验失败
+            # (Content-Type 不对)是这条 URL 自身的问题, 拿它去放宽节奏会白白
+            # 拖慢整个相册 —— 把"URL 不对"误当成"站点限流"是最常见的误判。
+            if isinstance(e, requests.RequestException):
+                note_failure(url)
             # 指数退避 + 抖动: 纯指数会让一批并发失败的请求在同一时刻集体重试
             # (重试风暴, 把站点/WAF 瞬间打爆)。乘一个 0.6~1.4 的随机因子错开它们。
             backoff = min(2 ** attempt, 8)

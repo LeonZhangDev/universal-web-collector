@@ -34,6 +34,14 @@ class FakeResp:
     def iter_content(self, _chunk):
         yield self._body
 
+    def close(self):
+        """真 requests.Response 有它; 下载层在 finally 里调用。
+
+        不加的话 AttributeError 会在 finally 里**覆盖掉原异常**, 重试循环被莫名
+        多跑几轮 —— 表现为"pop from empty list"这种和真正原因毫不相干的报错。
+        """
+        self.closed = True
+
 
 class FakeSession:
     def __init__(self, script):

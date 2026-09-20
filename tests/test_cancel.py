@@ -56,6 +56,10 @@ def _serve(monkeypatch, chunks=8):
         def raise_for_status(self):
             pass
 
+        def close(self):
+            """真 requests.Response 有它; 下载层在 finally 里调用。"""
+            self.closed = True
+
         def iter_content(self, size):
             for _ in range(chunks):
                 yield b"x" * size
@@ -112,6 +116,9 @@ def test_ordinary_error_still_retries(tmp_path, monkeypatch):
 
         def raise_for_status(self):
             pass
+
+        def close(self):
+            self.closed = True
 
         def iter_content(self, size):
             attempts.append(1)

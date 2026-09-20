@@ -227,8 +227,19 @@ Playwright storage_state 加载/保存, cookies+localStorage,
 
 - 单域名并发上限 domain_concurrency(默认3)
 - 单域名最小请求间隔 domain_min_interval(默认0.5s)
+- **令牌桶**: `domain_burst`(默认3)是突发容量 —— 长程平均速率不变, 只是允许
+  把攒下来的配额一次花掉(下完一个大文件后的空档不必干等)
+- **AIMD 自适应**: `adaptive_throttle` 开时, 间隔在 `domain_fast_interval`~
+  `domain_slow_interval` 之间浮动: 连续成功缓慢收紧、429/非 2xx 立即翻倍放宽。
+  ⚠️ **只按成功与否判定, 不看响应延迟** —— CDN 边缘缓存和 429 都能毫秒级返回,
+  拿延迟当"服务器很闲"的信号会越错越快
 - 代理: config.yaml proxy 或环境变量 UWC_PROXY
   (http/socks5, requests 与 Playwright 均走代理)
+
+⚠️ **吞吐由间隔决定, 不由并发决定**: 并发只管"同时在飞几个"。想提速要动
+`domain_min_interval`(或让 AIMD 自己收紧), 调大 `domain_concurrency` 不提速。
+任务日志会打一行「站点节奏: 并发 3 / 间隔 0.50s / 突发 3 → 长程约 2.0 req/s」
+并给出预计耗时 —— 看不见的阈值会被反复误调。
 
 
 ## 4. 任务健壮性
@@ -1506,3 +1517,115 @@ frontend/src/components/TaskDetail.vue  疑似重复标记(清单 + 资源网格
 frontend/src/style.css               .dup-hint
 ```
 
+
+## 8. V26 — 下载速度优化（令牌桶 / 自适应节流 / 枚举快路径 / 连接池）
+
+起因：按实际代码逐段测算 300 张图的耗时，结论反直觉 —— **真正传数据只占 5%，
+其余 95% 都在等**。所以这一轮不是"把并发调大"，而是把等待本身拆掉。
+
+### 8.1 ⚠️ 最重要的诊断：吞吐由间隔决定，不由并发决定
+
+旧实现在每个请求前持锁按 `_last + gap` 排队 —— 这正是**容量=1 的退化令牌桶**：
+长程平均速率被限死的同时，连一点突发都不允许。于是 `domain_concurrency` 调多大
+都不提速（用户最常问的一句"我把并发调到 16 怎么还是这么慢"）。
+
+修法不是降 `domain_min_interval`（那是用礼貌性换速度），而是放大桶的容量：
+**平均速率不变，只是允许把攒下来的配额一次花掉**。同样的礼貌、更少的干等。
+
+### 8.2 AIMD：补上"只减不增"的缺口
+
+冷却原本是**单向阀** —— 429 之后间隔会放宽，但到期后只回到配置值，没有"增"
+那一半。站点被限过一次就永久卡在最慢档，只能人工改配置恢复。
+
+- 加性增：连续成功 `_AI_EVERY`(8) 次收紧一档，地板 `domain_fast_interval`
+- 乘性减：任一失败/被限立即翻倍放宽，天花板 `domain_slow_interval`，并清零计数
+- ⚠️ **不看响应延迟**（Scrapy AutoThrottle 的默认套路在本项目是帮倒忙）：
+  CDN 边缘缓存亚毫秒返回 → 判定"服务器很闲"→ 疯狂加速；429 同样毫秒级返回 →
+  被当成健康。本项目两个条件都命中，所以**只按成功与否判定**。
+- ⚠️ 只有"传输层/服务端"失败才计入放宽；Content-Type 不合预期是这条 URL 的问题，
+  拿它去拖慢整个相册是把"URL 不对"误判成"站点限流"。
+
+### 8.3 枚举快路径：抽样校验过的区间替代逐张探测
+
+三级阶梯：**L0** 页面自报数量 → 直接取 N，抽样校验后跳过逐张探测；
+**L1** 指数探上界 + 二分（**默认关**）；**L2** 线性扫描兜底（原行为）。
+
+⚠️ **L1 默认关是刻意的**：二分假定序号连续，中间恰好缺一张就会把上界定在缺口
+之前 —— 那是"300 张只采到 4 张"的**静默截断**，比慢得多更糟。要开先确认站点
+序号确实连续（`enumeration_search`）。
+
+⚠️ 快路径的本质是"用抽样推断全体"，所以抽样点**必须包含首尾**：数量错一个、
+起点错一位是最常见的两种不一致，只抽中间点会同时放过它们。任一不中即退回逐张
+扫描 —— 最坏情况只是多花几次探测，不会采错。
+
+真站实测（`69ad45698f836`，同一相册各跑一遍）：
+
+| | 资源数 | 探测次数 | 耗时 |
+|---|---|---|---|
+| 逐张扫描 | 114 | 117 | 61.7s |
+| 快路径 | **114（完全一致）** | **6** | **2.6s** |
+
+### 8.4 连接池与传输
+
+- `SESSION` 挂 `HTTPAdapter(pool_maxsize = max(10, 并发×2), pool_block=True)`：
+  默认 `pool_maxsize=10` 且池满时**建了又丢**，池化收益全丢还白付握手
+- ⚠️ `pool_block=True` 有个前提：响应**必须关闭**。416/429/内容校验这些提前退出
+  的路径都没读过响应体，连接不会自动归还；泄漏到池满就是永久阻塞（卡死而非报错）。
+  已用 `try/finally: resp.close()` 兜住。
+- `filters.probe_size` 改用共享 `SESSION.head`：裸 `requests.head` 每次新建连接，
+  N 个资源就是 N 次 TCP+TLS 握手 —— 而探测本身就是为了省请求
+- `CHUNK` 64KB → 256KB；超时拆成 `(connect 10, read 120)` 元组，单值会同时约束
+  两者，把大视频的读取掐断
+
+### 8.5 感知去重降开销 + 自检扩字段
+
+- sha256 命中**别的任务**时不再解码：感知比对只在任务内进行，那次 ffmpeg 一定
+  比不出东西，300 张图就是 300 次白白创建进程且占着下载 worker
+- `check_site` 纳入 `seq_format` / `base_candidate_digits`：这两项写错的表现是
+  "每张都判 MISSING → 0 资源 → failed"，而用户只看到失败（V22 的根因）
+- 任务日志新增「站点节奏 …→ 长程约 N req/s」与预计耗时
+
+### 8.6 踩坑记录
+
+1. ⚠️⚠️ **可重入死锁**：`DomainLimiter` 的 `interval` / `rate` 属性各自取锁，
+   而 `_wait_token` / `describe` 持锁后调用它们 —— 普通 `Lock` 不可重入，
+   **当场死锁**，表现为"调了一次就整个进程卡住"，从堆栈完全看不出所以然。
+   修法：锁内**就地计算**，并把锁换成 `RLock` 兜底（可重入只掩盖问题，不解决）。
+2. ⚠️ **`sqlite3.Row` 没有 `.get()`**：误用会抛 AttributeError，而这个位置在
+   `try` 里 —— 异常被当成"下载失败"，报得离真相很远（测试里表现为
+   `assert 'failed' == 'filtered'`）。
+3. ⚠️ **`finally` 里的异常会覆盖原异常**：给响应加 `close()` 时，测试替身没有该
+   方法 → AttributeError 在 `finally` 中抛出，掩盖了真实原因，重试循环继续跑，
+   最终报成"pop from empty list"这种毫不相干的错。替身应当**模拟真实对象的完整
+   契约**。
+4. ⚠️ **写测试期望值前先确认数据形态**：序号是 5 位补零，`"/0030.jpg" in url`
+   永远匹配不上，于是"中间缺一张"的场景根本没生效，断言却在别处先红。
+
+### 8.7 验证
+
+- `pytest` → **477 用例**（新增 `test_ratelimit` 9 项令牌桶/AIMD、
+  `test_enum_fast` 9 项、`test_phash` 1 项）
+- `verify_output` 33 / `verify_hls` 18 / `selfcheck` / `vite build` 全过
+- 真站对比：探测 117 → 6，耗时 61.7s → 2.6s，资源数一致
+
+### 8.8 新增/改动的文件清单（本轮）
+
+```
+backend/downloaders/ratelimit.py    DomainLimiter 令牌桶 + AIMD + describe()
+                                    note_success / note_failure
+backend/downloaders/base.py         连接池(HTTPAdapter) / CHUNK / 超时元组 /
+                                    try-finally 关闭响应 / 成功失败信号
+backend/core/config.py              domain_burst / adaptive_throttle /
+                                    fast|slow_interval / enumeration_* /
+                                    connect|read_timeout
+backend/core/filters.py             probe_size 走共享 SESSION
+backend/collectors/gallery_base.py  discover 快路径(declared_count) /
+                                    _sample_points / _search_upper /
+                                    check_site 扩 seq_format
+backend/core/task_manager.py        跨任务字节命中跳过 dHash / 节奏与 ETA 日志
+tests/test_ratelimit.py             +9
+tests/test_enum_fast.py             新 9 项
+tests/test_phash.py                 +1
+tests/test_cancel.py                替身补 close()
+tests/test_http_guard.py            替身补 close()
+```

@@ -190,6 +190,13 @@ class VideoDownloader:
                     log(f"ffmpeg 拉流完成: {path.name}")
                 fill_info(info, leaf, "video/mp4")
                 return path, sha256_file(path)
+            except TaskCancelled:
+                # ⚠️ 用户点了停止。这不是"ffmpeg 拉流失败" —— 落到下面的
+                # `except Exception` 里会被当成一次普通失败, 于是在 engine=auto
+                # 下**降级到内置分片下载**, 继续去下一个已经被叫停的视频。
+                # 用户的体感就是"点了停止没反应, 它还在下"。
+                path.unlink(missing_ok=True)
+                raise
             except Exception as e:
                 path.unlink(missing_ok=True)
                 if engine == "ffmpeg":

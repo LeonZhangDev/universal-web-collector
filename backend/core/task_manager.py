@@ -1,6 +1,8 @@
 import inspect
 import json
+import logging
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -11,16 +13,21 @@ from collectors import get_collector
 from core import events
 from core.cancel import TaskCancelled  # noqa: F401  (下载层要识别它, 在这里重导出)
 from core.config import settings
+from core.disk import ensure_free
+from core.errors import CollectorError, DiskFullError, describe
 from core.filters import Filters, probe_size
 from core.imageinfo import fmt_dimensions, image_dimensions
 from core.manifest import manifest_enabled, write_manifest, write_sidecar
 from core.naming import build_context, render, safe_relative
 from downloaders import ratelimit
+from downloaders.base import discard_partial
 from downloaders.file import FileDownloader
 from downloaders.image import ImageDownloader
 from downloaders.text import TextDownloader
 from downloaders.video import VideoDownloader
 from . import database as db
+
+logger = logging.getLogger("uwc")
 
 DOWNLOADS_DIR = settings.download_dir
 
@@ -150,6 +157,48 @@ def _owned_by_any_manager(task_id):
     with _LIVE_LOCK:
         managers = list(_LIVE_MANAGERS)
     return any(m._entry(task_id) is not None for m in managers)
+
+
+def recover_orphans(stale_timeout=None):
+    """启动补偿: 把"上次那个进程没活到收尾"的活动任务复位成可操作状态。
+
+    ⚠️ 为什么必须有这一步: worker 和看门狗都活在进程内存里。后端重启/崩溃后,
+    库里 `running`/`extracting`/`downloading` 的任务**没有任何 worker 持有**,
+    看门狗也随旧进程一起没了 —— 它们会永远停在"运行中", 进度条一动不动,
+    用户既看不到报错也没法继续, 只能手动删掉。这是最像"程序坏了"的一类问题。
+
+    ⚠️ 判活必须看库里的 `tasks.hb`, 与看门狗用同一把尺子。只按状态扫会把
+    **另一个进程正在跑**的任务一并误伤(那个任务的 worker 好端端在下着),
+    这就是"症状在状态机、根因在别处"的翻版。
+
+    ⚠️ 复位成 paused 还是 failed, 取决于**资源清单落地了没有**:
+      * 有清单 -> paused, 点「继续」能从断点接着下, 已下好的不浪费;
+      * 没清单 -> failed, 因为续跑一个空清单只会得到"成功但 0 资源",
+        那比报错难查得多。日志里直接告诉用户改点「重试」。
+    """
+    stale = stale_timeout if stale_timeout is not None else settings.stale_task_timeout
+    now = time.time()
+    recovered = []
+    for t in db.list_active_tasks():
+        tid = t["id"]
+        if _owned_by_any_manager(tid):
+            continue
+        hb = t["hb"]
+        if hb and now - float(hb) <= stale:
+            # 心跳新鲜: 别的进程/实例正在跑它, 别碰
+            continue
+        if db.get_resources(tid):
+            db.transition_task_from_any(tid, TaskStatus.PAUSED, ACTIVE_STATES)
+            db.update_task(tid, error="上次进程中断, 已复位为暂停")
+            db.add_log(tid, "启动补偿: 检测到上次进程中断, 已复位为「暂停」,"
+                            " 点「继续」可从断点接着下", "warn")
+        else:
+            db.transition_task_from_any(tid, TaskStatus.FAILED, ACTIVE_STATES)
+            db.update_task(tid, error="上次进程中断于资源发现阶段, 请重试该任务")
+            db.add_log(tid, "启动补偿: 上次进程中断时还没采到任何资源, 无清单可续,"
+                            " 已标记失败 —— 请改用「重试」重新采集", "error")
+        recovered.append(tid)
+    return recovered
 
 
 class TaskManager:
@@ -605,6 +654,13 @@ class TaskManager:
                 # 续跑: 不重新采集, 直接下载被暂停打断时标回 pending 的未完成资源。
                 # 已 done 的文件原样保留, 只补下缺失的那部分 —— 这是 pause/resume
                 # 相对于 cancel+retry 的核心价值(后者会全量重下)。
+                if not db.get_resources(task_id):
+                    # 续跑一个空清单会走到"0 个资源 -> 全成功 -> success", 也就是
+                    # "什么也没下到"和"全部下好了"长得一模一样。宁可直接报错。
+                    raise ValueError(
+                        "续跑失败: 上次没有留下任何资源清单(中断发生在资源发现阶段),"
+                        " 请改用「重试」重新采集"
+                    )
                 self._set_progress(task_id, 20)
                 self._transition(task_id, TaskStatus.RUNNING, TaskStatus.DOWNLOADING)
                 self._safe_log(task_id, f"resume output dir: {self._out_dir(task_id)}")
@@ -750,6 +806,17 @@ class TaskManager:
                 # "这条要显眼一点"(如"有 3 个子页面没展开")。只收一个参数的话,
                 # 那行日志会在**采集全部做完之后**抛 TypeError 把整个任务搞崩 ——
                 # 明明资源都发现了, 用户却看到 failed。宁可丢掉等级也不能丢任务。
+                #
+                # ⚠️ 采集阶段也要能被叫停: 逐张枚举几百个序号要跑十几分钟, 而取消
+                # 检查点原本只装在下载循环里 —— 用户点了"停止", 界面已经变灰,
+                # 后台却还在把剩下的序号一个个探完。log 是采集器在枚举循环里唯一
+                # 稳定调用的东西, 借它当检查点最及时。
+                #
+                # ⚠️ 只在"当前没有异常正在传播"时才检查: 采集器常常在 `except`
+                # 块里调 log 报告错误, 那时抛 TaskCancelled 会把真正的原因顶掉
+                # —— 又是"报错离真相很远"那一类。
+                if sys.exc_info()[0] is None:
+                    self._check_cancel(task_id)
                 self._safe_log(task_id, m, level)
                 now = time.time()
                 if now - beat[0] >= 5:
@@ -781,9 +848,12 @@ class TaskManager:
         counter = [0]
         counter_lock = threading.Lock()
 
+        # 环境级失败(如磁盘满)的广播通道: 一个资源撞上, 同批剩下的直接跳过,
+        # 而不是各自走完重试链 —— 那样几百个资源就是长时间空转。
+        abort = threading.Event()
         futures = [
             self._download_executor.submit(
-                self._download_one, task_id, r, referer, out_dir, filters
+                self._download_one, task_id, r, referer, out_dir, filters, abort
             )
             for r in resources
         ]
@@ -793,6 +863,12 @@ class TaskManager:
             with counter_lock:
                 counter[0] += 1
                 self._set_progress(task_id, 20 + int(80 * counter[0] / total))
+
+        if abort.is_set():
+            # 把"为什么只下了一部分"写进任务本身 —— 否则用户看到 partial 却
+            # 没有任何解释, 只会以为程序下漏了。
+            db.update_task(task_id, error="磁盘空间不足, 部分资源未下载(清理后可继续)")
+            self._safe_log(task_id, "磁盘空间不足: 已停止剩余资源的下载", "error")
 
         stat = self._resource_stat(task_id)
         self._safe_log(
@@ -821,17 +897,29 @@ class TaskManager:
         stat = self._resource_stat(task_id)
         done = stat.get("done", 0)
         failed = stat.get("failed", 0)
+        # ⚠️ 一个资源都没有却走到这里 = 这次运行什么也没产出。空集在"全部成功"
+        # 的判定下会被算成 success, 于是"什么也没下到"与"全部下好了"在界面上
+        # 长得一模一样。正常路径已在采集后判空抛错, 这里兜住其余入口。
+        if not stat:
+            return TaskStatus.FAILED
         if failed and not done:
             return TaskStatus.FAILED
         if failed:
             return TaskStatus.PARTIAL
         return TaskStatus.SUCCESS
 
-    def _download_one(self, task_id, r, referer, out_dir, filters=None):
+    def _download_one(self, task_id, r, referer, out_dir, filters=None, abort=None):
         rid = r["id"]
         filters = filters or Filters()
         if self._cancelled(task_id):
             db.update_resource(rid, status="skipped")
+            self._publish_resource(task_id, rid, "skipped")
+            return
+        if abort and abort.is_set():
+            # 同批里已经有资源撞上环境级失败(磁盘满): 剩下的注定一样, 直接跳过。
+            # ⚠️ 不标 failed —— 它们没有失败, 只是没轮到; 标成 failed 会让
+            # "一个盘满"看起来像"几百个资源都坏了"。
+            db.update_resource(rid, status="skipped", note="磁盘空间不足, 未下载")
             self._publish_resource(task_id, rid, "skipped")
             return
         self._heartbeat(task_id)
@@ -876,6 +964,9 @@ class TaskManager:
                     self._publish_resource(task_id, rid, "filtered")
                     self._safe_log(task_id, f"filtered {r['url']}: {reason}")
                     return
+
+            # 磁盘水位: 满盘之后再下就是纯空转(每个资源都要走完一整条重试链)
+            ensure_free(out_dir)
 
             db.update_resource(rid, status="downloading")
             self._publish_resource(task_id, rid, "downloading")
@@ -961,10 +1052,32 @@ class TaskManager:
             db.update_resource(rid, status="skipped")
             self._publish_resource(task_id, rid, "skipped")
             self._safe_log(task_id, f"skip (not implemented): {r['url']}")
+        except DiskFullError as e:
+            # 环境级失败: 剩下的资源注定也写不进去, 让同批其它 worker 直接跳过。
+            # ⚠️ 不标 cancelled —— 已经下好的文件是真实成果, 终态交给
+            # _final_status 判成 partial/failed。
+            if abort:
+                abort.set()
+            # 残片在满盘时只是占位, 清掉还给磁盘一点空间
+            self._discard_partial(out_dir, r)
+            db.update_resource(rid, status="failed", note=str(e))
+            self._publish_resource(task_id, rid, "failed")
+            self._safe_log(task_id, str(e), "error")
+        except CollectorError as e:
+            # 外部世界的问题(站点/URL/环境): 消息本身就是写给用户看的,
+            # 不打堆栈 —— 堆栈会把"接下来怎么办"挤到屏幕外。
+            db.update_resource(rid, status="failed", note=str(e)[:500])
+            self._publish_resource(task_id, rid, "failed")
+            self._safe_log(task_id, f"{r['url']}: {e}", "error")
         except Exception as e:
             db.update_resource(rid, status="failed")
             self._publish_resource(task_id, rid, "failed")
-            self._safe_log(task_id, f"fail {r['url']}: {e}", "error")
+            self._safe_log(task_id, f"fail {r['url']}: {describe(e)}", "error")
+            # ⚠️ 走到这里说明**分类之外**: 不是站点的问题, 也不是环境的问题,
+            # 那就是我们的 bug。只在日志里留堆栈, 界面上仍是一句人话 ——
+            # 没有这一段, 这类 bug 会表现成"某个资源莫名失败", 复盘时无从下手。
+            logger.debug("unclassified failure on %s\n%s", r["url"],
+                         traceback.format_exc())
 
     def _mark_perceptual_dup(self, task_id, rid, path, url, threshold):
         """算 dHash, 并在**本任务内**找出最接近的一张, 只做标记。
@@ -1040,11 +1153,10 @@ class TaskManager:
         name = TaskManager._row_field(r, "filename")
         if not name:
             return
-        for p in (Path(out_dir) / name,):
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # ⚠️ 半成品现在落在 `<name>.part`(见 downloaders/base.py 原子落盘),
+        # 中断时目标位置反而是干净的 —— 所以必须连同 .part 一起清, 否则用户
+        # 目录里会留下一堆 xxx.jpg.part, 下次续传还会接着这些残片继续写。
+        discard_partial(Path(out_dir) / name)
 
     def _transition(self, task_id, expected, new):
         self._check_cancel(task_id)

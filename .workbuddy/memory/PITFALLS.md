@@ -242,6 +242,37 @@ ffmpeg 解成 9x8 灰度 → 64 位 dHash，**零新增依赖**。
 4. ⚠️ **写测试期望值前先确认数据形态**：序号是 5 位补零，`"/0030.jpg" in url` 永远
    匹配不上 —— 场景没生效，断言却在别处先红，很容易误判成实现有问题。
 
+## 健壮性一轮（本轮新增：`errors.py` / `disk.py` / 原子写 / 孤儿恢复 / 门禁）
+
+1. ⚠️⚠️ **PITFALLS 写得再全也没人会在加 `try` 之前读一遍** —— 所以真正的护栏是
+   **`tests/test_cancel_guard.py` 的 AST 门禁**：凡 `try` 块内有取消源调用却没写
+   `except TaskCancelled: raise`，pytest 直接红。首次运行就抓到 `video.py` 的真违规
+   （取消被当成 ffmpeg 失败 → 降级继续下一个**已被叫停**的视频）。
+   **新增下载/采集调用时要同步更新 `CANCEL_SOURCES`**，否则门禁静默失效。
+2. ⚠️ **重启后任务永远卡在"运行中"**：库里 `running/extracting/downloading` 的任务
+   没有任何 manager 持有，看门狗只在活着的实例里跑。→ `recover_orphans()` 挂在
+   **`lifespan`** 上；放模块级的话 `import main` 就会扫库改状态（导入产生写副作用）。
+3. ⚠️ **WAL 不等于并发写**：`sqlite3.connect` 默认 `timeout=5` 但项目里没设，且
+   WAL 只解决读写并发，写-写仍单写者 → `database is locked` 落在业务 `try` 里被
+   当成"资源下载失败"。→ `busy_timeout` + `_retry_write`（只对 locked/busy 重试、
+   有上限）。**非锁错误不重试** —— 重试只是把真 bug 藏起来。
+4. ⚠️⚠️ **非原子写 + 续传不校验 = 最难查的一类坏文件**：直接写最终路径，中断留
+   半成品被当成成果；无条件 `open(path,"ab")` 续传，残片来自另一个 URL 也能拼出
+   "文件在、大小对、内容是坏的"，而 sha256 算的是**坏的全文**，全部校验都会放行。
+   → `.part` + `os.replace`；`.part.src` 记来源 URL（不匹配即丢弃重下）；落盘比对
+   字节数（**有 `Content-Encoding` 时不比**，那是压缩后的长度）。
+5. ⚠️ **磁盘满会走完整重试链空转**：几百个资源 × 完整退避，用户只看到一堆
+   `No space left on device`。→ 预检 + 捕获即置 `abort` 让同批 worker 跳过。
+   ⚠️ 不标 `cancelled` —— 已下好的文件是真实成果，终态交 `_final_status`。
+6. ⚠️ **`finally`/`except` 里调回调时抛异常会顶掉真因**：采集器常在 `except` 块里
+   `log(msg)` 报告错误，而 `crawl_log` 又是取消检查点 → 会把"基址全 MISSING"变成
+   "任务已取消"。→ 只在 `sys.exc_info()[0] is None` 时检查取消。
+7. ⚠️ **`monkeypatch.setattr(module, "open", ...)` 需要 `raising=False`**：`open` 是
+   内置函数，模块里本来没这个属性。设进模块全局即可生效（模块全局优先于 builtins）。
+8. ⚠️ **`"wb" + "x"` = `wbx` 不是合法模式**：独占新建写作 `"xb"`。
+9. ⚠️ **把启动副作用放进模块级, 会让"导入"变成"写入"**：任何 `import main`
+   （测试/脚本/文档工具）都会执行。挂 `lifespan`。
+
 ## 接入新站点
 
 新建 `collectors/<site>/spider.py` → `@register("<name>")` → 在 `collectors/__init__.py` import

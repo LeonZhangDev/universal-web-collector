@@ -1,4 +1,7 @@
+import errno
 import hashlib
+import json
+import os
 import random
 import re
 import time
@@ -9,10 +12,136 @@ import requests
 
 from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
+from core.errors import DiskFullError
 from .ratelimit import describe, domain_slot, note_failure, note_rate_limited, note_success
 
 #: 流式写入的分块。64KB 在大文件上要跑几千次 Python 层循环, 256KB 是纯收益。
 CHUNK = 256 * 1024
+
+
+# ---- 原子落盘: 先写 .part, 成功后原子改名 ----
+#
+# ⚠️ 直接写目标路径的话, 中断(取消/崩溃/断电/超时)会在**最终位置**留下一个半截
+# 文件。它会以"已下载"的身份参与去重、manifest 和进度统计; 更糟的是断点续传会
+# **接着这个半截文件继续写** —— 如果那半截来自另一个 URL(换过下载点/画质档)
+# 或本身就是坏的, 拼出来的是一个内容错误但长度正确的文件, 而 sha256 是把"坏的
+# 完整文件"算出来的, 于是它一路绿灯通过所有校验。这类问题没有报错、没有日志,
+# 只能在用户打开文件时才被发现。
+#
+# 写 .part + os.replace 之后, 半成品永远只存在于最终位置之外。
+
+
+def _part_path(path):
+    return path.with_name(path.name + ".part")
+
+
+def _part_src(path):
+    """.part 的来源记录: 记下这批字节是哪个 URL 写的。
+
+    续传的唯一凭据 —— 光比对长度挡不住"两个不同文件拼在一起恰好等长"。
+    """
+    return path.with_name(path.name + ".partsrc")
+
+
+def _read_src(sidecar):
+    try:
+        return json.loads(sidecar.read_text(encoding="utf-8")).get("url")
+    except Exception:
+        # 读不出来(没有/损坏)就当"来源不明", 结果是丢弃重下 —— 安全方向
+        return None
+
+
+def _write_src(sidecar, url):
+    try:
+        sidecar.write_text(json.dumps({"url": url}, ensure_ascii=False),
+                           encoding="utf-8")
+    except OSError:
+        pass  # 记不下来就记不下来: 最坏结果是下次从头重下, 不会下出坏文件
+
+
+def _prepare_resume(path, url):
+    """把"上次留下的内容"搬到 .part, 返回可以接着写的字节数(0 = 从头下)。"""
+    part = _part_path(path)
+    src = _part_src(path)
+    if part.exists():
+        if _read_src(src) == url:
+            return part.stat().st_size
+        # ⚠️ 残留是另一个 URL 写的: 接着它续就是在拼接两个不同的文件。
+        part.unlink(missing_ok=True)
+        src.unlink(missing_ok=True)
+        return 0
+    if path.exists() and path.stat().st_size > 0:
+        # 已存在的完整文件: 当作"半成品"搬进 .part, 让 416 分支(服务器说范围
+        # 越界 = 本地这份已完整)把它原样换回去。rename 是原子的, 中断也不丢内容。
+        path.rename(part)
+        _write_src(src, url)
+        return part.stat().st_size
+    return 0
+
+
+def _commit_part(path):
+    """.part -> 最终文件。os.replace 在同一分区内是原子的。"""
+    part = _part_path(path)
+    if not part.exists():
+        return
+    os.replace(part, path)
+    _part_src(path).unlink(missing_ok=True)
+
+
+def _hdr(resp, name):
+    """取响应头; 拿不到或不是字符串(测试替身常给 Mock)一律当不存在。
+
+    ⚠️ 不做这个 isinstance 检查的话, `re.match(模式, Mock对象)` 会抛 TypeError,
+    而它发生在下载路径的 try 里 —— 又被当成"这个资源下载失败"。
+    """
+    try:
+        v = resp.headers.get(name)
+    except Exception:
+        return ""
+    return v if isinstance(v, str) else ""
+
+
+def discard_partial(path):
+    """清理某个最终路径对应的全部残留: 最终文件 + .part + 来源记录。
+
+    用在取消/中止时。⚠️ 只删最终文件是不够的 —— 中断时内容在 .part 里,
+    目标位置反而是干净的; 漏删 .part 会在用户目录里留下一堆 `xxx.jpg.part`,
+    而且下次续传会接着这些残片继续写。
+    """
+    p = Path(path)
+    for f in (p, _part_path(p), _part_src(p)):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _expected_size(resp, offset):
+    """从响应头推出"落盘后应该是多少字节"。认不出返回 None(不校验)。"""
+    # ⚠️ 有 Content-Encoding 时 Content-Length 是**压缩后**的长度, 拿它比对
+    # 解压后的字节数必然误判。宁可不校验, 也别把好文件判成坏的。
+    if (_hdr(resp, "Content-Encoding") or "identity").lower() != "identity":
+        return None
+    m = re.match(r"bytes\s+\d+-\d+/(\d+)", _hdr(resp, "Content-Range").strip())
+    if m:
+        return int(m.group(1))
+    if not offset:
+        cl = _hdr(resp, "Content-Length").strip()
+        if cl.isdigit():
+            return int(cl)
+    return None
+
+
+def _write_chunk(f, chunk):
+    try:
+        f.write(chunk)
+    except OSError as e:
+        if e.errno == errno.ENOSPC:
+            raise DiskFullError(
+                "磁盘空间不足, 已停止下载。请清理目标磁盘后重试"
+                " —— 已下好的文件会保留, 续跑不会重复下载它们。"
+            )
+        raise
 
 
 def _timeout():
@@ -124,9 +253,8 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
     for attempt in range(1, retries + 1):
         try:
             req_headers = dict(headers)
-            offset = 0
-            if resume and path.exists() and path.stat().st_size > 0:
-                offset = path.stat().st_size
+            offset = _prepare_resume(path, url) if resume else 0
+            if offset:
                 req_headers["Range"] = f"bytes={offset}-"
 
             with domain_slot(url):
@@ -137,6 +265,8 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             # 症状是任务卡死而非报错。读完的路径 close() 是幂等的。
             try:
                 if resp.status_code == 416:
+                    # 服务器说"你要的范围越界了" = 本地这份已经是完整的
+                    _commit_part(path)
                     fill_info(info, url, None)
                     return sha256_file(path), None
                 if resp.status_code == 429:
@@ -155,17 +285,42 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                     )
                 fill_info(info, url, ctype or None)
 
+                part = _part_path(path)
                 mode = "ab" if offset and resp.status_code == 206 else "wb"
+                if mode == "wb":
+                    part.unlink(missing_ok=True)
+                    _part_src(path).unlink(missing_ok=True)
                 h = hashlib.sha256()
                 if mode == "ab":
-                    h.update(path.read_bytes())
-                with open(path, mode) as f:
+                    h.update(part.read_bytes())
+                total = _expected_size(resp, offset)
+                # ⚠️ 新建时用**独占**模式("x"): 两个任务采到同一张图会落到同一个
+                # .part, 两份字节交错写入的结果是"两边都报成功, 文件却是坏的",
+                # 而且没有任何报错。宁可让后到的一方失败并说明原因。
+                # 续传("ab")不在此列 —— 那时 .part 的来源已被校验过是本 URL 的。
+                # "x" 本身就是"独占新建 + 写入", 不能与 "w" 组合("wbx" 非法)
+                flags = "ab" if mode == "ab" else "xb"
+                try:
+                    handle = open(part, flags)
+                except FileExistsError:
+                    raise FileExistsError(
+                        f"另一处正在下载同一个文件({part.name});"
+                        f" 为避免两份字节交错写坏, 本次放弃"
+                    )
+                with handle:
                     for chunk in resp.iter_content(CHUNK):
                         if chunk:
-                            f.write(chunk)
+                            _write_chunk(handle, chunk)
                             h.update(chunk)
                             if progress_cb:
                                 progress_cb()
+                # ⚠️ 长度不符就丢弃重来: 否则这个坏文件会以"成功"的身份落盘,
+                # 之后去重/manifest/预览全都建立在错误的字节上, 且毫无报错。
+                got = part.stat().st_size
+                if total is not None and got != total:
+                    part.unlink(missing_ok=True)
+                    raise OSError(f"下载不完整: 得到 {got} 字节, 应为 {total} 字节")
+                _commit_part(path)
             finally:
                 resp.close()
             # 只有"2xx + 内容合规"才算一次真成功, 才计入 AIMD 增速

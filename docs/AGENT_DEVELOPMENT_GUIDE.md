@@ -1629,3 +1629,79 @@ tests/test_phash.py                 +1
 tests/test_cancel.py                替身补 close()
 tests/test_http_guard.py            替身补 close()
 ```
+
+
+## 9. V27 — 健壮性（从"记得别踩"到"忘了就红"）
+
+起因：把后端一万行按失效模式扫了一遍，结论不是"又发现几个坑"，而是——
+**已有的 30 多个坑都靠人记才不踩**。PITFALLS.md 写得再全，也不会有人在下一次
+加 `try` 之前先去读一遍。所以这一轮一半在补缺口，一半在把缺口变成门禁。
+
+### 9.1 P0：四个"用户一定会遇到、且看起来像程序坏了"的缺口
+
+1. **孤儿任务**：后端重启后，库里 `running/extracting/downloading` 的任务没有任何
+   manager 持有，看门狗只在活着的实例里跑 —— 它们**永远停在"运行中"，进度条不动**。
+   → `recover_orphans()`：扫心跳超时的活动任务，有资源清单的复位成 `paused`
+   （已下好的文件还能接着用），没有清单的判 `failed` 并给出"重试"提示
+   （续跑一个空清单只会得到"成功但 0 资源"）。
+   ⚠️ 挂在 `lifespan` 上而**不是模块导入时**：放模块级的话，任何人 `import main`
+   都会去扫库改状态 —— 一个"只读地导入一下"的动作产生写副作用。
+2. **SQLite 零锁处理**：`sqlite3.connect` 没有 `timeout`、没有 `busy_timeout`、
+   没有任何 `OperationalError` 重试。WAL 只解决读写并发，**写-写仍单写者**，
+   多个 worker 同时写心跳/日志/资源状态撞上就是 `database is locked` ——
+   而它落在业务 `try` 里会被当成"这个资源下载失败"，任务莫名 failed。
+   → `DB_TIMEOUT` / `busy_timeout` + `_retry_write()` 带退避，**只对 locked/busy
+   重试**（语法错误重试只是把真 bug 藏起来），且有上限（一直撞锁要变成可诊断错误）。
+3. **非原子写**：直接写最终路径 → 中断留半成品，被去重/manifest/预览当成成果；
+   更隐蔽的是**续传不校验**：无条件 `open(path,"ab")` 接着写，残片若来自另一个
+   URL 或本身就是坏的，产出坏文件，而 sha256 把"坏的全文"算得毫无破绽 ——
+   **文件在、大小对、内容是坏的**，最难查的一类。
+   → 写 `.part` + `os.replace` 原子改名；`.part.src` 记下来源 URL，不匹配即
+   丢弃重下；落盘后比对实际字节数与声明大小（有 `Content-Encoding` 时不比，
+   那是压缩后的长度）。
+4. **磁盘满**：`ENOSPC` 会走完整重试链空转几百次。
+   → 任务前 `ensure_free()` 预检；下载中捕获即置 `abort` 事件让同批 worker 直接
+   跳过，终态交 `_final_status` 判 partial/failed（已下好的文件是真实成果）。
+
+### 9.2 P1/P2：把"记得加"变成机器门禁
+
+| 机制 | 落点 | 挡住的坑 |
+|---|---|---|
+| **静态门禁** `tests/test_cancel_guard.py` | AST 扫核心模块：凡 `try` 块内有取消源调用，前面必须有 `except TaskCancelled: raise`，漏了 pytest 红 | 85 处 `except Exception` 对 8 处取消捕获 —— 漏一处就是"点了停止没反应" |
+| **异常分类** `core/errors.py` | `CollectorError`（给用户看、不打堆栈）/ `TransientError`（重试）/ 未分类 → 记 traceback | 报错离真相很远（`Row.get()` 那次） |
+| **全局异常处理器** | `install_exception_handlers(app)` → 统一 `{detail, type}`，堆栈只进服务端日志 | 默认 500 的结构随部署方式变化，且可能带堆栈片段 |
+| **日志裁剪** | 每任务保留 `LOG_KEEP_PER_TASK` 条，超出删最旧 | 长期运行数据库单调膨胀 |
+| **采集取消检查点** | 借 `crawl_log` 检查取消 | 逐张枚举几十分钟，点了停止界面变灰后台还在跑 |
+| **同路径独占写** | 新建用 `xb`，冲突即报错退出 | 两个任务写同一 `.part`，字节交错且双方都报成功 |
+
+⚠️ 门禁第一次跑就**抓到一个真违规**：`video.py` 的 ffmpeg 拉流被 `except Exception`
+包着 —— 取消会被当成"ffmpeg 失败"，进而**降级到内置分片下载，继续下一个已被叫停的
+视频**。这种"取消后还在干活"的 bug 靠读代码很难发现，靠 AST 扫一遍就有了。
+
+⚠️ 采集取消检查点有两处细节：`crawl_log` 必须收第二个可选参数（采集器用
+`log(msg,"warn")`），且**只在没有异常正在传播时才检查取消** —— 采集器常在 `except`
+块里调 log 报告错误，那时抛 TaskCancelled 会把真因顶掉。
+
+### 9.3 验证
+
+- `pytest` → **502 用例**（新增 `test_robustness` 23 项、`test_cancel_guard` 门禁）
+- `verify_output` 33 / `verify_hls` 18 / `selfcheck` / `vite build` 全过
+- 真实下载冒烟：`.part` 与 `.part.src` 落盘后均已清理，二次下载 sha 一致
+
+### 9.4 新增/改动的文件清单（本轮）
+
+```
+backend/core/errors.py              新: CollectorError / TransientError /
+                                    DiskFullError / is_retryable / describe
+backend/core/disk.py                新: ensure_free / free_bytes
+backend/core/database.py            DB_TIMEOUT / busy_timeout / _retry_write /
+                                    日志裁剪(LOG_KEEP_PER_TASK)
+backend/core/task_manager.py        recover_orphans / 磁盘预检与 abort /
+                                    crawl_log 取消检查点 / 异常分类消费
+backend/downloaders/base.py         .part 原子写 / _prepare_resume 来源校验 /
+                                    长度校验 / ENOSPC → DiskFullError / xb 独占
+backend/downloaders/video.py        补 except TaskCancelled(门禁抓到的真违规)
+backend/main.py                     install_exception_handlers / lifespan
+tests/test_cancel_guard.py          新: 取消穿透 AST 门禁
+tests/test_robustness.py            新 23 项
+```

@@ -14,6 +14,8 @@ api/tasks.py              HTTP+SSE（create/preview/resolve/watch/manifest/archi
 core/task_manager.py      状态机/线程池/看门狗/资源重试/暂停续/任务名推断
 core/database.py          SQLite(WAL) → data/collector.db（加列必须写进 _MIGRATIONS）
 core/filters.py           "有效资源"唯一定义 = match_resource()；dedup_perceptual/阈值
+core/errors.py            异常分类：CollectorError(给用户)/TransientError(重试)/未分类记堆栈
+core/disk.py              ensure_free 磁盘预检（查不出剩余空间就放行）
 core/imageinfo.py         文件头读尺寸（纯 Python 零依赖）
 core/phash.py             dHash 感知指纹（ffmpeg 解码，零新依赖）——**只标记不删除**
 core/cdn_profile.py       站点 CDN 画像（基址/序号格式命中统计，给探测排序）
@@ -26,7 +28,20 @@ collectors/scores.py          识别分数阶梯（单独模块，防循环依�
 collectors/xchina/aggregate.py 聚合页采集器（模特/系列/索引，委派给 gallery/video）
 downloaders/base.py           会话/重试/抖动/429；连接池(CHUNK/超时元组/响应必关)
 downloaders/ratelimit.py      站点级**令牌桶**+并发闸门+AIMD；⚠️吞吐由间隔决定
+main.py                       lifespan 里跑 recover_orphans；install_exception_handlers
+tests/test_cancel_guard.py    AST 门禁：try 内有取消源却没 `except TaskCancelled: raise` → 红
 ```
+
+## ⚠️ 健壮性四条（V27，都踩在"静默"上）
+- **原子落盘**：写 `.part` + `os.replace`；`.part.src` 记来源 URL（不匹配即丢弃重下）；
+  落盘比对字节数（**有 `Content-Encoding` 时不比**）。否则"文件在、大小对、内容是坏的"，
+  而 sha256 算的是坏的全文 —— 全部校验都会放行。
+- **孤儿恢复**：重启后心跳超时的活动任务由 `recover_orphans()`（挂在 **lifespan**）复位：
+  有清单 → `paused` 可续；无清单 → `failed` + 提示重试。⚠️ 不要放模块级：`import main`
+  就会扫库改状态。
+- **SQLite 写重试**：WAL 只解决读写并发，**写-写仍单写者**；`locked` 落在业务 try 里会被
+  当成"资源下载失败"。`busy_timeout` + `_retry_write`（只对 locked/busy、有上限）。
+- **磁盘满**：预检 + 捕获即 `abort` 中止整任务；⚠️ 不标 cancelled（已下好的是真实成果）。
 
 ## 状态机（最容易出事的一块）
 `pending→running→extracting→downloading→success/partial/failed`，可 `paused`/`cancelled`。

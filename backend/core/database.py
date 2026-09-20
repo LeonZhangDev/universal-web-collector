@@ -1,4 +1,6 @@
 import json
+import os
+import random
 import sqlite3
 import threading
 import time
@@ -8,6 +10,21 @@ from pathlib import Path
 from core.config import settings
 
 DB_PATH = settings.db_path
+
+# ---- 并发写保护 ----
+# ⚠️ WAL 只解决了"读不阻塞写", **写-写仍然是单写者**。多个实例/进程共用一个
+#    SQLite 文件时会撞 "database is locked"; 而这个异常一旦落在业务 try 里,
+#    就会被当成"这个资源下载失败", 报错离真相极远 —— 表现为任务莫名其妙
+#    failed, 日志里只有一堆 locked。所以:
+#      ① 连接给足等待时间(默认 5s 太短, 大事务期间必撞);
+#      ② 真撞上了只对 locked/busy 退避重试, 其它异常一律照原样往上抛
+#         —— 把 SQL 语法错误也重试一遍只会掩盖真正的 bug。
+DB_TIMEOUT = float(os.getenv("UWC_DB_TIMEOUT", "30"))
+DB_WRITE_RETRIES = int(os.getenv("UWC_DB_WRITE_RETRIES", "5"))
+
+# 每个任务保留的日志条数(0 = 不裁剪)与"每写几条检查一次"
+LOG_KEEP_PER_TASK = int(os.getenv("UWC_LOG_KEEP", "2000"))
+LOG_TRIM_EVERY = int(os.getenv("UWC_LOG_TRIM_EVERY", "50"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks(
@@ -122,9 +139,11 @@ def get_conn():
     global _conn
     if _conn is None:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT,
+                                check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute(f"PRAGMA busy_timeout={int(DB_TIMEOUT * 1000)}")
         _conn.execute("PRAGMA foreign_keys=ON")
         _conn.executescript(SCHEMA)
         _migrate(_conn)
@@ -133,12 +152,39 @@ def get_conn():
     return _conn
 
 
+def _is_locked(exc):
+    """这个异常是不是"别人正在写" —— 只有这类错才值得重试。"""
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _retry_write(fn):
+    """在持有 _lock 的前提下执行写操作, 撞锁时退避重试。
+
+    重试放在锁**内**: 一旦放锁, 别的线程会插进来跟我们抢同一个写锁,
+    反而更难收敛。退避总时长被压在 1 秒量级, 持锁等待是可接受的。
+    """
+    last = None
+    for attempt in range(DB_WRITE_RETRIES):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            last = e
+            if not _is_locked(e) or attempt == DB_WRITE_RETRIES - 1:
+                raise
+            # 指数退避 + 抖动: 与下载层同理, 纯指数会让多个等待者同时重试
+            time.sleep(min(0.05 * 2 ** attempt, 0.4) * random.uniform(0.6, 1.4))
+    raise last
+
+
 def execute(sql, params=()):
     with _lock:
-        conn = get_conn()
-        cur = conn.execute(sql, params)
-        conn.commit()
-        return cur
+        def _run():
+            conn = get_conn()
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur
+        return _retry_write(_run)
 
 
 def query(sql, params=()):
@@ -198,26 +244,30 @@ def update_task_status(task_id, status):
 def transition_task(task_id, new_status, expected_status):
     """状态机迁移，带乐观锁校验当前状态。返回是否迁移成功。"""
     with _lock:
-        conn = get_conn()
-        cur = conn.execute(
-            "UPDATE tasks SET status=? WHERE id=? AND status=?",
-            (new_status, task_id, expected_status),
-        )
-        conn.commit()
-        return cur.rowcount == 1
+        def _run():
+            conn = get_conn()
+            cur = conn.execute(
+                "UPDATE tasks SET status=? WHERE id=? AND status=?",
+                (new_status, task_id, expected_status),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        return _retry_write(_run)
 
 
 def transition_task_from_any(task_id, new_status, allowed_statuses):
     """从任一允许状态迁移到新状态(用于取消/看门狗)。"""
     ph = ",".join("?" for _ in allowed_statuses)
     with _lock:
-        conn = get_conn()
-        cur = conn.execute(
-            f"UPDATE tasks SET status=? WHERE id=? AND status IN ({ph})",
-            (new_status, task_id, *allowed_statuses),
-        )
-        conn.commit()
-        return cur.rowcount == 1
+        def _run():
+            conn = get_conn()
+            cur = conn.execute(
+                f"UPDATE tasks SET status=? WHERE id=? AND status IN ({ph})",
+                (new_status, task_id, *allowed_statuses),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        return _retry_write(_run)
 
 
 def delete_task(task_id):
@@ -384,9 +434,26 @@ def task_phashes(task_id, exclude_id=None):
 # ---- logs ----
 
 def add_log(task_id, message, level="info"):
-    execute(
+    cur = execute(
         "INSERT INTO task_logs(task_id, level, message, created_time) VALUES(?,?,?,?)",
         (task_id, level, message[:2000], _now()),
+    )
+    # 每 LOG_TRIM_EVERY 条裁一次: 一个几百资源的任务会写上千行日志, 任务删掉后
+    # 这些行不会自己消失 —— 库会单调膨胀, "取最新 N 条"也会越来越慢。
+    # 按行号取样而不是每写一条都裁, 是为了不让日志写入变成两次查询。
+    if LOG_KEEP_PER_TASK > 0 and cur.lastrowid % LOG_TRIM_EVERY == 0:
+        trim_logs(task_id)
+
+
+def trim_logs(task_id, keep=None):
+    """只保留每个任务最近的 keep 条日志。"""
+    keep = keep if keep is not None else LOG_KEEP_PER_TASK
+    if keep <= 0:
+        return
+    execute(
+        "DELETE FROM task_logs WHERE task_id=? AND id NOT IN"
+        " (SELECT id FROM task_logs WHERE task_id=? ORDER BY id DESC LIMIT ?)",
+        (task_id, task_id, keep),
     )
 
 

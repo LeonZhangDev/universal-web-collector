@@ -316,7 +316,7 @@ python scripts/selfcheck.py --reset-profile
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (477 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径)
+make test           # pytest (502 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -329,6 +329,22 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 站点解析探针: `uv run python scripts/probe.py <url>`。
 感知去重依赖 ffmpeg(与视频 remux 共用同一套探测, 见 `core/ffmpeg.py`) ——
 探测不到时自动降级为"不算指纹", 不影响任何下载。
+
+## 健壮性(V27)
+
+这一轮的目标不是"再修几个坑", 而是**让坑不再靠人记才不踩**:
+
+- **孤儿任务恢复**: 后端重启后心跳超时的活动任务会被复位(有资源清单 → `paused`
+  可续跑; 无清单 → `failed` 并提示重试), 不再永远卡在"运行中"
+- **SQLite 写重试**: `busy_timeout` + 只对 `locked/busy` 的退避重试, 避免写冲突
+  被误判成"这个资源下载失败"
+- **原子落盘**: 写 `.part` 后原子改名; 续传前校验残片确实来自同一 URL; 落盘后
+  比对字节数 —— 杜绝"文件在、大小对、内容是坏的"
+- **磁盘满 fail-fast**: 预检 + 下载中捕获即中止整任务, 不走完重试链空转
+- **取消穿透门禁**: `tests/test_cancel_guard.py` 用 AST 扫核心模块, 凡 `try` 块内
+  有取消源却没写 `except TaskCancelled: raise`, **pytest 直接红**
+- **异常分类**: `core/errors.py` 区分"站点/环境的问题(给用户看)"、"可重试"、
+  "我们的 bug(记堆栈)"; API 全局兜底只返回 `{detail, type}`, 堆栈不泄漏
 
 ## 架构
 

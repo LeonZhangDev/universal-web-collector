@@ -45,6 +45,10 @@ class Config:
     # 任务健壮性
     stale_task_timeout: int = 900
     watchdog_interval: int = 30
+    # 目标盘的最低剩余水位: 低于它就停止下载剩余资源(core/disk.py)。
+    # ⚠️ 满盘后再下是纯空转 —— 每个资源都会各自走完一整条重试链才失败。
+    # 设 0 关闭该检查。
+    min_free_bytes: int = 200 * 1024 * 1024
     # 限速与代理
     domain_concurrency: int = 3
     # 起始(也是固定模式下的)请求间隔。启用自适应后会被 AIMD 在下面两个界之间调整。

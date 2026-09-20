@@ -59,7 +59,11 @@ def test_final_status_follows_resource_outcome(monkeypatch):
         ({"done": 0, "failed": 4}, "failed"),
         ({"filtered": 3}, "success"),          # 过滤是用户规则, 不算失败
         ({"done": 1, "skipped": 2}, "success"),  # 跳过是能力缺失, 也不算失败
-        ({}, "success"),
+        # ⚠️ 空集 = 这次运行什么也没产出, 必须是 failed。
+        # 判成 success 就是"什么也没下到"和"全部下好了"在界面上长得一模一样 ——
+        # 这是本项目反复踩的那类静默失败(见 PITFALLS)。真实触发口是 resume 到
+        # 一个空清单(上次中断在资源发现阶段), 那里已另有精确报错, 这里是兜底。
+        ({}, "failed"),
     ]
     for stat, expect in cases:
         monkeypatch.setattr(

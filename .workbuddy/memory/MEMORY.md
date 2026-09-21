@@ -20,12 +20,13 @@
 `collectors/gallery_base.py`(SequenceGallerySpider/GallerySite/check_site) · `collectors/hls.py` · `collectors/scores.py`
 `downloaders/base.py` · `downloaders/ratelimit.py`(令牌桶+AIMD) · `main.py`(lifespan)
 
-## ⚠️ 五条"静默"坑（细节见 PITFALLS）
+## ⚠️ 六条"静默"坑（细节见 PITFALLS）
 1. **次序即契约**：先 `_write_manifest` 再 `_settle_status`；`_settle_status` 不得抛。
 2. **原子落盘** `.part` + `.part.src` + `os.replace`，落盘比字节数（有 `Content-Encoding` 不比）。
 3. **孤儿恢复**挂 lifespan（别放模块级）；**SQLite 写-写仍单写者** → `busy_timeout` + `_retry_write`。
 4. **取消穿透**：所有 `except Exception` 前必须 `except TaskCancelled: raise`（AST 门禁把关）。
 5. **`FilterIn` 必须声明全部键 + `extra="allow"`**，否则前端开关被静默丢弃。
+6. **重名必须在下载前消解**（`layout.claim`）：下载器见"目标已存在"就当**半成品**续传 → 异源同名被拼成一份、字节数还常恰好对上 → 报成功。只查库不够，要加本次采集内的占位表。
 
 ## 状态机
 `pending→running→extracting→downloading→success/partial/failed`，可 paused/cancelled。
@@ -44,7 +45,7 @@ curl 对 127.0.0.1 加 `--noproxy '*'`；起服务用 `run_in_background`；命�
 
 ```bash
 make install|backend|frontend|build|test|docker
-python scripts/verify_output.py            # 33 项断言
+python scripts/verify_output.py            # 40 项断言
 python scripts/verify_hls.py               # 18 项断言
 python scripts/selfcheck.py                # 站点声明自检 + CDN 画像快照
 ```

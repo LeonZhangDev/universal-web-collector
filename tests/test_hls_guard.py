@@ -107,6 +107,21 @@ def test_leaf_playlist_without_endlist_is_rejected(playlist_type):
     assert "ENDLIST" in r["reason"]
 
 
+def test_endlisted_playlist_with_zero_total_duration_is_rejected():
+    body = (
+        "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        "#EXTINF:0,\nhttps://h/ts/00001.ts\n#EXT-X-ENDLIST\n"
+    )
+    r = inspect_playlist(
+        "https://h/720.m3u8?expires=9999999999&md5=x",
+        session=FakeSession({"720.m3u8": body}),
+    )
+
+    assert r["ok"] is False
+    assert r["kind"] == "invalid-duration"
+    assert "时长" in r["reason"]
+
+
 def test_encrypted_but_key_unreachable_is_rejected():
     body = (
         "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://h/key/enc.key\"\n"

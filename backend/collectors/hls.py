@@ -328,6 +328,11 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
         )
         return result
 
+    if info["duration"] <= 0:
+        result["kind"] = "invalid-duration"
+        result["reason"] = "播放列表已结束但分片总时长无效，无法验证完整性"
+        return result
+
     # 4) 占位清单: 状态码、Content-Type、语法全都合法, 只有内容在撒谎
     if _looks_like_placeholder(info, hints):
         result["kind"] = "placeholder"

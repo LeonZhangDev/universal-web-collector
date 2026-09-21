@@ -29,7 +29,11 @@ async def lifespan(app):
     finally:
         # Native 模式的安装/重启会向后端发送 SIGTERM。必须把取消信号传给
         # 下载 worker；否则监听已关闭但 Python 仍被 executor 线程阻塞。
-        task_manager.shutdown(wait=False)
+        # Executor workers are non-daemon.  Merely broadcasting cancellation
+        # leaves Python's executor exit hook waiting on those threads after
+        # uvicorn has already closed its socket, which makes the native-host
+        # installer observe a stopped API but a still-live backend PID.
+        task_manager.shutdown(wait=True)
 
 
 app = FastAPI(title="Universal Web Collector v10", lifespan=lifespan)

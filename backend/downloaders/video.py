@@ -14,7 +14,8 @@ ffmpeg 路径由 `core/ffmpeg.py` 探测(显式配置 -> PATH -> 常见安装位
 在本进程里仍返回 None)。
 
 ⚠️ 走 ffmpeg 拉流时请求由 ffmpeg 自己发出: 本项目的 DomainLimiter 不参与,
-   mirrors 也不会被轮换, 分片进度也只在整个文件完成时上报一次。
+   mirrors 也不会被轮换。ffmpeg 子进程运行期间会周期性调用 progress_cb，
+   让任务心跳与取消信号保持活跃；资源完成进度仍只在整个文件完成时上报一次。
    对限速/镜像敏感的站点请用 `builtin`。
 
 内置分片下载器 (builtin)
@@ -183,7 +184,7 @@ class VideoDownloader:
         if pull_with_ffmpeg:
             path = out / f"{stem}.mp4"
             try:
-                self._ffmpeg_pull(leaf, headers, path, ff)
+                self._ffmpeg_pull(leaf, headers, path, ff, progress_cb=progress_cb)
                 if progress_cb:
                     progress_cb()
                 if log:
@@ -389,7 +390,7 @@ class VideoDownloader:
 
     # ---- ffmpeg ----
 
-    def _ffmpeg_pull(self, url, headers, path, ff):
+    def _ffmpeg_pull(self, url, headers, path, ff, progress_cb=None):
         """让 ffmpeg 直接拉 m3u8 并输出到 path(`-c copy` 不重编码)。
 
         请求头经 `-headers` 传给 http 协议, 必须放在 `-i` 之前。
@@ -415,7 +416,7 @@ class VideoDownloader:
             ff, "-y", "-nostats", *args, *net,
             "-allowed_extensions", "ALL",
             "-i", url, "-c", "copy", str(path),
-        ])
+        ], progress_cb=progress_cb)
 
     def _ffmpeg_remux(self, src, dst, ff):
         self._run_ffmpeg(
@@ -423,14 +424,51 @@ class VideoDownloader:
         )
 
     @staticmethod
-    def _run_ffmpeg(cmd):
+    def _run_ffmpeg(cmd, progress_cb=None):
         """执行 ffmpeg; 失败时把 stderr 尾行带出来。
 
         旧实现是 `except Exception: pass`, 真实原因(协议不支持/编码不兼容)
         全部丢失, 排查时只能看到降级后那条误导性的报错。
         """
+        proc = None
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+            if progress_cb is None:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+                return
+
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            deadline = time.monotonic() + 3600
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, 3600)
+                try:
+                    stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    # ffmpeg 拉一个长 HLS 资源时，任务级进度会一直停在 20%。
+                    # 周期回调既刷新 watchdog 心跳，也让用户取消及时穿透到子进程。
+                    progress_cb()
+            if proc.returncode:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, cmd, output=stdout, stderr=stderr
+                )
+        except TaskCancelled:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+            raise
+        except subprocess.TimeoutExpired:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            raise
         except FileNotFoundError as e:
             # 路径来自 core.ffmpeg 探测, 到这里说明探测后又被动过(卸载/移动)
             raise RuntimeError(f"ffmpeg 不可执行: {cmd[0]}") from e

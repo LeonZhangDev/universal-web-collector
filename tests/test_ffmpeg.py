@@ -11,7 +11,9 @@ import pytest
 
 import core.ffmpeg as ffm
 from core import config as cfgmod
+from core.cancel import TaskCancelled
 from core.config import settings
+import downloaders.video as video_mod
 from downloaders.video import ENGINES, VideoDownloader, _is_dash, _is_hls, _short
 
 
@@ -168,6 +170,43 @@ def test_engine_builtin_never_calls_ffmpeg_pull(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         VideoDownloader().download("http://127.0.0.1:1/x.m3u8", save_dir=tmp_path)
     assert pulled == [], "engine=builtin 时不应调用 ffmpeg 拉流"
+
+
+def test_ffmpeg_pull_heartbeats_and_terminates_on_cancel(monkeypatch):
+    """长 HLS 拉流必须持续心跳；取消回调抛出后要收掉精确子进程。"""
+    calls = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if len([c for c in calls if c[0] == "communicate"]) == 1:
+                raise video_mod.subprocess.TimeoutExpired(["ffmpeg"], timeout)
+            self.returncode = -15
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append(("terminate", None))
+
+        def kill(self):
+            calls.append(("kill", None))
+
+    monkeypatch.setattr(video_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+
+    def cancel_tick():
+        calls.append(("tick", None))
+        raise TaskCancelled()
+
+    with pytest.raises(TaskCancelled):
+        VideoDownloader._run_ffmpeg(["ffmpeg"], progress_cb=cancel_tick)
+
+    assert ("tick", None) in calls
+    assert ("terminate", None) in calls
+    assert ("kill", None) not in calls
 
 
 # ---- URL 形态判定 ----

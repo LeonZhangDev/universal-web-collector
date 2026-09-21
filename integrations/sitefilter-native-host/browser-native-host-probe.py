@@ -17,7 +17,7 @@ HOST_NAME = "dev.zackzhang.sitefilter_collector"
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--browser", choices=("Chrome", "Edge"), required=True)
+    parser.add_argument("--browser", choices=("ChromeForTesting", "Chromium", "Edge"), required=True)
     parser.add_argument("--browser-path", type=Path, required=True)
     parser.add_argument("--integration-root", type=Path, required=True)
     args = parser.parse_args()

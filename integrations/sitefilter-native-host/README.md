@@ -95,7 +95,10 @@ print the complete plan without changing files or the registry. The installer
 pins PyInstaller 6.16.0, packages the host under
 `%LOCALAPPDATA%\SiteFilter\NativeHost`, writes the exact config and manifest,
 restricts that directory to the current user, and registers both Chrome and
-Edge under HKCU. It never needs elevation.
+Edge under HKCU. If Windows `uv` is initially absent from `PATH`, the installer
+runs the official per-user installer, resolves `%USERPROFILE%\.local\bin\uv.exe`
+directly, and refreshes its own `PATH` before packaging. It never needs
+elevation.
 If the target directory already contains files without this installer's
 ownership marker, the installer moves the directory to a timestamped sibling
 `NativeHost.preinstall-backup-*` before proceeding; the uninstaller leaves
@@ -107,12 +110,17 @@ Uninstall only the owned host files and matching registrations:
 .\integrations\sitefilter-native-host\uninstall-native-host.ps1
 ```
 
-The uninstaller verifies an ownership marker and matching registry values. It
+The versioned ownership marker enumerates every generated file and stores a
+typed recursive snapshot of each target registry key before the first install.
+Uninstall restores pre-existing values and subkeys, preserves later additions,
+removes only recorded files, and removes `NativeHost` only when it is empty.
+Unexpected files added after installation remain in place. The uninstaller
 does not remove `%LOCALAPPDATA%\SiteFilter`, Collector data, downloads,
 browser profiles, or project environments.
 
-The hidden `-InstallRoot`, `-RegistryRoot`, `-TestHostExecutable`, and
-`-SkipSelfCheck` parameters are exclusively for disposable integration tests:
+The hidden `-InstallRoot`, `-RegistryRoot`, `-TestHostExecutable`,
+`-TestWindowsUvPath`, and `-SkipSelfCheck` parameters are exclusively for
+disposable integration tests:
 
 ```powershell
 .\integrations\sitefilter-native-host\test-install-native-host.ps1 -ProjectPath (Get-Location)
@@ -120,5 +128,14 @@ The hidden `-InstallRoot`, `-RegistryRoot`, `-TestHostExecutable`, and
 
 For release verification, `test-browser-native-host.ps1` creates a temporary
 unpacked probe extension and browser profile, sends one native `ping`, then
-removes both. Pass `-Browser Chrome` or `-Browser Edge` and the corresponding
-browser executable path. It never opens or changes a normal browser profile.
+removes both. `-Browser Chromium` automatically uses Playwright's supported
+Chromium build, while `-Browser Edge -BrowserPath <path>` tests Edge. The
+optional `-Browser ChromeForTesting` mode downloads the official stable win64
+artifact into an explicit LocalAppData cache and prints its version and archive
+SHA-256; `-ChromeForTestingCacheRoot` changes that cache. None of these modes
+opens or changes a normal browser profile.
+
+Installed branded Chrome 153 rejects command-line-loaded unpacked extensions
+with `ERR_BLOCKED_BY_CLIENT`, so it is not an automation route. Use Chromium
+or Chrome for Testing for the temporary probe; Task 10 can perform acceptance
+with a user-loaded extension in branded Chrome.

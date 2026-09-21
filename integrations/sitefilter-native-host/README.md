@@ -82,7 +82,8 @@ The fixed unpacked-extension identity is derived from the public-only
 to establish that identity is not retained. Task 7 must copy this exact public
 key into the extension manifest.
 
-Run the installer from a normal (non-administrator) PowerShell session:
+Run the installer from a normal (non-administrator) Windows PowerShell 5.1 or
+newer session:
 
 ```powershell
 .\integrations\sitefilter-native-host\install-native-host.ps1 -ProjectPath C:\path\to\universal_web_collector_v9
@@ -92,17 +93,21 @@ Omit `-ProjectPath` to select the project with a Windows folder picker. Use
 `-Distro <name>` to override default WSL detection, `-SkipProvision` to skip
 the WSL `make install` and `make build` steps, and `-WhatIf` to validate and
 print the complete plan without changing files or the registry. The installer
-pins PyInstaller 6.16.0, packages the host under
+pins PyInstaller 6.16.0, builds a complete sibling staging installation, and
+performs BOM-free atomic JSON writes before swapping it into
 `%LOCALAPPDATA%\SiteFilter\NativeHost`, writes the exact config and manifest,
 restricts that directory to the current user, and registers both Chrome and
-Edge under HKCU. If Windows `uv` is initially absent from `PATH`, the installer
-runs the official per-user installer, resolves `%USERPROFILE%\.local\bin\uv.exe`
-directly, and refreshes its own `PATH` before packaging. It never needs
+Edge under HKCU. A failure after the root swap, either registry write, or final
+self-check restores the prior root and exact prior registry defaults. If
+Windows `uv` is initially absent, the installer downloads the pinned official
+uv 0.12.15 archive, verifies SHA-256
+`477BD99A84E34891F2BD4C9152DDEB74E971ACCCCBC59C0F0301F11F08A32D46`
+before extraction, resolves
+the absolute per-user executable, and refreshes its own `PATH`. It never needs
 elevation.
-If the target directory already contains files without this installer's
-ownership marker, the installer moves the directory to a timestamped sibling
-`NativeHost.preinstall-backup-*` before proceeding; the uninstaller leaves
-that backup untouched.
+If a target without this installer's ownership marker contains a colliding
+host filename, installation refuses without changing it. Non-colliding
+unexpected files are preserved through a transactional replacement.
 
 Uninstall only the owned host files and matching registrations:
 
@@ -110,17 +115,22 @@ Uninstall only the owned host files and matching registrations:
 .\integrations\sitefilter-native-host\uninstall-native-host.ps1
 ```
 
-The versioned ownership marker enumerates every generated file and stores a
-typed recursive snapshot of each target registry key before the first install.
-Uninstall restores pre-existing values and subkeys, preserves later additions,
-removes only recorded files, and removes `NativeHost` only when it is empty.
+The versioned ownership marker enumerates every generated file and stores only
+the prior typed default value for each exact hardcoded browser host key.
+Named values and subkeys are never serialized or replayed. Uninstall restores
+or removes a prior default only while the current default still points to this
+installation, preserves later changes, removes only recorded files, and
+removes `NativeHost` only when it is empty. Before mutation it validates any
+owned runtime PID against the configured WSL distribution, project cwd, and
+backend command, requests bounded graceful termination, and checks every owned
+file for locks.
 Unexpected files added after installation remain in place. The uninstaller
 does not remove `%LOCALAPPDATA%\SiteFilter`, Collector data, downloads,
 browser profiles, or project environments.
 
 The hidden `-InstallRoot`, `-RegistryRoot`, `-TestHostExecutable`,
-`-TestWindowsUvPath`, and `-SkipSelfCheck` parameters are exclusively for
-disposable integration tests:
+failure-injection, uv-fixture, process-verification, root-safety, and
+`-SkipSelfCheck` parameters are exclusively for disposable integration tests:
 
 ```powershell
 .\integrations\sitefilter-native-host\test-install-native-host.ps1 -ProjectPath (Get-Location)

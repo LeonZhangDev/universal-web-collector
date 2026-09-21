@@ -1,3 +1,4 @@
+#requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateSet('ChromeForTesting', 'Chromium', 'Edge')][string]$Browser,
@@ -45,5 +46,7 @@ if ($Browser -eq 'Chromium' -and -not $BrowserPath) {
 if (-not $BrowserPath -or -not (Test-Path -LiteralPath $BrowserPath -PathType Leaf)) { throw "Browser executable not found: $BrowserPath" }
 Write-Host "$Browser executable version: $((Get-Item -LiteralPath $BrowserPath).VersionInfo.FileVersion)"
 
+& $PythonPath (Join-Path $PSScriptRoot 'browser-native-host-probe.py') --self-test-validation
+if ($LASTEXITCODE -ne 0) { throw 'Native messaging response validator self-test failed.' }
 & $PythonPath (Join-Path $PSScriptRoot 'browser-native-host-probe.py') --browser $Browser --browser-path $BrowserPath --integration-root $PSScriptRoot
 if ($LASTEXITCODE -ne 0) { throw "$Browser native messaging probe failed with exit code $LASTEXITCODE." }

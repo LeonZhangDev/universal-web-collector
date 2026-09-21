@@ -15,12 +15,57 @@ EXTENSION_ID = "jaihdgjnnpmiabeoefmihmjhoodcjlhf"
 HOST_NAME = "dev.zackzhang.sitefilter_collector"
 
 
+def validate_ping_response(result: object) -> None:
+    if not isinstance(result, dict):
+        raise RuntimeError(f"native response is not an object: {result!r}")
+    ping = result.get("result")
+    collector = ping.get("collector") if isinstance(ping, dict) else None
+    if (
+        result.get("v") != 1
+        or result.get("id") != "browser-probe"
+        or result.get("ok") is not True
+        or not isinstance(ping, dict)
+        or ping.get("protocol_version") != 1
+        or not isinstance(ping.get("port"), int)
+        or isinstance(ping.get("port"), bool)
+        or ping["port"] <= 0
+        or not isinstance(collector, dict)
+        or collector.get("status") != "ok"
+    ):
+        raise RuntimeError(f"native response was not successful: {result}")
+
+
+def self_test_validation() -> None:
+    valid = {
+        "v": 1,
+        "id": "browser-probe",
+        "ok": True,
+        "result": {"protocol_version": 1, "port": 8000, "collector": {"status": "ok"}},
+    }
+    validate_ping_response(valid)
+    for field, bad_value in (("v", 2), ("id", "wrong"), ("ok", False)):
+        invalid = json.loads(json.dumps(valid))
+        invalid[field] = bad_value
+        try:
+            validate_ping_response(invalid)
+        except RuntimeError:
+            continue
+        raise AssertionError(f"validator accepted bad {field}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--browser", choices=("ChromeForTesting", "Chromium", "Edge"), required=True)
-    parser.add_argument("--browser-path", type=Path, required=True)
-    parser.add_argument("--integration-root", type=Path, required=True)
+    parser.add_argument("--browser", choices=("ChromeForTesting", "Chromium", "Edge"))
+    parser.add_argument("--browser-path", type=Path)
+    parser.add_argument("--integration-root", type=Path)
+    parser.add_argument("--self-test-validation", action="store_true")
     args = parser.parse_args()
+    if args.self_test_validation:
+        self_test_validation()
+        print("PASS: native probe rejects protocol, correlation-id, and success mismatches")
+        return 0
+    if not args.browser or not args.browser_path or not args.integration_root:
+        parser.error("--browser, --browser-path, and --integration-root are required")
 
     with tempfile.TemporaryDirectory(prefix="sitefilter-browser-probe-") as temp:
         root = Path(temp)
@@ -81,8 +126,7 @@ def main() -> int:
                 if result_text == "waiting":
                     raise TimeoutError("native response did not arrive within 70 seconds")
                 result = json.loads(result_text)
-                if result.get("ok") is not True:
-                    raise RuntimeError(f"native response was not successful: {result}")
+                validate_ping_response(result)
                 print(f"PASS: {args.browser} temporary-profile native messaging ping: {json.dumps(result)}")
             finally:
                 context.close()

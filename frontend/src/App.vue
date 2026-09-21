@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import FolderPicker from "./components/FolderPicker.vue";
 import TaskDetail from "./components/TaskDetail.vue";
 import TaskTable from "./components/TaskTable.vue";
+import { selectTaskFromSearch } from "./task-query.mjs";
 import {
   bulkDeleteTasks,
   createTask,
@@ -668,6 +669,7 @@ async function removeSession(domain) {
 onMounted(async () => {
   loadPrefs();
   await refresh();
+  selectedId.value = selectTaskFromSearch(window.location.search, tasks.value);
   connectSSE();
   try {
     const list = await getCollectors();

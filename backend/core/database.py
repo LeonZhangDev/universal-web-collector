@@ -368,6 +368,17 @@ def count_resources(task_id):
     return {r["status"]: r["n"] for r in rows}
 
 
+def summarize_resources(task_id):
+    """返回任务资源总数与面向任务摘要的终态计数。"""
+    by_status = count_resources(task_id)
+    return {
+        "total": sum(by_status.values()),
+        "done": by_status.get("done", 0),
+        "failed": by_status.get("failed", 0),
+        "filtered": by_status.get("filtered", 0),
+    }
+
+
 def count_tasks_by_status():
     """按状态统计任务数量, 返回 dict。
 

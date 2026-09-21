@@ -391,7 +391,11 @@ def get_task(task_id: int):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     resources = [_resource_out(r, task) for r in db.get_resources(task_id)]
-    return TaskDetail(**dict(task), resources=resources)
+    return TaskDetail(
+        **dict(task),
+        resources=resources,
+        resource_counts=db.summarize_resources(task_id),
+    )
 
 
 @router.get("/tasks/{task_id}/logs")

@@ -38,8 +38,16 @@ class ResourceOut(BaseModel):
     duplicate_of: Optional[int] = None
 
 
+class ResourceCounts(BaseModel):
+    total: int
+    done: int
+    failed: int
+    filtered: int
+
+
 class TaskDetail(TaskOut):
     resources: List[ResourceOut]
+    resource_counts: ResourceCounts
 
 
 class FilterIn(BaseModel):

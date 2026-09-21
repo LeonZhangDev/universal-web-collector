@@ -105,6 +105,12 @@ try {
         Assert-True ((Get-DefaultFingerprint $chromeKey) -eq $chromeBefore) "Chrome rollback failed at $point."
         Assert-True ((Get-DefaultFingerprint $edgeKey) -eq $edgeBefore) "Edge rollback failed at $point."
     }
+    $rootBefore = Get-RootFingerprint $installRoot; $edgeBefore = Get-DefaultFingerprint $edgeKey
+    Assert-Fails { Invoke-TestInstall $installRoot $registryRoot $fakeExe 'after-first-registry-concurrent' } 'Concurrent registry failure injection did not fail.'
+    Assert-True ((Get-RootFingerprint $installRoot) -eq $rootBefore) 'Concurrent registry rollback changed the original root.'
+    Assert-True ((Get-Item $chromeKey).GetValue('') -eq 'C:\concurrent\replacement.json') 'Rollback overwrote a concurrent later Chrome default.'
+    Assert-True ((Get-DefaultFingerprint $edgeKey) -eq $edgeBefore) 'Rollback changed the not-yet-written Edge key.'
+    Set-Item -LiteralPath $chromeKey -Value (Join-Path $installRoot "$hostName.json")
 
     Write-TestText (Join-Path $installRoot 'collector-startup.log') 'locked'
     $rootBefore = Get-RootFingerprint $installRoot; $chromeBefore = Get-DefaultFingerprint $chromeKey; $edgeBefore = Get-DefaultFingerprint $edgeKey
@@ -118,6 +124,19 @@ try {
 
     Set-TestOwnedDescriptor $installRoot 'main'
     $signalLog = Join-Path $root 'signals.log'
+    $rootBefore = Get-RootFingerprint $installRoot; $chromeBefore = Get-DefaultFingerprint $chromeKey; $edgeBefore = Get-DefaultFingerprint $edgeKey
+    & $uninstaller -InstallRoot $installRoot -RegistryRoot $registryRoot -TestSafetyBase $root -TestProcessState Verified -TestSignalLog $signalLog -WhatIf | Out-Null
+    Assert-True (-not (Test-Path $signalLog)) 'Uninstall -WhatIf signaled an owned process.'
+    Assert-True ((Get-RootFingerprint $installRoot) -eq $rootBefore -and (Get-DefaultFingerprint $chromeKey) -eq $chromeBefore -and (Get-DefaultFingerprint $edgeKey) -eq $edgeBefore) 'Uninstall -WhatIf mutated files or registry.'
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $confirmOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $uninstaller -InstallRoot $installRoot -RegistryRoot $registryRoot -TestSafetyBase $root -TestProcessState Verified -TestSignalLog $signalLog -Confirm 2>&1
+        $confirmExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    Assert-True ($confirmExit -ne 0) "Explicit -Confirm unexpectedly completed without a noninteractive refusal: $($confirmOutput -join ' ')"
+    Assert-True (-not (Test-Path $signalLog)) 'Denied/noninteractive -Confirm signaled an owned process.'
+    Assert-True ((Get-RootFingerprint $installRoot) -eq $rootBefore -and (Get-DefaultFingerprint $chromeKey) -eq $chromeBefore -and (Get-DefaultFingerprint $edgeKey) -eq $edgeBefore) 'Denied/noninteractive -Confirm mutated files or registry.'
     New-ItemProperty -LiteralPath $chromeKey -Name later -Value 'keep' -PropertyType String | Out-Null
     New-Item -Path (Join-Path $edgeKey 'later-child') -Force | Out-Null
     Set-Item -LiteralPath $chromeKey -Value 'C:\later\user-manifest.json'
@@ -133,13 +152,15 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $statePath)) 'Completed marker was retained.'
     Invoke-TestUninstall $installRoot $registryRoot
 
-    # Mismatch must not signal or mutate; verified retry succeeds.
+    # Wrong argv and PID changes must never signal or mutate; verified retry succeeds.
     $mismatchRoot = Join-Path $root 'mismatch-install'; $mismatchRegistry = "$registryBase\Mismatch"
     Invoke-TestInstall $mismatchRoot $mismatchRegistry $fakeExe
     Set-TestOwnedDescriptor $mismatchRoot 'mismatch'
     $mismatchSignal = Join-Path $root 'mismatch-signals.log'; $before = Get-RootFingerprint $mismatchRoot
-    Assert-Fails { Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'Mismatch' $mismatchSignal } 'Mismatched owned process did not fail.'
-    Assert-True (-not (Test-Path $mismatchSignal) -and (Get-RootFingerprint $mismatchRoot) -eq $before) 'Mismatch signaled or mutated.'
+    Assert-Fails { Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'WrongCommand' $mismatchSignal } 'Wrong-command owned process did not fail.'
+    Assert-True (-not (Test-Path $mismatchSignal) -and (Get-RootFingerprint $mismatchRoot) -eq $before) 'Wrong command signaled or mutated.'
+    Assert-Fails { Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'PidChanged' $mismatchSignal } 'Changed owned PID did not fail.'
+    Assert-True (-not (Test-Path $mismatchSignal) -and (Get-RootFingerprint $mismatchRoot) -eq $before) 'Changed PID signaled or mutated.'
     Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'Verified' $mismatchSignal
 
     # An unowned process seam is never signaled, while prior value types and
@@ -206,6 +227,13 @@ try {
     & $installer -ProjectPath $ProjectPath -SkipProvision -InstallRoot $uvRoot -RegistryRoot $uvRegistry -TestSafetyBase $root -TestHostExecutable $fakeExe -TestRequireWindowsUv -TestIgnoreInstalledUv -TestUvArchivePath $fixtureZip -TestUvArchiveSha256 $fixtureHash -TestUvInstallDirectory $uvBin -SkipSelfCheck | Out-Null
     Assert-True (Test-Path (Join-Path $uvBin 'uv.exe')) 'Pinned verified uv fixture was not resolved in the same run.'
     Invoke-TestUninstall $uvRoot $uvRegistry
+
+    # Exercise the production WSL uv resolution/version branch without running
+    # make against a disposable install root.
+    $wslUvRoot = Join-Path $root 'wsl-uv-install'; $wslUvRegistry = "$registryBase\WslUv"
+    & $installer -ProjectPath $ProjectPath -InstallRoot $wslUvRoot -RegistryRoot $wslUvRegistry -TestSafetyBase $root -TestHostExecutable $fakeExe -TestSkipMake -SkipSelfCheck | Out-Null
+    Assert-True (Test-Path (Join-Path $wslUvRoot '.sitefilter-native-host-owned.json')) 'Production WSL uv verification branch did not proceed.'
+    Invoke-TestUninstall $wslUvRoot $wslUvRegistry
 
     # A junction root must fail before writes outside the intended target.
     $outside = Join-Path $root 'outside'; New-Item -ItemType Directory -Path $outside | Out-Null

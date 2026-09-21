@@ -104,7 +104,9 @@ uv 0.12.15 archive, verifies SHA-256
 `477BD99A84E34891F2BD4C9152DDEB74E971ACCCCBC59C0F0301F11F08A32D46`
 before extraction, resolves
 the absolute per-user executable, and refreshes its own `PATH`. It never needs
-elevation.
+elevation. WSL provisioning requires an existing `uv` executable in the
+selected distribution; the installer verifies `uv --version` and fails with
+an actionable message rather than executing a mutable remote install script.
 If a target without this installer's ownership marker contains a colliding
 host filename, installation refuses without changing it. Non-colliding
 unexpected files are preserved through a transactional replacement.
@@ -121,9 +123,17 @@ Named values and subkeys are never serialized or replayed. Uninstall restores
 or removes a prior default only while the current default still points to this
 installation, preserves later changes, removes only recorded files, and
 removes `NativeHost` only when it is empty. Before mutation it validates any
-owned runtime PID against the configured WSL distribution, project cwd, and
-backend command, requests bounded graceful termination, and checks every owned
-file for locks.
+owned runtime PID in one WSL operation: the descriptor PID must still identify
+the exact configured project cwd, executable, and NUL-separated backend
+argument vector. Only that same verified process is sent bounded graceful
+termination. `-WhatIf` performs the read-only validation but does not signal
+the process or change files/registry; an interactive confirmation refusal has
+the same no-side-effect behavior. The installer uses the same exact check
+before a root swap. If a final self-check starts a new owned Collector and the
+transaction then fails, rollback first stops that exact new process, restores
+the old root and guarded registry defaults, and safely restarts a previously
+running owned Collector from the restored installation. Every owned file is
+checked for locks before uninstall.
 Unexpected files added after installation remain in place. The uninstaller
 does not remove `%LOCALAPPDATA%\SiteFilter`, Collector data, downloads,
 browser profiles, or project environments.

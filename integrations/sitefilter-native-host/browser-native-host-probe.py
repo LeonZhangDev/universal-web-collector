@@ -18,18 +18,23 @@ HOST_NAME = "dev.zackzhang.sitefilter_collector"
 def validate_ping_response(result: object) -> None:
     if not isinstance(result, dict):
         raise RuntimeError(f"native response is not an object: {result!r}")
+    if set(result) != {"v", "id", "ok", "result"}:
+        raise RuntimeError(f"native response has unexpected top-level keys: {result}")
     ping = result.get("result")
     collector = ping.get("collector") if isinstance(ping, dict) else None
     if (
-        result.get("v") != 1
+        type(result.get("v")) is not int
+        or result.get("v") != 1
         or result.get("id") != "browser-probe"
         or result.get("ok") is not True
         or not isinstance(ping, dict)
+        or set(ping) != {"protocol_version", "port", "collector"}
+        or type(ping.get("protocol_version")) is not int
         or ping.get("protocol_version") != 1
-        or not isinstance(ping.get("port"), int)
-        or isinstance(ping.get("port"), bool)
-        or ping["port"] <= 0
+        or type(ping.get("port")) is not int
+        or not 1 <= ping["port"] <= 65535
         or not isinstance(collector, dict)
+        or set(collector) != {"status"}
         or collector.get("status") != "ok"
     ):
         raise RuntimeError(f"native response was not successful: {result}")
@@ -43,14 +48,32 @@ def self_test_validation() -> None:
         "result": {"protocol_version": 1, "port": 8000, "collector": {"status": "ok"}},
     }
     validate_ping_response(valid)
-    for field, bad_value in (("v", 2), ("id", "wrong"), ("ok", False)):
+    cases: list[tuple[str, dict[str, object]]] = []
+    for field, bad_value in (("v", 2), ("v", True), ("id", "wrong"), ("ok", False)):
         invalid = json.loads(json.dumps(valid))
         invalid[field] = bad_value
+        cases.append((f"bad {field}={bad_value!r}", invalid))
+    for value in (True, 2):
+        invalid = json.loads(json.dumps(valid)); invalid["result"]["protocol_version"] = value
+        cases.append((f"bad nested protocol={value!r}", invalid))
+    for value in (True, 0, 65536):
+        invalid = json.loads(json.dumps(valid)); invalid["result"]["port"] = value
+        cases.append((f"bad port={value!r}", invalid))
+    for location, key in (("top", "id"), ("result", "collector")):
+        invalid = json.loads(json.dumps(valid))
+        if location == "top":
+            del invalid[key]
+        else:
+            del invalid["result"][key]
+        cases.append((f"missing {location} key {key}", invalid))
+    invalid = json.loads(json.dumps(valid)); invalid["extra"] = 1; cases.append(("extra top key", invalid))
+    invalid = json.loads(json.dumps(valid)); invalid["result"]["extra"] = 1; cases.append(("extra result key", invalid))
+    for label, invalid in cases:
         try:
             validate_ping_response(invalid)
         except RuntimeError:
             continue
-        raise AssertionError(f"validator accepted bad {field}")
+        raise AssertionError(f"validator accepted {label}")
 
 
 def main() -> int:

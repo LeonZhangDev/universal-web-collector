@@ -5,7 +5,7 @@ param(
     [Parameter(DontShow)][string]$InstallRoot,
     [Parameter(DontShow)][string]$RegistryRoot = 'HKCU:\Software',
     [Parameter(DontShow)][string]$TestSafetyBase,
-    [Parameter(DontShow)][ValidateSet('', 'Verified', 'Unowned', 'Mismatch', 'Absent')][string]$TestProcessState = '',
+    [Parameter(DontShow)][ValidateSet('', 'Verified', 'Unowned', 'WrongCommand', 'PidChanged', 'Absent')][string]$TestProcessState = '',
     [Parameter(DontShow)][string]$TestSignalLog
 )
 
@@ -78,8 +78,8 @@ function ConvertFrom-DefaultData {
     return [string]$Snapshot.default_data
 }
 
-function Stop-VerifiedOwnedCollector {
-    param($Config)
+function Invoke-VerifiedOwnedCollectorStop {
+    param($Config, [switch]$VerifyOnly)
     $runtimePath = [string]$Config.runtime_file
     if (-not [IO.Path]::IsPathRooted($runtimePath) -or -not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) { return }
     $descriptor = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
@@ -90,24 +90,42 @@ function Stop-VerifiedOwnedCollector {
     if (-not $pidIsInteger -or [long]$descriptor.pid -le 0 -or -not $portIsInteger -or [long]$descriptor.port -le 0 -or $descriptor.ready -isnot [bool]) { throw 'Owned runtime descriptor fields are invalid; refusing to signal any process.' }
     if ($TestProcessState) {
         if ($TestProcessState -eq 'Unowned' -or $TestProcessState -eq 'Absent') { return }
-        if ($TestProcessState -eq 'Mismatch') { throw 'Test seam reports a mismatched owned process.' }
-        if ($TestProcessState -eq 'Verified') { if ($TestSignalLog) { [IO.File]::AppendAllText($TestSignalLog, "TERM $($descriptor.pid)`n", (New-Object Text.UTF8Encoding($false))) }; return }
+        if ($TestProcessState -eq 'WrongCommand') { throw 'Test seam reports an owned process with the wrong command.' }
+        if ($TestProcessState -eq 'PidChanged' -and -not $VerifyOnly) { throw 'Test seam reports that the owned PID changed before termination.' }
+        if ($TestProcessState -eq 'Verified' -or $TestProcessState -eq 'PidChanged') {
+            if (-not $VerifyOnly -and $TestSignalLog) { [IO.File]::AppendAllText($TestSignalLog, "TERM $($descriptor.pid)`n", (New-Object Text.UTF8Encoding($false))) }
+            return
+        }
     }
     $distro = [string]$Config.distro; $project = [string]$Config.project_path
     if ($distro -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $project -notmatch '^/' -or $project.Contains('..') -or $project.Contains('\')) { throw 'Installed config has unsafe WSL values; refusing to signal any process.' }
-    $verifyScript = 'pid="$1"; project="$2"; [ -d "/proc/$pid" ] || { printf ABSENT; exit 0; }; cwd=$(readlink -f "/proc/$pid/cwd") || exit 20; [ "$cwd" = "$project" ] || exit 21; cmd=$(tr "\0" " " < "/proc/$pid/cmdline") || exit 22; case "$cmd" in *"$project/.venv/bin/python3 backend/main.py"*) printf VERIFIED;; *) exit 23;; esac'
-    $verification = Invoke-External 'wsl.exe' @('-d', $distro, '--exec', 'sh', '-c', $verifyScript, 'sitefilter-uninstall', ([string]$descriptor.pid), $project) "Owned Collector verification failed; refusing to signal PID $($descriptor.pid)"
-    if (($verification -join '').Trim() -eq 'ABSENT') { return }
-    if (($verification -join '').Trim() -ne 'VERIFIED') { throw 'Owned Collector verification was inconclusive.' }
-    Invoke-External 'wsl.exe' @('-d', $distro, '--exec', 'kill', '-TERM', ([string]$descriptor.pid)) "Could not signal verified Collector PID $($descriptor.pid)" | Out-Null
-    for ($attempt = 0; $attempt -lt 50; $attempt++) {
-        $previousPreference = $ErrorActionPreference
-        try { $ErrorActionPreference = 'Continue'; & wsl.exe -d $distro --exec kill -0 ([string]$descriptor.pid) 2>$null; $aliveExit = $LASTEXITCODE }
-        finally { $ErrorActionPreference = $previousPreference }
-        if ($aliveExit -ne 0) { return }
-        Start-Sleep -Milliseconds 200
-    }
-    throw "Verified Collector PID $($descriptor.pid) did not exit within 10 seconds."
+    $mode = if ($VerifyOnly) { 'verify' } else { 'stop' }
+    $processScript = @'
+import os, pathlib, signal, sys, time
+pid = int(sys.argv[1]); project = pathlib.Path(sys.argv[2]); mode = sys.argv[3]
+proc = pathlib.Path('/proc') / str(pid)
+if not proc.is_dir(): print('ABSENT'); raise SystemExit(0)
+expected_python = project / '.venv/bin/python3'
+def matches():
+    try:
+        cwd = pathlib.Path(os.readlink(proc / 'cwd'))
+        exe = pathlib.Path(os.readlink(proc / 'exe')).resolve()
+        argv = (proc / 'cmdline').read_bytes().split(b'\0')
+        if argv and argv[-1] == b'': argv.pop()
+        return cwd == project and exe == expected_python.resolve() and argv == [os.fsencode(str(expected_python)), b'backend/main.py']
+    except (FileNotFoundError, PermissionError, ProcessLookupError): return False
+if not matches(): print('MISMATCH'); raise SystemExit(21)
+if mode == 'verify': print('VERIFIED'); raise SystemExit(0)
+os.kill(pid, signal.SIGTERM)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    if not proc.exists() or not matches(): print('STOPPED'); raise SystemExit(0)
+    time.sleep(0.2)
+print('TIMEOUT'); raise SystemExit(22)
+'@
+    $result = Invoke-External 'wsl.exe' @('-d', $distro, '--exec', 'python3', '-c', $processScript, ([string]$descriptor.pid), $project, $mode) "Owned Collector exact verification/stop failed for PID $($descriptor.pid)"
+    if ($result -eq 'ABSENT' -or $result -eq 'VERIFIED' -or $result -eq 'STOPPED') { return }
+    throw 'Owned Collector verification was inconclusive.'
 }
 
 function Assert-OwnedFilesUnlocked {
@@ -115,8 +133,17 @@ function Assert-OwnedFilesUnlocked {
     foreach ($name in $OwnedFileNames) {
         $path = Join-Path $Root $name
         if (Test-Path -LiteralPath $path -PathType Leaf) {
-            try { $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); $stream.Dispose() }
-            catch { throw "Owned file is locked; uninstall preflight made no changes: $path" }
+            $unlocked = $false
+            for ($attempt = 0; $attempt -lt 25 -and -not $unlocked; $attempt++) {
+                try {
+                    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                    $stream.Dispose()
+                    $unlocked = $true
+                } catch {
+                    if ($attempt -lt 24) { Start-Sleep -Milliseconds 200 }
+                }
+            }
+            if (-not $unlocked) { throw "Owned file remains locked; no registry or file changes were made: $path" }
         }
     }
 }
@@ -163,19 +190,22 @@ foreach ($snapshot in $snapshots) {
     }
 }
 
-# All process and lock checks complete before the first registry or file mutation.
+# Validate process identity before confirmation, but never signal it until the
+# single operation-wide ShouldProcess gate approves the whole uninstall.
 $configPath = Join-Path $InstallRoot 'config.json'
+$config = $null
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-    Stop-VerifiedOwnedCollector $config
+    Invoke-VerifiedOwnedCollectorStop $config -VerifyOnly
 }
+if (-not $PSCmdlet.ShouldProcess($InstallRoot, 'Stop the exactly verified owned Collector, restore owned registry defaults, and remove exact owned files')) { Write-Host 'Uninstall validation completed; no process, registry, or file changes were made.'; return }
+if ($config) { Invoke-VerifiedOwnedCollectorStop $config }
 Assert-OwnedFilesUnlocked $InstallRoot
 
 foreach ($entry in @(@{ browser = 'chrome'; path = $ChromeKey }, @{ browser = 'edge'; path = $EdgeKey })) {
     $snapshot = @($snapshots | Where-Object { $_.browser -eq $entry.browser })[0]
     $current = Get-CurrentDefault $entry.path
     if (-not $current.value_exists -or $current.value -ne $ManifestPath) { continue }
-    if (-not $PSCmdlet.ShouldProcess($entry.path, 'Restore only the exact prior default registry value')) { continue }
     if ($snapshot.default_existed) {
         $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse([Microsoft.Win32.RegistryValueKind], [string]$snapshot.default_kind)
         $key = Open-RegistryKeyWritable $entry.path
@@ -191,11 +221,11 @@ $markerRemoved = $false
 foreach ($name in @($OwnedFileNames | Where-Object { $_ -ne '.sitefilter-native-host-owned.json' })) {
     $target = [IO.Path]::GetFullPath((Join-Path $InstallRoot $name))
     if (-not $target.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe owned path: $name" }
-    if ((Test-Path -LiteralPath $target -PathType Leaf) -and $PSCmdlet.ShouldProcess($target, 'Remove exact owned file')) { Remove-Item -LiteralPath $target -Force }
+    if (Test-Path -LiteralPath $target -PathType Leaf) { Remove-Item -LiteralPath $target -Force }
 }
 $remainingOwned = @($OwnedFileNames | Where-Object { $_ -ne '.sitefilter-native-host-owned.json' -and (Test-Path -LiteralPath (Join-Path $InstallRoot $_) -PathType Leaf) })
-if ($remainingOwned.Count -eq 0 -and (Test-Path -LiteralPath $OwnerPath) -and $PSCmdlet.ShouldProcess($OwnerPath, 'Remove completed ownership marker')) { Remove-Item -LiteralPath $OwnerPath -Force; $markerRemoved = $true }
-if ((Test-Path -LiteralPath $InstallRoot) -and @(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -eq 0 -and $PSCmdlet.ShouldProcess($InstallRoot, 'Remove empty install directory')) { Remove-Item -LiteralPath $InstallRoot -Force }
+if ($remainingOwned.Count -eq 0 -and (Test-Path -LiteralPath $OwnerPath)) { Remove-Item -LiteralPath $OwnerPath -Force; $markerRemoved = $true }
+if ((Test-Path -LiteralPath $InstallRoot) -and @(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -eq 0) { Remove-Item -LiteralPath $InstallRoot -Force }
 elseif (Test-Path -LiteralPath $InstallRoot) { Write-Warning "Preserved unexpected files under: $InstallRoot" }
 
 Write-Host 'SiteFilter native host default registrations and exact owned files were removed; unrelated registry state and files were preserved.'

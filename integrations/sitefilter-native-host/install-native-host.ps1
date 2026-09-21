@@ -13,8 +13,10 @@ param(
     [Parameter(DontShow)][string]$TestUvArchiveSha256,
     [Parameter(DontShow)][string]$TestUvInstallDirectory,
     [Parameter(DontShow)][switch]$TestRequireWindowsUv,
-    [Parameter(DontShow)][ValidateSet('', 'after-root-swap', 'after-first-registry', 'self-check')][string]$TestFailurePoint = '',
+    [Parameter(DontShow)][switch]$TestSkipMake,
+    [Parameter(DontShow)][ValidateSet('', 'after-root-swap', 'after-first-registry', 'after-first-registry-concurrent', 'self-check')][string]$TestFailurePoint = '',
     [Parameter(DontShow)][string]$TestSafetyBase,
+    [Parameter(DontShow)][string]$TestSelfCheckLocalAppData,
     [Parameter(DontShow)][switch]$SkipSelfCheck
 )
 
@@ -271,7 +273,8 @@ function Write-NativeFrame {
 function Read-NativeFrame {
     param([IO.Stream]$Stream)
     $header = New-Object byte[] 4
-    if ($Stream.Read($header, 0, 4) -ne 4) { throw 'Packaged host returned no complete frame.' }
+    $headerOffset = 0
+    while ($headerOffset -lt 4) { $read = $Stream.Read($header, $headerOffset, 4 - $headerOffset); if ($read -eq 0) { throw 'Packaged host returned no complete frame.' }; $headerOffset += $read }
     $length = [BitConverter]::ToUInt32($header, 0); if ($length -lt 1 -or $length -gt 1MB) { throw 'Packaged host returned an invalid frame length.' }
     $body = New-Object byte[] $length; $offset = 0
     while ($offset -lt $length) { $read = $Stream.Read($body, $offset, $length - $offset); if ($read -eq 0) { throw 'Packaged host response ended early.' }; $offset += $read }
@@ -286,9 +289,17 @@ function Invoke-HostSelfCheck {
     $process.StartInfo.RedirectStandardInput = $true; $process.StartInfo.RedirectStandardOutput = $true; $process.StartInfo.RedirectStandardError = $true
     $process.StartInfo.EnvironmentVariables['LOCALAPPDATA'] = $LocalAppData
     if (-not $process.Start()) { throw 'Could not start packaged native host.' }
-    Write-NativeFrame $process.StandardInput.BaseStream @{ v = 1; id = 'installer-self-check'; action = 'ping'; payload = @{} }
-    $response = Read-NativeFrame $process.StandardOutput.BaseStream; $process.StandardInput.Close()
-    if (-not $process.WaitForExit(70000)) { $process.Kill(); throw 'Native host self-check timed out.' }
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    try {
+        Write-NativeFrame $process.StandardInput.BaseStream @{ v = 1; id = 'installer-self-check'; action = 'ping'; payload = @{} }
+        $response = Read-NativeFrame $process.StandardOutput.BaseStream; $process.StandardInput.Close()
+        if (-not $process.WaitForExit(70000)) { $process.Kill(); throw 'Native host self-check timed out.' }
+        $stderr = $stderrTask.Result
+        if ($process.ExitCode -ne 0) { throw "Native host self-check exited $($process.ExitCode): $stderr" }
+    } finally {
+        if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+        $process.Dispose()
+    }
     if ($response.v -ne 1 -or $response.id -ne 'installer-self-check' -or $response.ok -ne $true) { throw "Native host self-check failed: $($response | ConvertTo-Json -Compress)" }
     return $response
 }
@@ -305,32 +316,41 @@ function Get-OwnedRuntimePid {
     return [long]$descriptor.pid
 }
 
-function Stop-VerifiedPreflightCollector {
-    param([bool]$HadOwnedBefore, [string]$RuntimePath, [string]$Distribution, [string]$LinuxPath, [string]$PreflightLog)
-    Write-Host "Staged preflight cleanup: owned_before=$HadOwnedBefore runtime=$RuntimePath"
+function Stop-ExactlyVerifiedCollector {
+    param([string]$RuntimePath, [string]$Distribution, [string]$LinuxPath, [string]$LogPath, [long]$ExpectedPid = -1)
     $afterPid = Get-OwnedRuntimePid $RuntimePath
-    Write-Host "Staged preflight cleanup: owned_after_pid=$afterPid"
     if ($afterPid -lt 1) { return }
-    $verifyScript = 'pid="$1"; project="$2"; [ -d "/proc/$pid" ] || exit 20; cwd=$(readlink -f "/proc/$pid/cwd") || exit 21; [ "$cwd" = "$project" ] || exit 22; cmd=$(tr "\0" " " < "/proc/$pid/cmdline") || exit 23; case "$cmd" in *"$project/.venv/bin/python3 backend/main.py"*) printf VERIFIED;; *) exit 24;; esac'
-    $verified = Invoke-External 'wsl.exe' @('-d', $Distribution, '--exec', 'sh', '-c', $verifyScript, 'sitefilter-installer-preflight', ([string]$afterPid), $LinuxPath) 'New preflight Collector verification failed'
-    if ($verified -ne 'VERIFIED') { throw 'New preflight Collector verification was inconclusive.' }
-    Write-Host "Stopping verified preflight-observed Collector PID $afterPid before install mutation."
-    Invoke-External 'wsl.exe' @('-d', $Distribution, '--exec', 'kill', '-TERM', ([string]$afterPid)) 'Could not stop the verified preflight Collector' | Out-Null
-    for ($attempt = 0; $attempt -lt 50; $attempt++) {
-        $previousPreference = $ErrorActionPreference
-        try { $ErrorActionPreference = 'Continue'; & wsl.exe -d $Distribution --exec kill -0 ([string]$afterPid) 2>$null; $aliveExit = $LASTEXITCODE }
-        finally { $ErrorActionPreference = $previousPreference }
-        if ($aliveExit -ne 0) {
-            for ($unlockAttempt = 0; $unlockAttempt -lt 25; $unlockAttempt++) {
-                if (-not (Test-Path -LiteralPath $PreflightLog -PathType Leaf)) { return }
-                try { $stream = [IO.File]::Open($PreflightLog, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); $stream.Dispose(); return }
-                catch { Start-Sleep -Milliseconds 200 }
-            }
-            throw 'Verified preflight Collector exited, but its exact staged log remained locked.'
-        }
-        Start-Sleep -Milliseconds 200
+    if ($ExpectedPid -gt 0 -and $afterPid -ne $ExpectedPid) { throw "Owned Collector PID changed from expected $ExpectedPid to $afterPid; refusing to signal it." }
+    $processScript = @'
+import os, pathlib, signal, sys, time
+pid = int(sys.argv[1]); project = pathlib.Path(sys.argv[2]); proc = pathlib.Path('/proc') / str(pid)
+expected_python = project / '.venv/bin/python3'
+def matches():
+    try:
+        cwd = pathlib.Path(os.readlink(proc / 'cwd'))
+        exe = pathlib.Path(os.readlink(proc / 'exe')).resolve()
+        argv = (proc / 'cmdline').read_bytes().split(b'\0')
+        if argv and argv[-1] == b'': argv.pop()
+        return cwd == project and exe == expected_python.resolve() and argv == [os.fsencode(str(expected_python)), b'backend/main.py']
+    except (FileNotFoundError, PermissionError, ProcessLookupError): return False
+if not proc.is_dir(): print('ABSENT'); raise SystemExit(0)
+if not matches(): print('MISMATCH'); raise SystemExit(21)
+os.kill(pid, signal.SIGTERM)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    if not proc.exists() or not matches(): print('STOPPED'); raise SystemExit(0)
+    time.sleep(0.2)
+print('TIMEOUT'); raise SystemExit(22)
+'@
+    Write-Host "Stopping exactly verified Collector PID $afterPid before filesystem mutation."
+    $result = Invoke-External 'wsl.exe' @('-d', $Distribution, '--exec', 'python3', '-c', $processScript, ([string]$afterPid), $LinuxPath) 'Exact Collector verification/termination failed'
+    if ($result -ne 'ABSENT' -and $result -ne 'STOPPED') { throw 'Collector termination was inconclusive.' }
+    for ($unlockAttempt = 0; $unlockAttempt -lt 25; $unlockAttempt++) {
+        if (-not $LogPath -or -not (Test-Path -LiteralPath $LogPath -PathType Leaf)) { return $afterPid }
+        try { $stream = [IO.File]::Open($LogPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); $stream.Dispose(); return $afterPid }
+        catch { Start-Sleep -Milliseconds 200 }
     }
-    throw "Verified preflight Collector PID $afterPid did not exit within 10 seconds."
+    throw 'Exactly verified Collector exited, but its owned log remained locked.'
 }
 
 $ResolvedProject = Resolve-ProjectPath $ProjectPath
@@ -352,19 +372,24 @@ foreach ($key in @($ChromeKey, $EdgeKey)) { if ($key -notlike 'HKCU:\Software\*'
 $plan = [ordered]@{ project_path = $ResolvedProject; linux_project_path = $LinuxProject; runtime_file = $RuntimeFile; distro = $Distro; install_root = $InstallRoot; manifest_path = $ManifestPath; allowed_origin = $ExtensionOrigin; chrome_registry_key = $ChromeKey; edge_registry_key = $EdgeKey }
 if ($WhatIfPreference) { [PSCustomObject]$plan | ConvertTo-Json -Compress; return }
 if (-not (Test-Path -LiteralPath $parentRoot)) { New-Item -ItemType Directory -Path $parentRoot -Force | Out-Null }
+$SelfCheckLocalAppData = if ($TestSelfCheckLocalAppData) { [IO.Path]::GetFullPath($TestSelfCheckLocalAppData) } elseif ((Split-Path $InstallRoot -Leaf) -eq 'NativeHost' -and (Split-Path (Split-Path $InstallRoot -Parent) -Leaf) -eq 'SiteFilter') { Split-Path (Split-Path $InstallRoot -Parent) -Parent } else { $env:LOCALAPPDATA }
 
 if (-not $SkipProvision) {
-    & wsl.exe -d $Distro --exec sh -lc 'command -v uv >/dev/null 2>&1 || test -x "$HOME/.local/bin/uv"'
-    if ($LASTEXITCODE -ne 0) { Invoke-External 'wsl.exe' @('-d', $Distro, '--exec', 'sh', '-lc', 'curl -LsSf https://astral.sh/uv/install.sh | sh') 'Could not install uv in WSL' | Out-Null }
+    $wslUvCheck = 'uv_path=$(command -v uv 2>/dev/null || true); if [ -z "$uv_path" ] && [ -x "$HOME/.local/bin/uv" ]; then uv_path="$HOME/.local/bin/uv"; fi; [ -n "$uv_path" ] || { echo "uv is required in WSL; install a trusted pinned release before retrying" >&2; exit 20; }; exec "$uv_path" --version'
+    $wslUvVersion = Invoke-External 'wsl.exe' @('-d', $Distro, '--exec', 'sh', '-lc', $wslUvCheck) 'A verified preinstalled WSL uv is required; mutable remote install scripts are not executed'
+    if ($wslUvVersion -notmatch '^uv [0-9]+\.') { throw "WSL uv returned an invalid version: $wslUvVersion" }
     $wslMake = 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; cd "$1"; exec make "$2"'
-    Invoke-External 'wsl.exe' @('-d', $Distro, '--exec', 'sh', '-lc', $wslMake, 'sitefilter-installer', $LinuxProject, 'install') 'WSL make install failed' | Out-Null
-    Invoke-External 'wsl.exe' @('-d', $Distro, '--exec', 'sh', '-lc', $wslMake, 'sitefilter-installer', $LinuxProject, 'build') 'WSL make build failed' | Out-Null
+    if (-not $TestSkipMake) {
+        Invoke-External 'wsl.exe' @('-d', $Distro, '--exec', 'sh', '-lc', $wslMake, 'sitefilter-installer', $LinuxProject, 'install') 'WSL make install failed' | Out-Null
+        Invoke-External 'wsl.exe' @('-d', $Distro, '--exec', 'sh', '-lc', $wslMake, 'sitefilter-installer', $LinuxProject, 'build') 'WSL make build failed' | Out-Null
+    }
 }
 
 $stageRoot = Join-Path $parentRoot ('.NativeHost-stage-' + [Guid]::NewGuid().ToString('N'))
 $rollbackRoot = Join-Path $parentRoot ('.NativeHost-rollback-' + [Guid]::NewGuid().ToString('N'))
-$mutated = $false; $oldRootMoved = $false; $stageMoved = $false; $unexpectedNames = @()
-$currentRegistry = @((Get-RegistryDefaultSnapshot 'chrome' $ChromeKey), (Get-RegistryDefaultSnapshot 'edge' $EdgeKey))
+$mutated = $false; $oldRootMoved = $false; $stageMoved = $false; $unexpectedNames = @(); $writtenRegistry = @()
+$preexistingOwnedPid = Get-OwnedRuntimePid $RuntimeFile; $preexistingOwnedWasRunning = $preexistingOwnedPid -gt 0; $preexistingStopped = $false
+$finalSelfCheckAttempted = $false
 try {
     New-Item -ItemType Directory -Path $stageRoot | Out-Null; Set-PrivateAclExact $stageRoot -Directory
     $stageExe = Join-Path $stageRoot 'sitefilter-native-host.exe'
@@ -407,6 +432,7 @@ try {
     Write-Utf8NoBomAtomic (Join-Path $stageRoot '.sitefilter-native-host-owned.json') ($state | ConvertTo-Json -Depth 10)
     foreach ($name in $OwnedFileNames) { $candidate = Join-Path $stageRoot $name; if (Test-Path -LiteralPath $candidate -PathType Leaf) { Set-PrivateAclExact $candidate } }
     Assert-NoReparseTree $stageRoot
+    if (-not $PSCmdlet.ShouldProcess($InstallRoot, 'Validate the staged host, stop only an exactly verified owned Collector, atomically replace the root, and register Chrome and Edge')) { return }
 
     if (-not $SkipSelfCheck -and -not $TestHostExecutable) {
         $preflightLocal = Join-Path $stageRoot '.preflight-local'; $preflightConfig = Join-Path $preflightLocal 'SiteFilter\NativeHost'
@@ -416,7 +442,9 @@ try {
         Write-Host "Staged preflight starting: owned_before=$hadOwnedBefore"
         try { $null = Invoke-HostSelfCheck $stageExe $preflightLocal }
         finally {
-            Stop-VerifiedPreflightCollector -HadOwnedBefore $hadOwnedBefore -RuntimePath $RuntimeFile -Distribution $Distro -LinuxPath $LinuxProject -PreflightLog (Join-Path $preflightConfig 'collector-startup.log')
+            $observedLog = if ($hadOwnedBefore) { Join-Path $InstallRoot 'collector-startup.log' } else { Join-Path $preflightConfig 'collector-startup.log' }
+            $stoppedPid = Stop-ExactlyVerifiedCollector -RuntimePath $RuntimeFile -Distribution $Distro -LinuxPath $LinuxProject -LogPath $observedLog
+            if ($preexistingOwnedWasRunning -and $stoppedPid -eq $preexistingOwnedPid) { $preexistingStopped = $true }
             Assert-NoReparseTree $preflightLocal; Remove-SafeTree $preflightLocal
         }
     }
@@ -425,22 +453,29 @@ try {
         Assert-NoReparseTree $InstallRoot
         foreach ($item in @(Get-ChildItem -LiteralPath $InstallRoot -Force)) { if ($OwnedFileNames -notcontains $item.Name) { $unexpectedNames += $item.Name } }
     }
-    if (-not $PSCmdlet.ShouldProcess($InstallRoot, 'Atomically replace the staged native host and register Chrome and Edge')) { return }
     $mutated = $true
-    if (Test-Path -LiteralPath $InstallRoot) { Move-Item -LiteralPath $InstallRoot -Destination $rollbackRoot; $oldRootMoved = $true }
-    Move-Item -LiteralPath $stageRoot -Destination $InstallRoot; $stageMoved = $true
+    if (Test-Path -LiteralPath $InstallRoot) { [IO.Directory]::Move($InstallRoot, $rollbackRoot); $oldRootMoved = $true }
+    [IO.Directory]::Move($stageRoot, $InstallRoot); $stageMoved = $true
     if ($TestFailurePoint -eq 'after-root-swap') { throw 'Injected failure after root swap.' }
     foreach ($name in $unexpectedNames) { Move-Item -LiteralPath (Join-Path $rollbackRoot $name) -Destination (Join-Path $InstallRoot $name) }
 
     $index = 0
-    foreach ($key in @($ChromeKey, $EdgeKey)) {
+    foreach ($entry in @(@{ browser = 'chrome'; path = $ChromeKey }, @{ browser = 'edge'; path = $EdgeKey })) {
+        $key = $entry.path
+        $writeSnapshot = Get-RegistryDefaultSnapshot $entry.browser $key
         if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
         Set-Item -LiteralPath $key -Value $ManifestPath
+        $writtenRegistry += [ordered]@{ path = $key; snapshot = $writeSnapshot }
         $index++
         if ($index -eq 1 -and $TestFailurePoint -eq 'after-first-registry') { throw 'Injected failure after first registry write.' }
+        if ($index -eq 1 -and $TestFailurePoint -eq 'after-first-registry-concurrent') { Set-Item -LiteralPath $key -Value 'C:\concurrent\replacement.json'; throw 'Injected concurrent registry replacement after first registry write.' }
     }
-    if ($TestFailurePoint -eq 'self-check') { throw 'Injected failure at final self-check.' }
-    if (-not $SkipSelfCheck -and -not $TestHostExecutable) { $response = Invoke-HostSelfCheck (Join-Path $InstallRoot 'sitefilter-native-host.exe') $env:LOCALAPPDATA; Write-Host "Native host self-check: $($response | ConvertTo-Json -Compress)" }
+    if (-not $SkipSelfCheck -and -not $TestHostExecutable) {
+        $finalSelfCheckAttempted = $true
+        $response = Invoke-HostSelfCheck (Join-Path $InstallRoot 'sitefilter-native-host.exe') $SelfCheckLocalAppData
+        Write-Host "Native host self-check: $($response | ConvertTo-Json -Compress)"
+        if ($TestFailurePoint -eq 'self-check') { throw 'Injected failure after the real final self-check started the Collector.' }
+    } elseif ($TestFailurePoint -eq 'self-check') { throw 'Injected failure at the skipped test self-check seam.' }
     Set-PrivateAclExact $InstallRoot -Directory
     foreach ($name in $OwnedFileNames) { $installedFile = Join-Path $InstallRoot $name; if (Test-Path -LiteralPath $installedFile -PathType Leaf) { Set-PrivateAclExact $installedFile } }
 
@@ -450,14 +485,31 @@ try {
     }
 } catch {
     $failure = $_
+    if ($finalSelfCheckAttempted) {
+        try {
+            $newPid = Get-OwnedRuntimePid $RuntimeFile
+            if ($newPid -gt 0 -and (Test-Path -LiteralPath (Join-Path $InstallRoot 'collector-startup.log') -PathType Leaf)) {
+                $null = Stop-ExactlyVerifiedCollector -RuntimePath $RuntimeFile -Distribution $Distro -LinuxPath $LinuxProject -LogPath (Join-Path $InstallRoot 'collector-startup.log') -ExpectedPid $newPid
+            }
+        } catch { $failure = [InvalidOperationException]::new("Final self-check cleanup failed before rollback: $($_.Exception.Message)", $failure.Exception) }
+    }
     if ($mutated) {
-        Restore-RegistryDefaultExact $currentRegistry[0] $ChromeKey; Restore-RegistryDefaultExact $currentRegistry[1] $EdgeKey
+        $rollbackWrites = @($writtenRegistry); [array]::Reverse($rollbackWrites)
+        foreach ($written in $rollbackWrites) {
+            $current = Get-RegistryDefaultSnapshot 'rollback' $written.path
+            if ($current.default_existed -and [string]$current.default_data -eq $ManifestPath) { Restore-RegistryDefaultExact $written.snapshot $written.path }
+        }
         if ($stageMoved -and (Test-Path -LiteralPath $InstallRoot)) {
             foreach ($name in $unexpectedNames) { $item = Join-Path $InstallRoot $name; if ((Test-Path -LiteralPath $item) -and $oldRootMoved) { Move-Item -LiteralPath $item -Destination (Join-Path $rollbackRoot $name) } }
             foreach ($name in $OwnedFileNames) { $file = Join-Path $InstallRoot $name; if (Test-Path -LiteralPath $file -PathType Leaf) { Remove-Item -LiteralPath $file -Force } }
             if (@(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -eq 0) { Remove-Item -LiteralPath $InstallRoot -Force }
         }
-        if ($oldRootMoved -and (Test-Path -LiteralPath $rollbackRoot) -and -not (Test-Path -LiteralPath $InstallRoot)) { Move-Item -LiteralPath $rollbackRoot -Destination $InstallRoot }
+        if ($oldRootMoved -and (Test-Path -LiteralPath $rollbackRoot) -and -not (Test-Path -LiteralPath $InstallRoot)) { [IO.Directory]::Move($rollbackRoot, $InstallRoot) }
+    }
+    if ($preexistingStopped -and (Test-Path -LiteralPath (Join-Path $InstallRoot 'sitefilter-native-host.exe') -PathType Leaf)) {
+        try {
+            if ((Get-OwnedRuntimePid $RuntimeFile) -lt 1) { $null = Invoke-HostSelfCheck (Join-Path $InstallRoot 'sitefilter-native-host.exe') $SelfCheckLocalAppData }
+        } catch { $failure = [InvalidOperationException]::new("Rollback restored files but could not restore the pre-install Collector running state: $($_.Exception.Message)", $failure.Exception) }
     }
     throw $failure
 } finally {

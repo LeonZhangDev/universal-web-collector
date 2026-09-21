@@ -20,6 +20,18 @@ from core.config import settings
 _SECOND_LEVEL = {"com", "net", "org", "gov", "edu", "co", "ac", "mil", "biz", "info"}
 
 
+def _interruptible_wait(seconds, progress_cb=None):
+    deadline = time.monotonic() + max(0.0, seconds)
+    waiter = threading.Event()
+    while True:
+        if progress_cb:
+            progress_cb()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        waiter.wait(min(0.1, remaining))
+
+
 class DomainLimiter:
     """站点级闸门: 令牌桶(节奏) + 信号量(并发) + AIMD 自适应。
 
@@ -102,7 +114,7 @@ class DomainLimiter:
 
     # ---- 令牌桶 ----
 
-    def _wait_token(self):
+    def _wait_token(self, progress_cb=None):
         """等到拿到一个令牌。
 
         ⚠️ 锁内只算不睡: 拿着锁 sleep 会把所有并发线程一起串行掉, 那正是旧实现
@@ -132,13 +144,17 @@ class DomainLimiter:
                     wait += random.uniform(0.0, max(0.0, self._max - self._min))
             if wait <= 0:
                 return
-            time.sleep(wait)
+            _interruptible_wait(wait, progress_cb)
 
     @contextmanager
-    def slot(self):
-        self._sem.acquire()
+    def slot(self, progress_cb=None):
+        if progress_cb is None:
+            self._sem.acquire()
+        else:
+            while not self._sem.acquire(timeout=0.1):
+                progress_cb()
         try:
-            self._wait_token()
+            self._wait_token(progress_cb)
             yield
         finally:
             self._sem.release()
@@ -325,7 +341,7 @@ def clear_cooldown(domain=None):
             _COOLDOWN.clear()
 
 
-def _await_cooldown(url, log=None):
+def _await_cooldown(url, log=None, progress_cb=None):
     """等到该站点的冷却结束。多线程会各自重新检查截止时间, 不会集体惊醒。"""
     slept = 0.0
     while True:
@@ -335,14 +351,14 @@ def _await_cooldown(url, log=None):
         nap = min(left, _COOLDOWN_POLL) * random.uniform(0.9, 1.1)
         if log and slept <= 0:
             log(f"站点 {site_key(url)} 被限速冷却中, 等待约 {left:.0f}s 后继续")
-        time.sleep(nap)
+        _interruptible_wait(nap, progress_cb)
         slept += nap
     if log and slept > 0:
         log(f"冷却结束(等了 {slept:.0f}s), 恢复请求")
     return slept
 
 
-def domain_slot(url, log=None):
+def domain_slot(url, log=None, progress_cb=None):
     """用法: with domain_slot(url): requests.get(...)
 
     函数名保留是为兼容既有调用方; 实际按 site_key(url) 分组,
@@ -351,5 +367,5 @@ def domain_slot(url, log=None):
     进闸门前先等站点冷却结束 —— 冷却中的站点上再快的并发也只是在踩雷。
     """
     if cooldown_left(url) > 0:
-        _await_cooldown(url, log=log)
-    return _limiter(site_key(url)).slot()
+        _await_cooldown(url, log=log, progress_cb=progress_cb)
+    return _limiter(site_key(url)).slot(progress_cb=progress_cb)

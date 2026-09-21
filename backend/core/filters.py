@@ -424,6 +424,7 @@ def probe_size(url, headers=None, timeout=None):
     探测失败(405/超时/无 Content-Length)返回 None —— 此时一律放行,
     不因为探针本身的问题误杀资源。
     """
+    resp = None
     try:
         # Accept 不可省: 部分 WAF 只给 */* 或不给会直接 403, 导致探测全部失败
         h = {"User-Agent": settings.user_agent, "Accept": DEFAULT_ACCEPT}
@@ -439,13 +440,14 @@ def probe_size(url, headers=None, timeout=None):
         # 重来一遍 —— N 个资源就是 N 次握手, 而探测本身就是为了省请求。
         # 惰性导入: core 层不该在**导入期**依赖 downloaders, 但连接池只有那一份。
         try:
-            from downloaders.base import SESSION as _shared
+            from downloaders.base import SESSION as _shared, TASK_IO_TIMEOUT as _bounded
         except Exception:
             _shared = requests
+            _bounded = (4.0, 4.0)
         resp = _shared.head(
             url,
             headers=h,
-            timeout=timeout or settings.request_timeout,
+            timeout=timeout or _bounded,
             allow_redirects=True,
             proxies=proxies,
         )
@@ -456,4 +458,10 @@ def probe_size(url, headers=None, timeout=None):
             return int(cl)
     except Exception:
         return None
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
     return None

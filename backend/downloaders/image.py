@@ -1,6 +1,12 @@
 from pathlib import Path
 from core.config import IMAGE_ACCEPT
-from .base import build_headers, download_with_mirrors, resolve_target
+from .base import (
+    TASK_IO_TIMEOUT,
+    build_headers,
+    download_with_mirrors,
+    resolve_target,
+    task_session,
+)
 from .browser_session import browser_session_for
 
 
@@ -18,18 +24,26 @@ class ImageDownloader:
     filename: 外部指定的落盘相对路径, 优先级高于 URL 末段(见 core/naming.py)。
     """
 
+    def __init__(self):
+        self.session = None
+
+    def close(self):
+        session, self.session = self.session, None
+        if session is not None:
+            session.close()
+
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None, info=None):
         h = build_headers(referer, headers, accept=IMAGE_ACCEPT)
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         path = resolve_target(save_dir, url, filename, ".jpg")
-        session = _session_for(url)
+        self.session = task_session(_session_for(url))
         try:
             sha, real = download_with_mirrors(
-                url, path, h, session=session, progress_cb=progress_cb,
+                url, path, h, session=self.session, progress_cb=progress_cb,
                 mirrors=mirrors, log=log, require_image=True, info=info,
+                request_timeout=TASK_IO_TIMEOUT,
             )
         finally:
-            if session is not None:
-                session.close()
+            self.close()
         return real, sha

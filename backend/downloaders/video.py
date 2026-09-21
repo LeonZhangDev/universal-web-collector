@@ -40,20 +40,20 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
-
 from core.cancel import TaskCancelled
 from core.config import settings
 from core.ffmpeg import find_ffmpeg
 from collectors.hls import inspect_playlist
 from .base import (
     CHUNK,
+    TASK_IO_TIMEOUT,
     build_headers,
     download_with_mirrors,
     fill_info,
     resolve_target,
     safe_filename,
     sha256_file,
+    task_session,
 )
 from .browser_session import browser_session_for
 from .ratelimit import DomainLimiter
@@ -64,7 +64,7 @@ REJECT_CT = "text/html"
 
 ENGINES = ("auto", "ffmpeg", "builtin")
 MIN_HLS_DURATION_RATIO = 0.99
-SHUTDOWN_IO_TIMEOUT = 4.0
+SHUTDOWN_IO_TIMEOUT = TASK_IO_TIMEOUT
 
 
 def _short(err, limit=180):
@@ -162,9 +162,7 @@ class VideoDownloader:
                  info=None, **kw):
         owned = self.session is None
         if owned:
-            self.session = browser_session_for(url) or requests.Session()
-            if settings.proxy and not getattr(self.session, "proxies", None):
-                self.session.proxies.update({"http": settings.proxy, "https": settings.proxy})
+            self.session = task_session(browser_session_for(url))
         try:
             h = build_headers(referer, headers)
             if _is_dash(url):

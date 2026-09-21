@@ -1,20 +1,12 @@
 from pathlib import Path
-from urllib.parse import urlparse
-
-from core.config import IMAGE_ACCEPT, settings
+from core.config import IMAGE_ACCEPT
 from .base import build_headers, download_with_mirrors, resolve_target
+from .browser_session import browser_session_for
 
 
 def _session_for(url):
     """Use a Chromium TLS fingerprint for XChina's Cloudflare media host."""
-    if (urlparse(url).hostname or "").lower() != "img.xchina.io":
-        return None
-    from curl_cffi import requests as curl_requests
-
-    session = curl_requests.Session(impersonate="chrome")
-    if settings.proxy:
-        session.proxies.update({"http": settings.proxy, "https": settings.proxy})
-    return session
+    return browser_session_for(url)
 
 
 class ImageDownloader:

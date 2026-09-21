@@ -55,6 +55,7 @@ from .base import (
     safe_filename,
     sha256_file,
 )
+from .browser_session import browser_session_for
 from .ratelimit import DomainLimiter
 
 # 视频 CDN 常返回 application/octet-stream, 像图片那样用白名单会误杀真实视频;
@@ -126,21 +127,30 @@ class VideoDownloader:
     """
 
     def __init__(self):
-        self.session = requests.Session()
-        if settings.proxy:
-            self.session.proxies.update({"http": settings.proxy, "https": settings.proxy})
-
+        # Tests/collectors may inject a session. Sessions created by download()
+        # are owned by that call and closed on every success/failure path.
+        self.session = None
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None,
                  info=None, **kw):
-        h = build_headers(referer, headers)
-        if _is_dash(url):
-            raise RuntimeError("暂不支持 DASH(.mpd), 请改用 ffmpeg 手工下载")
-        if _is_hls(url):
-            return self._download_m3u8(url, h, save_dir, progress_cb, log, mirrors,
+        owned = self.session is None
+        if owned:
+            self.session = browser_session_for(url) or requests.Session()
+            if settings.proxy and not getattr(self.session, "proxies", None):
+                self.session.proxies.update({"http": settings.proxy, "https": settings.proxy})
+        try:
+            h = build_headers(referer, headers)
+            if _is_dash(url):
+                raise RuntimeError("暂不支持 DASH(.mpd), 请改用 ffmpeg 手工下载")
+            if _is_hls(url):
+                return self._download_m3u8(url, h, save_dir, progress_cb, log, mirrors,
+                                           filename, info)
+            return self._download_file(url, h, save_dir, mirrors, progress_cb, log,
                                        filename, info)
-        return self._download_file(url, h, save_dir, mirrors, progress_cb, log,
-                                   filename, info)
+        finally:
+            if owned:
+                self.session.close()
+                self.session = None
 
     # ---- mp4 直链 ----
 

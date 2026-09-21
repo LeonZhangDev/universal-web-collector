@@ -1,4 +1,4 @@
-.PHONY: install start start-dev backend frontend test build docker clean
+.PHONY: install start start-native start-dev backend frontend test build docker clean
 
 install:
 	uv sync --group dev
@@ -7,6 +7,9 @@ install:
 
 start:
 	uv run python scripts/start.py
+
+start-native:
+	uv run python scripts/start.py --native --no-open --idle-minutes 30
 
 start-dev:
 	uv run python scripts/start.py --dev

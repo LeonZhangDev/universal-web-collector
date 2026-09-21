@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -16,6 +17,175 @@ from scripts import start
 POSIX_TERMINATION_SIGNALS = [signal.SIGTERM]
 if hasattr(signal, "SIGHUP"):
     POSIX_TERMINATION_SIGNALS.append(signal.SIGHUP)
+
+
+def _fake_uv(path, label):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"{label}:$*\" > \"$UWC_UV_CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _fake_runtime_uv(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$0:$*\" >> \"$UWC_UV_CAPTURE\"\n"
+        "if [ \"$1\" = run ] && [ \"$2\" = python ]; then\n"
+        "  shift 2\n"
+        "  exec \"$UWC_TEST_PYTHON\" \"$@\"\n"
+        "fi\n"
+        "if [ \"$1\" = sync ]; then exit 17; fi\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _run_native_make(tmp_path, *, path_uv=False, home_uv=False, unset_home=False):
+    make = shutil.which("make")
+    if make is None:
+        pytest.skip("make is unavailable")
+    home = tmp_path / "home"
+    path_dir = tmp_path / "path"
+    capture = tmp_path / "uv-call.txt"
+    path_dir.mkdir()
+    if path_uv:
+        _fake_uv(path_dir / "uv", "path")
+    if home_uv:
+        _fake_uv(home / ".local" / "bin" / "uv", "home")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": str(path_dir),
+        "UWC_UV_CAPTURE": str(capture),
+    }
+    if unset_home:
+        env.pop("HOME", None)
+    result = subprocess.run(
+        [make, "start-native"],
+        cwd=start.ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    call = capture.read_text(encoding="utf-8").strip() if capture.exists() else None
+    return result, call
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+def test_start_native_falls_back_to_user_uv(tmp_path):
+    result, call = _run_native_make(tmp_path, home_uv=True)
+
+    assert result.returncode == 0, result.stderr
+    assert call == "home:run python scripts/start.py --native --no-open --idle-minutes 30"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+def test_start_native_prefers_path_uv(tmp_path):
+    result, call = _run_native_make(tmp_path, path_uv=True, home_uv=True)
+
+    assert result.returncode == 0, result.stderr
+    assert call == "path:run python scripts/start.py --native --no-open --idle-minutes 30"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+def test_start_native_reports_missing_uv(tmp_path):
+    result, call = _run_native_make(tmp_path)
+
+    assert result.returncode != 0
+    assert call is None
+    assert "$HOME/.local/bin/uv" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+def test_start_native_reports_missing_uv_with_unset_home(tmp_path):
+    result, call = _run_native_make(tmp_path, unset_home=True)
+
+    assert result.returncode != 0
+    assert call is None
+    assert "start-native: uv not found" in result.stderr
+    assert "parameter not set" not in result.stderr.lower()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+def test_native_fallback_passes_uv_to_internal_sync(tmp_path):
+    make = shutil.which("make")
+    if make is None:
+        pytest.skip("make is unavailable")
+    home = tmp_path / "home"
+    path_dir = tmp_path / "path"
+    path_dir.mkdir()
+    uv = home / ".local" / "bin" / "uv"
+    capture = tmp_path / "uv-calls.txt"
+    _fake_runtime_uv(uv)
+
+    result = subprocess.run(
+        [make, "start-native"],
+        cwd=start.ROOT,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": str(path_dir),
+            "UWC_RUNTIME_FILE": str(tmp_path / "runtime.json"),
+            "UWC_SKIP_BROWSER_CHECK": "1",
+            "UWC_TEST_PYTHON": sys.executable,
+            "UWC_UV_CAPTURE": str(capture),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    calls = capture.read_text(encoding="utf-8").splitlines()
+    assert result.returncode != 0
+    assert calls == [
+        f"{uv}:run python scripts/start.py --native --no-open --idle-minutes 30",
+        f"{uv}:sync",
+    ]
+
+
+@pytest.mark.parametrize("invalid", ["relative/uv", "/missing/uv"])
+def test_invalid_internal_uv_falls_back_to_path(tmp_path, monkeypatch, invalid):
+    path_uv = tmp_path / "path-uv"
+    _fake_uv(path_uv, "path")
+    monkeypatch.setenv("UWC_START_UV", invalid)
+    monkeypatch.setattr(start.shutil, "which", lambda name: str(path_uv))
+
+    assert start.resolve_uv_command() == str(path_uv)
+
+
+def test_nonexecutable_internal_uv_falls_back_to_path(tmp_path, monkeypatch):
+    internal_uv = tmp_path / "internal-uv"
+    internal_uv.write_text("not executable", encoding="utf-8")
+    path_uv = tmp_path / "path-uv"
+    _fake_uv(path_uv, "path")
+    monkeypatch.setenv("UWC_START_UV", str(internal_uv.resolve()))
+    monkeypatch.setattr(start.shutil, "which", lambda name: str(path_uv))
+
+    assert start.resolve_uv_command() == str(path_uv)
+
+
+def test_path_uv_is_used_by_check_env(monkeypatch):
+    calls = []
+    monkeypatch.delenv("UWC_START_UV", raising=False)
+    monkeypatch.setattr(start.shutil, "which", lambda name: "/opt/bin/uv")
+    monkeypatch.setattr(
+        start,
+        "run",
+        lambda cmd, **kwargs: (
+            calls.append(cmd) or SimpleNamespace(returncode=1)
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        start.check_env(dev=False, force_build=False)
+
+    assert calls == [["/opt/bin/uv", "sync"]]
 
 
 def test_parse_native_runtime_arguments(tmp_path):

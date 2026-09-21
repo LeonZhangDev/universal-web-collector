@@ -30,6 +30,7 @@ DEFAULT_PORT = 8000
 DEFAULT_FRONT_PORT = 5173
 DEFAULT_RUNTIME_FILE = ROOT / "data" / "native-runtime.json"
 NATIVE_PROTOCOL_VERSION = 1
+START_UV_ENV = "UWC_START_UV"
 NATIVE_BUSY_TASK_STATES = frozenset(
     {"pending", "running", "extracting", "downloading", "paused"}
 )
@@ -65,6 +66,26 @@ def which(name):
     return p
 
 
+def resolve_uv_command():
+    """Resolve uv without treating an untrusted env value as a command."""
+    internal = os.environ.get(START_UV_ENV)
+    if internal:
+        candidate = Path(internal)
+        if (
+            candidate.is_absolute()
+            and candidate.is_file()
+            and os.access(candidate, os.X_OK)
+        ):
+            return str(candidate)
+    path_uv = shutil.which("uv")
+    if path_uv:
+        return path_uv
+    fail(
+        "未找到 uv。请将 uv 加入 PATH，或通过 start-native 使用"
+        " $HOME/.local/bin/uv"
+    )
+
+
 # ---- 环境自检 ----
 
 def chromium_installed():
@@ -87,9 +108,10 @@ def vite_cmd(*args):
 def check_env(dev, force_build):
     dist_ready = (DIST / "index.html").is_file()
     need_node = dev or force_build or not dist_ready
+    uv = resolve_uv_command()
 
     print("[1/5] 后端依赖 (uv sync)")
-    if run(["uv", "sync"], cwd=ROOT).returncode != 0:
+    if run([uv, "sync"], cwd=ROOT).returncode != 0:
         fail("uv sync 失败, 检查网络或 pyproject.toml")
     ok("后端依赖就绪")
 

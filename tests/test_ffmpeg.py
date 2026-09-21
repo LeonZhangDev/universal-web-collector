@@ -228,6 +228,71 @@ def test_hls_duration_validation_rejects_successful_but_truncated_output(
         _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
 
 
+def test_hls_duration_validation_fails_closed_without_probe(monkeypatch, tmp_path):
+    path = tmp_path / "unverified.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: None)
+
+    with pytest.raises(RuntimeError, match="无法验证"):
+        _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
+
+
+def test_hls_duration_probe_timeout_fails_closed(monkeypatch, tmp_path):
+    path = tmp_path / "timeout.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(
+        video_mod.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            video_mod.subprocess.TimeoutExpired(a[0], k.get("timeout"))
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="无法验证"):
+        _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
+
+
+@pytest.mark.parametrize(
+    ("actual", "accepted"),
+    [(99.0, True), (98.999, False), (9.6, True), (9.4, False)],
+)
+def test_hls_duration_boundary_and_short_container_tolerance(
+    monkeypatch, tmp_path, actual, accepted
+):
+    expected = 100.0 if actual > 20 else 10.0
+    path = tmp_path / "boundary.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: actual)
+
+    if accepted:
+        assert _validate_hls_duration(
+            path, {"duration": expected}, "/usr/bin/ffmpeg"
+        ) == actual
+    else:
+        with pytest.raises(RuntimeError, match="截断"):
+            _validate_hls_duration(path, {"duration": expected}, "/usr/bin/ffmpeg")
+
+
+def test_direct_video_does_not_require_hls_duration_probe(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        video_mod,
+        "_validate_hls_duration",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("HLS-only guard")),
+    )
+    monkeypatch.setattr(
+        video_mod,
+        "download_with_mirrors",
+        lambda url, path, headers, **kw: ("a" * 64, path),
+    )
+
+    path, digest = VideoDownloader().download(
+        "https://example.com/video.mp4", save_dir=tmp_path
+    )
+    assert path.suffix == ".mp4"
+    assert digest == "a" * 64
+
+
 def test_hls_duration_validation_accepts_small_container_variance(monkeypatch, tmp_path):
     path = tmp_path / "complete.mp4"
     path.write_bytes(b"not-used")

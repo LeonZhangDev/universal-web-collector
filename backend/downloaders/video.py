@@ -109,13 +109,21 @@ def _validate_hls_duration(path, info, ff):
     """拒绝 ffmpeg 退出码为 0、但只封装了播放列表前一小段的假成功。"""
     expected = float((info or {}).get("duration") or 0)
     actual = _probe_media_duration(path, ff)
-    if actual is None or expected <= 0:
+    if expected <= 0:
         return actual
-    if actual < expected * MIN_HLS_DURATION_RATIO:
+    if actual is None:
+        raise RuntimeError(
+            "ffmpeg 产物无法验证时长: ffprobe 缺失、超时或返回无效结果"
+        )
+    # For normal/long videos this is exactly the 99% gate. Very short
+    # containers can differ by a few hundred milliseconds due to timestamp
+    # rounding, so allow at most 0.5s there rather than rejecting valid clips.
+    tolerance = max(expected * (1.0 - MIN_HLS_DURATION_RATIO), 0.5)
+    if expected - actual > tolerance:
         raise RuntimeError(
             "ffmpeg 产物疑似截断: "
             f"实际 {actual:.1f}s / 播放列表 {expected:.1f}s "
-            f"(< {MIN_HLS_DURATION_RATIO:.0%})"
+            f"(允许误差 {tolerance:.1f}s)"
         )
     return actual
 

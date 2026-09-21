@@ -62,6 +62,7 @@ from .ratelimit import DomainLimiter
 REJECT_CT = "text/html"
 
 ENGINES = ("auto", "ffmpeg", "builtin")
+MIN_HLS_DURATION_RATIO = 0.90
 
 
 def _short(err, limit=180):
@@ -79,6 +80,43 @@ def _is_hls(url):
 
 def _is_dash(url):
     return _path_only(url).endswith(".mpd")
+
+
+def _probe_media_duration(path, ff):
+    """用 ffprobe 读取最终容器时长；本机没有探测器时返回 None。"""
+    sibling = Path(ff).with_name("ffprobe.exe" if Path(ff).suffix.lower() == ".exe" else "ffprobe")
+    probe = str(sibling) if sibling.is_file() else shutil.which("ffprobe")
+    if not probe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                probe, "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return float(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _validate_hls_duration(path, info, ff):
+    """拒绝 ffmpeg 退出码为 0、但只封装了播放列表前一小段的假成功。"""
+    expected = float((info or {}).get("duration") or 0)
+    actual = _probe_media_duration(path, ff)
+    if actual is None or expected <= 0:
+        return actual
+    if actual < expected * MIN_HLS_DURATION_RATIO:
+        raise RuntimeError(
+            "ffmpeg 产物疑似截断: "
+            f"实际 {actual:.1f}s / 播放列表 {expected:.1f}s "
+            f"(< {MIN_HLS_DURATION_RATIO:.0%})"
+        )
+    return actual
 
 
 class VideoDownloader:
@@ -185,6 +223,7 @@ class VideoDownloader:
             path = out / f"{stem}.mp4"
             try:
                 self._ffmpeg_pull(leaf, headers, path, ff, progress_cb=progress_cb)
+                _validate_hls_duration(path, info, ff)
                 if progress_cb:
                     progress_cb()
                 if log:
@@ -413,7 +452,7 @@ class VideoDownloader:
         # 但有些 CDN 用 .jpg/.php 之类的伪装分片 URL, 默认值会直接拒绝拉取。
         # 放在 -i 之前(它是 demuxer 选项)。
         self._run_ffmpeg([
-            ff, "-y", "-nostats", *args, *net,
+            ff, "-y", "-nostats", "-xerror", *args, *net,
             "-allowed_extensions", "ALL",
             "-i", url, "-c", "copy", str(path),
         ], progress_cb=progress_cb)

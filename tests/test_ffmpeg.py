@@ -14,7 +14,14 @@ from core import config as cfgmod
 from core.cancel import TaskCancelled
 from core.config import settings
 import downloaders.video as video_mod
-from downloaders.video import ENGINES, VideoDownloader, _is_dash, _is_hls, _short
+from downloaders.video import (
+    ENGINES,
+    VideoDownloader,
+    _is_dash,
+    _is_hls,
+    _short,
+    _validate_hls_duration,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -207,6 +214,28 @@ def test_ffmpeg_pull_heartbeats_and_terminates_on_cancel(monkeypatch):
     assert ("tick", None) in calls
     assert ("terminate", None) in calls
     assert ("kill", None) not in calls
+
+
+def test_hls_duration_validation_rejects_successful_but_truncated_output(
+    monkeypatch, tmp_path
+):
+    """ffmpeg exit 0 也可能只产出前几分钟，必须与预检总时长交叉校验。"""
+    path = tmp_path / "truncated.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: 270.0)
+
+    with pytest.raises(RuntimeError, match="截断"):
+        _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
+
+
+def test_hls_duration_validation_accepts_small_container_variance(monkeypatch, tmp_path):
+    path = tmp_path / "complete.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: 5400.0)
+
+    assert _validate_hls_duration(
+        path, {"duration": 5442.0}, "/usr/bin/ffmpeg"
+    ) == 5400.0
 
 
 # ---- URL 形态判定 ----

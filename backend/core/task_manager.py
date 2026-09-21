@@ -473,6 +473,14 @@ class TaskManager:
         连接是模块级、可被 monkeypatch 替换的), 症状是"别的用例的任务被写进
         莫名其妙的错误信息", 表现为随机失败, 极难定位。
         """
+        # 先向所有正在运行的任务广播取消。否则服务收到 SIGTERM 后，uvicorn
+        # 虽然已经关闭监听，ThreadPoolExecutor 的非 daemon worker 仍会等长视频
+        # 下载结束，导致 Native Host 安装器的精确 10 秒停止门禁超时。
+        with self._active_lock:
+            entries = list(self._active.values())
+        for entry in entries:
+            entry["cancel"].set()
+
         self._watchdog_stop.set()
         # 退出登记: 本实例不再持有任何任务, 它留下的活动任务应可被回收
         _unregister_manager(self)

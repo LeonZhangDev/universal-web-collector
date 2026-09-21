@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from api.sessions import router as sessions_router
 from api.tasks import router
 from core.config import settings
-from core.task_manager import recover_orphans
+from core.task_manager import recover_orphans, task_manager
 
 logger = logging.getLogger("uwc")
 
@@ -24,7 +24,12 @@ async def lifespan(app):
     被导入方当时的 DB_PATH。挂到 lifespan 上, 只有真正起服务才执行。
     """
     recover_orphans()
-    yield
+    try:
+        yield
+    finally:
+        # Native 模式的安装/重启会向后端发送 SIGTERM。必须把取消信号传给
+        # 下载 worker；否则监听已关闭但 Python 仍被 executor 线程阻塞。
+        task_manager.shutdown(wait=False)
 
 
 app = FastAPI(title="Universal Web Collector v10", lifespan=lifespan)

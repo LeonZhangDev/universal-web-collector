@@ -5,7 +5,7 @@ param(
     [Parameter(DontShow)][string]$InstallRoot,
     [Parameter(DontShow)][string]$RegistryRoot = 'HKCU:\Software',
     [Parameter(DontShow)][string]$TestSafetyBase,
-    [Parameter(DontShow)][ValidateSet('', 'Verified', 'Unowned', 'WrongCommand', 'PidChanged', 'Absent')][string]$TestProcessState = '',
+    [Parameter(DontShow)][ValidateSet('', 'Verified', 'Unowned', 'WrongCommand', 'PidChanged', 'PidfdUnavailable', 'Absent')][string]$TestProcessState = '',
     [Parameter(DontShow)][string]$TestSignalLog
 )
 
@@ -91,6 +91,7 @@ function Invoke-VerifiedOwnedCollectorStop {
     if ($TestProcessState) {
         if ($TestProcessState -eq 'Unowned' -or $TestProcessState -eq 'Absent') { return }
         if ($TestProcessState -eq 'WrongCommand') { throw 'Test seam reports an owned process with the wrong command.' }
+        if ($TestProcessState -eq 'PidfdUnavailable') { throw 'Test seam reports pidfd APIs unavailable; refusing a raw PID signal.' }
         if ($TestProcessState -eq 'PidChanged' -and -not $VerifyOnly) { throw 'Test seam reports that the owned PID changed before termination.' }
         if ($TestProcessState -eq 'Verified' -or $TestProcessState -eq 'PidChanged') {
             if (-not $VerifyOnly -and $TestSignalLog) { [IO.File]::AppendAllText($TestSignalLog, "TERM $($descriptor.pid)`n", (New-Object Text.UTF8Encoding($false))) }
@@ -101,7 +102,7 @@ function Invoke-VerifiedOwnedCollectorStop {
     if ($distro -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $project -notmatch '^/' -or $project.Contains('..') -or $project.Contains('\')) { throw 'Installed config has unsafe WSL values; refusing to signal any process.' }
     $mode = if ($VerifyOnly) { 'verify' } else { 'stop' }
     $processScript = @'
-import os, pathlib, signal, sys, time
+import os, pathlib, select, signal, sys
 pid = int(sys.argv[1]); project = pathlib.Path(sys.argv[2]); mode = sys.argv[3]
 proc = pathlib.Path('/proc') / str(pid)
 if not proc.is_dir(): print('ABSENT'); raise SystemExit(0)
@@ -114,13 +115,16 @@ def matches():
         if argv and argv[-1] == b'': argv.pop()
         return cwd == project and exe == expected_python.resolve() and argv == [os.fsencode(str(expected_python)), b'backend/main.py']
     except (FileNotFoundError, PermissionError, ProcessLookupError): return False
-if not matches(): print('MISMATCH'); raise SystemExit(21)
-if mode == 'verify': print('VERIFIED'); raise SystemExit(0)
-os.kill(pid, signal.SIGTERM)
-deadline = time.monotonic() + 10
-while time.monotonic() < deadline:
-    if not proc.exists() or not matches(): print('STOPPED'); raise SystemExit(0)
-    time.sleep(0.2)
+if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+    print('PIDFD_UNAVAILABLE'); raise SystemExit(23)
+try: pidfd = os.pidfd_open(pid, 0)
+except ProcessLookupError: print('ABSENT'); raise SystemExit(0)
+with os.fdopen(pidfd):
+    if not matches(): print('MISMATCH'); raise SystemExit(21)
+    if mode == 'verify': print('VERIFIED'); raise SystemExit(0)
+    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    poller = select.poll(); poller.register(pidfd, select.POLLIN)
+    if poller.poll(10000): print('STOPPED'); raise SystemExit(0)
 print('TIMEOUT'); raise SystemExit(22)
 '@
     $result = Invoke-External 'wsl.exe' @('-d', $distro, '--exec', 'python3', '-c', $processScript, ([string]$descriptor.pid), $project, $mode) "Owned Collector exact verification/stop failed for PID $($descriptor.pid)"

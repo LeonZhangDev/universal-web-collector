@@ -17,6 +17,9 @@ param(
     [Parameter(DontShow)][ValidateSet('', 'after-root-swap', 'after-first-registry', 'after-first-registry-concurrent', 'self-check')][string]$TestFailurePoint = '',
     [Parameter(DontShow)][string]$TestSafetyBase,
     [Parameter(DontShow)][string]$TestSelfCheckLocalAppData,
+    [Parameter(DontShow)][ValidateSet('', 'response', 'no-output', 'partial-header', 'partial-body', 'keep-open')][string]$TestSelfCheckMode = '',
+    [Parameter(DontShow)][string]$TestSelfCheckResponseJson,
+    [Parameter(DontShow)][ValidateRange(100, 70000)][int]$TestSelfCheckTimeoutMilliseconds = 70000,
     [Parameter(DontShow)][switch]$SkipSelfCheck
 )
 
@@ -270,37 +273,94 @@ function Write-NativeFrame {
     $Stream.Write($header, 0, 4); $Stream.Write($bytes, 0, $bytes.Length); $Stream.Flush()
 }
 
+function Get-RemainingDeadlineMilliseconds {
+    param([DateTime]$Deadline)
+    $remaining = [int][Math]::Ceiling(($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+    if ($remaining -le 0) { throw [TimeoutException]::new('Native host self-check timed out.') }
+    return $remaining
+}
+
+function Read-NativeBytesBeforeDeadline {
+    param([IO.Stream]$Stream, [byte[]]$Buffer, [int]$Offset, [int]$Count, [DateTime]$Deadline, [string]$EarlyEndMessage)
+    $completed = 0
+    while ($completed -lt $Count) {
+        $readTask = $Stream.ReadAsync($Buffer, $Offset + $completed, $Count - $completed)
+        if (-not $readTask.Wait((Get-RemainingDeadlineMilliseconds $Deadline))) { throw [TimeoutException]::new('Native host self-check timed out.') }
+        $read = $readTask.Result
+        if ($read -eq 0) { throw $EarlyEndMessage }
+        $completed += $read
+    }
+}
+
 function Read-NativeFrame {
-    param([IO.Stream]$Stream)
+    param([IO.Stream]$Stream, [DateTime]$Deadline)
     $header = New-Object byte[] 4
-    $headerOffset = 0
-    while ($headerOffset -lt 4) { $read = $Stream.Read($header, $headerOffset, 4 - $headerOffset); if ($read -eq 0) { throw 'Packaged host returned no complete frame.' }; $headerOffset += $read }
+    Read-NativeBytesBeforeDeadline $Stream $header 0 4 $Deadline 'Packaged host returned no complete frame.'
     $length = [BitConverter]::ToUInt32($header, 0); if ($length -lt 1 -or $length -gt 1MB) { throw 'Packaged host returned an invalid frame length.' }
-    $body = New-Object byte[] $length; $offset = 0
-    while ($offset -lt $length) { $read = $Stream.Read($body, $offset, $length - $offset); if ($read -eq 0) { throw 'Packaged host response ended early.' }; $offset += $read }
+    $body = New-Object byte[] $length
+    Read-NativeBytesBeforeDeadline $Stream $body 0 $length $Deadline 'Packaged host response ended early.'
     return ([Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json)
 }
 
+function Assert-StrictSelfCheckResponse {
+    param($Response)
+    if ($null -eq $Response -or $Response -isnot [PSCustomObject]) { throw 'Native host self-check response is not an object.' }
+    if ((@($Response.PSObject.Properties.Name | Sort-Object) -join '|') -ne 'id|ok|result|v') { throw 'Native host self-check response has unexpected top-level keys.' }
+    if ($Response.v.GetType() -notin @([int], [long]) -or [long]$Response.v -ne 1) { throw 'Native host self-check response has an invalid protocol version.' }
+    if ($Response.id.GetType() -ne [string] -or $Response.id -cne 'installer-self-check') { throw 'Native host self-check response has an invalid correlation id.' }
+    if ($Response.ok.GetType() -ne [bool] -or $Response.ok -ne $true) { throw 'Native host self-check response is not successful.' }
+    $result = $Response.result
+    if ($null -eq $result -or $result -isnot [PSCustomObject] -or (@($result.PSObject.Properties.Name | Sort-Object) -join '|') -ne 'collector|port|protocol_version') { throw 'Native host self-check result has unexpected keys.' }
+    if ($result.protocol_version.GetType() -notin @([int], [long]) -or [long]$result.protocol_version -ne 1) { throw 'Native host self-check result has an invalid protocol version.' }
+    if ($result.port.GetType() -notin @([int], [long]) -or [long]$result.port -lt 1 -or [long]$result.port -gt 65535) { throw 'Native host self-check result has an invalid port.' }
+    $collector = $result.collector
+    if ($null -eq $collector -or $collector -isnot [PSCustomObject] -or (@($collector.PSObject.Properties.Name | Sort-Object) -join '|') -ne 'status' -or $collector.status.GetType() -ne [string] -or $collector.status -cne 'ok') { throw 'Native host self-check result has an invalid Collector status.' }
+}
+
 function Invoke-HostSelfCheck {
-    param([string]$Executable, [string]$LocalAppData)
+    param([string]$Executable, [string]$LocalAppData, [string]$FixtureMode = '', [string]$FixtureResponseJson, [int]$TimeoutMilliseconds = 70000)
     $process = New-Object Diagnostics.Process
     $process.StartInfo = New-Object Diagnostics.ProcessStartInfo
-    $process.StartInfo.FileName = $Executable; $process.StartInfo.Arguments = $ExtensionOrigin; $process.StartInfo.UseShellExecute = $false
+    if ($FixtureMode) {
+        $validJson = '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}}}'
+        $json = if ($FixtureResponseJson) { $FixtureResponseJson } else { $validJson }
+        $body = [Text.Encoding]::UTF8.GetBytes($json); $frame = New-Object byte[] (4 + $body.Length)
+        [BitConverter]::GetBytes([uint32]$body.Length).CopyTo($frame, 0); $body.CopyTo($frame, 4)
+        $bytes = switch ($FixtureMode) {
+            'response' { $frame }
+            'no-output' { [byte[]]@() }
+            'partial-header' { [byte[]]@($frame[0], $frame[1]) }
+            'partial-body' { [byte[]]@($frame[0..5]) }
+            'keep-open' { $frame }
+        }
+        $sleep = if ($FixtureMode -in @('no-output', 'partial-header', 'partial-body', 'keep-open')) { $TimeoutMilliseconds + 5000 } else { 0 }
+        $encoded = [Convert]::ToBase64String($bytes)
+        $worker = '$b=[Convert]::FromBase64String("' + $encoded + '");$o=[Console]::OpenStandardOutput();if($b.Length){$o.Write($b,0,$b.Length);$o.Flush()};if(' + $sleep + '){Start-Sleep -Milliseconds ' + $sleep + '}'
+        $process.StartInfo.FileName = 'powershell.exe'
+        $process.StartInfo.Arguments = (@('-NoProfile', '-NonInteractive', '-Command', $worker) | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+    } else {
+        if ($TimeoutMilliseconds -ne 70000) { throw 'Production self-check timeout must remain 70 seconds.' }
+        $process.StartInfo.FileName = $Executable
+        $process.StartInfo.Arguments = $ExtensionOrigin
+    }
+    $process.StartInfo.UseShellExecute = $false
     $process.StartInfo.RedirectStandardInput = $true; $process.StartInfo.RedirectStandardOutput = $true; $process.StartInfo.RedirectStandardError = $true
     $process.StartInfo.EnvironmentVariables['LOCALAPPDATA'] = $LocalAppData
     if (-not $process.Start()) { throw 'Could not start packaged native host.' }
     $stderrTask = $process.StandardError.ReadToEndAsync()
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
     try {
-        Write-NativeFrame $process.StandardInput.BaseStream @{ v = 1; id = 'installer-self-check'; action = 'ping'; payload = @{} }
-        $response = Read-NativeFrame $process.StandardOutput.BaseStream; $process.StandardInput.Close()
-        if (-not $process.WaitForExit(70000)) { $process.Kill(); throw 'Native host self-check timed out.' }
+        if (-not $FixtureMode) { Write-NativeFrame $process.StandardInput.BaseStream @{ v = 1; id = 'installer-self-check'; action = 'ping'; payload = @{} } }
+        $response = Read-NativeFrame $process.StandardOutput.BaseStream $deadline
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit((Get-RemainingDeadlineMilliseconds $deadline))) { throw [TimeoutException]::new('Native host self-check timed out.') }
         $stderr = $stderrTask.Result
         if ($process.ExitCode -ne 0) { throw "Native host self-check exited $($process.ExitCode): $stderr" }
     } finally {
         if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
         $process.Dispose()
     }
-    if ($response.v -ne 1 -or $response.id -ne 'installer-self-check' -or $response.ok -ne $true) { throw "Native host self-check failed: $($response | ConvertTo-Json -Compress)" }
+    Assert-StrictSelfCheckResponse $response
     return $response
 }
 
@@ -322,7 +382,7 @@ function Stop-ExactlyVerifiedCollector {
     if ($afterPid -lt 1) { return }
     if ($ExpectedPid -gt 0 -and $afterPid -ne $ExpectedPid) { throw "Owned Collector PID changed from expected $ExpectedPid to $afterPid; refusing to signal it." }
     $processScript = @'
-import os, pathlib, signal, sys, time
+import os, pathlib, select, signal, sys
 pid = int(sys.argv[1]); project = pathlib.Path(sys.argv[2]); proc = pathlib.Path('/proc') / str(pid)
 expected_python = project / '.venv/bin/python3'
 def matches():
@@ -333,13 +393,15 @@ def matches():
         if argv and argv[-1] == b'': argv.pop()
         return cwd == project and exe == expected_python.resolve() and argv == [os.fsencode(str(expected_python)), b'backend/main.py']
     except (FileNotFoundError, PermissionError, ProcessLookupError): return False
-if not proc.is_dir(): print('ABSENT'); raise SystemExit(0)
-if not matches(): print('MISMATCH'); raise SystemExit(21)
-os.kill(pid, signal.SIGTERM)
-deadline = time.monotonic() + 10
-while time.monotonic() < deadline:
-    if not proc.exists() or not matches(): print('STOPPED'); raise SystemExit(0)
-    time.sleep(0.2)
+if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+    print('PIDFD_UNAVAILABLE'); raise SystemExit(23)
+try: pidfd = os.pidfd_open(pid, 0)
+except ProcessLookupError: print('ABSENT'); raise SystemExit(0)
+with os.fdopen(pidfd):
+    if not matches(): print('MISMATCH'); raise SystemExit(21)
+    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    poller = select.poll(); poller.register(pidfd, select.POLLIN)
+    if poller.poll(10000): print('STOPPED'); raise SystemExit(0)
 print('TIMEOUT'); raise SystemExit(22)
 '@
     Write-Host "Stopping exactly verified Collector PID $afterPid before filesystem mutation."
@@ -370,7 +432,9 @@ $ChromeKey = Join-Path $RegistryRoot "Google\Chrome\NativeMessagingHosts\$HostNa
 $EdgeKey = Join-Path $RegistryRoot "Microsoft\Edge\NativeMessagingHosts\$HostName"
 foreach ($key in @($ChromeKey, $EdgeKey)) { if ($key -notlike 'HKCU:\Software\*' -or -not $key.EndsWith("\$HostName", [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe registry target: $key" } }
 $plan = [ordered]@{ project_path = $ResolvedProject; linux_project_path = $LinuxProject; runtime_file = $RuntimeFile; distro = $Distro; install_root = $InstallRoot; manifest_path = $ManifestPath; allowed_origin = $ExtensionOrigin; chrome_registry_key = $ChromeKey; edge_registry_key = $EdgeKey }
-if ($WhatIfPreference) { [PSCustomObject]$plan | ConvertTo-Json -Compress; return }
+$installOperation = 'Provision dependencies, build and validate the staged host, atomically replace the root, and register Chrome and Edge'
+if ($WhatIfPreference) { $null = $PSCmdlet.ShouldProcess($InstallRoot, $installOperation); [PSCustomObject]$plan | ConvertTo-Json -Compress; return }
+if (-not $PSCmdlet.ShouldProcess($InstallRoot, $installOperation)) { return }
 if (-not (Test-Path -LiteralPath $parentRoot)) { New-Item -ItemType Directory -Path $parentRoot -Force | Out-Null }
 $SelfCheckLocalAppData = if ($TestSelfCheckLocalAppData) { [IO.Path]::GetFullPath($TestSelfCheckLocalAppData) } elseif ((Split-Path $InstallRoot -Leaf) -eq 'NativeHost' -and (Split-Path (Split-Path $InstallRoot -Parent) -Leaf) -eq 'SiteFilter') { Split-Path (Split-Path $InstallRoot -Parent) -Parent } else { $env:LOCALAPPDATA }
 
@@ -432,19 +496,19 @@ try {
     Write-Utf8NoBomAtomic (Join-Path $stageRoot '.sitefilter-native-host-owned.json') ($state | ConvertTo-Json -Depth 10)
     foreach ($name in $OwnedFileNames) { $candidate = Join-Path $stageRoot $name; if (Test-Path -LiteralPath $candidate -PathType Leaf) { Set-PrivateAclExact $candidate } }
     Assert-NoReparseTree $stageRoot
-    if (-not $PSCmdlet.ShouldProcess($InstallRoot, 'Validate the staged host, stop only an exactly verified owned Collector, atomically replace the root, and register Chrome and Edge')) { return }
-
-    if (-not $SkipSelfCheck -and -not $TestHostExecutable) {
+    if (-not $SkipSelfCheck -and (-not $TestHostExecutable -or $TestSelfCheckMode)) {
         $preflightLocal = Join-Path $stageRoot '.preflight-local'; $preflightConfig = Join-Path $preflightLocal 'SiteFilter\NativeHost'
         New-Item -ItemType Directory -Path $preflightConfig -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $stageRoot 'config.json') -Destination (Join-Path $preflightConfig 'config.json')
         $hadOwnedBefore = (Get-OwnedRuntimePid $RuntimeFile) -gt 0
         Write-Host "Staged preflight starting: owned_before=$hadOwnedBefore"
-        try { $null = Invoke-HostSelfCheck $stageExe $preflightLocal }
+        try { $null = Invoke-HostSelfCheck $stageExe $preflightLocal $TestSelfCheckMode $TestSelfCheckResponseJson $TestSelfCheckTimeoutMilliseconds }
         finally {
-            $observedLog = if ($hadOwnedBefore) { Join-Path $InstallRoot 'collector-startup.log' } else { Join-Path $preflightConfig 'collector-startup.log' }
-            $stoppedPid = Stop-ExactlyVerifiedCollector -RuntimePath $RuntimeFile -Distribution $Distro -LinuxPath $LinuxProject -LogPath $observedLog
-            if ($preexistingOwnedWasRunning -and $stoppedPid -eq $preexistingOwnedPid) { $preexistingStopped = $true }
+            if (-not $TestSelfCheckMode) {
+                $observedLog = if ($hadOwnedBefore) { Join-Path $InstallRoot 'collector-startup.log' } else { Join-Path $preflightConfig 'collector-startup.log' }
+                $stoppedPid = Stop-ExactlyVerifiedCollector -RuntimePath $RuntimeFile -Distribution $Distro -LinuxPath $LinuxProject -LogPath $observedLog
+                if ($preexistingOwnedWasRunning -and $stoppedPid -eq $preexistingOwnedPid) { $preexistingStopped = $true }
+            }
             Assert-NoReparseTree $preflightLocal; Remove-SafeTree $preflightLocal
         }
     }
@@ -470,9 +534,9 @@ try {
         if ($index -eq 1 -and $TestFailurePoint -eq 'after-first-registry') { throw 'Injected failure after first registry write.' }
         if ($index -eq 1 -and $TestFailurePoint -eq 'after-first-registry-concurrent') { Set-Item -LiteralPath $key -Value 'C:\concurrent\replacement.json'; throw 'Injected concurrent registry replacement after first registry write.' }
     }
-    if (-not $SkipSelfCheck -and -not $TestHostExecutable) {
+    if (-not $SkipSelfCheck -and (-not $TestHostExecutable -or $TestSelfCheckMode)) {
         $finalSelfCheckAttempted = $true
-        $response = Invoke-HostSelfCheck (Join-Path $InstallRoot 'sitefilter-native-host.exe') $SelfCheckLocalAppData
+        $response = Invoke-HostSelfCheck (Join-Path $InstallRoot 'sitefilter-native-host.exe') $SelfCheckLocalAppData $TestSelfCheckMode $TestSelfCheckResponseJson $TestSelfCheckTimeoutMilliseconds
         Write-Host "Native host self-check: $($response | ConvertTo-Json -Compress)"
         if ($TestFailurePoint -eq 'self-check') { throw 'Injected failure after the real final self-check started the Collector.' }
     } elseif ($TestFailurePoint -eq 'self-check') { throw 'Injected failure at the skipped test self-check seam.' }

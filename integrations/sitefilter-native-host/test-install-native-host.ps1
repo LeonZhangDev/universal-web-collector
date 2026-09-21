@@ -57,6 +57,11 @@ function Set-TestOwnedDescriptor([string]$InstallRoot, [string]$Name) {
 try {
     New-Item -ItemType Directory -Path $root | Out-Null
     $fakeExe = Join-Path $root 'fake-host.exe'; Write-TestText $fakeExe 'fake host v1'
+    $installerText = Get-Content -LiteralPath $installer -Raw; $uninstallerText = Get-Content -LiteralPath $uninstaller -Raw
+    foreach ($scriptText in @($installerText, $uninstallerText)) {
+        Assert-True ($scriptText -match 'os\.pidfd_open' -and $scriptText -match 'signal\.pidfd_send_signal') 'A process-stop path does not use pidfd for both binding and signaling.'
+        Assert-True ($scriptText -notmatch 'os\.kill\s*\(' -and $scriptText -notmatch "--exec',\s*'kill'") 'A process-stop path retains a raw PID signal fallback.'
+    }
     $installRoot = Join-Path $root 'main-install'; $registryRoot = "$registryBase\Main"
     $chromeKey = Join-Path $registryRoot "Google\Chrome\NativeMessagingHosts\$hostName"
     $edgeKey = Join-Path $registryRoot "Microsoft\Edge\NativeMessagingHosts\$hostName"
@@ -66,6 +71,59 @@ try {
     Assert-True ($plan.linux_project_path.StartsWith('/')) 'WhatIf did not convert the project path.'
     Assert-True (-not (Test-Path -LiteralPath $whatIfParent)) 'WhatIf created an install parent.'
     Assert-True (-not (Test-Path -LiteralPath $registryRoot)) 'WhatIf wrote registry state.'
+
+    # The one operation-wide confirmation gate must run before parent creation,
+    # dependency provisioning, uv acquisition, staging, packaging, or registry writes.
+    $confirmParent = Join-Path $root 'confirm-parent'; $confirmInstall = Join-Path $confirmParent 'NativeHost'; $confirmRegistry = "$registryBase\Confirm"
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $confirmOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -ProjectPath $ProjectPath -SkipProvision -InstallRoot $confirmInstall -RegistryRoot $confirmRegistry -TestSafetyBase $root -TestHostExecutable $fakeExe -SkipSelfCheck -Confirm 2>&1
+        $confirmExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    Assert-True ($confirmExit -ne 0) "Installer -Confirm unexpectedly completed without a noninteractive refusal: $($confirmOutput -join ' ')"
+    Assert-True (-not (Test-Path -LiteralPath $confirmParent) -and -not (Test-Path -LiteralPath $confirmRegistry)) 'Denied installer confirmation caused filesystem or registry side effects.'
+
+    # Self-check frame reads and process exit share one deadline. Each fixture
+    # holds stdout open beyond the short test deadline and must be killed promptly.
+    foreach ($mode in @('no-output', 'partial-header', 'partial-body', 'keep-open')) {
+        $fixtureInstall = Join-Path $root "self-check-$mode"; $fixtureRegistry = "$registryBase\SelfCheck-$mode"
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        Assert-Fails { & $installer -ProjectPath $ProjectPath -SkipProvision -InstallRoot $fixtureInstall -RegistryRoot $fixtureRegistry -TestSafetyBase $root -TestHostExecutable $fakeExe -TestSelfCheckMode $mode -TestSelfCheckTimeoutMilliseconds 400 | Out-Null } "Self-check fixture '$mode' did not time out."
+        $timer.Stop()
+        Assert-True ($timer.Elapsed.TotalSeconds -lt 4) "Self-check fixture '$mode' exceeded its unified deadline."
+        Assert-True (-not (Test-Path -LiteralPath $fixtureInstall) -and -not (Test-Path -LiteralPath $fixtureRegistry)) "Self-check fixture '$mode' mutated final state."
+    }
+
+    # PowerShell's comparison coercions must not accept JSON strings/numbers as
+    # protocol integers/booleans, nor tolerate missing/extra/nested shape drift.
+    $badResponses = @(
+        '{"v":"1","id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}}}',
+        '{"v":true,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":1,"ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":1,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}},"extra":1}',
+        '{"v":1,"ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":true,"port":8000,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":"1","port":8000,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":true,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":"8000","collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":0,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":65536,"collector":{"status":"ok"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok"},"extra":1}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"starting"}}}',
+        '{"v":1,"id":"installer-self-check","ok":true,"result":{"protocol_version":1,"port":8000,"collector":{"status":"ok","extra":1}}}'
+    )
+    $badIndex = 0
+    foreach ($json in $badResponses) {
+        $badIndex++; $fixtureInstall = Join-Path $root "bad-response-$badIndex"; $fixtureRegistry = "$registryBase\BadResponse-$badIndex"
+        Assert-Fails { & $installer -ProjectPath $ProjectPath -SkipProvision -InstallRoot $fixtureInstall -RegistryRoot $fixtureRegistry -TestSafetyBase $root -TestHostExecutable $fakeExe -TestSelfCheckMode response -TestSelfCheckResponseJson $json -TestSelfCheckTimeoutMilliseconds 2000 | Out-Null } "Malformed self-check response $badIndex was accepted."
+        Assert-True (-not (Test-Path -LiteralPath $fixtureInstall) -and -not (Test-Path -LiteralPath $fixtureRegistry)) "Malformed response $badIndex mutated final state."
+    }
+    $validFixtureRoot = Join-Path $root 'valid-response'; $validFixtureRegistry = "$registryBase\ValidResponse"
+    & $installer -ProjectPath $ProjectPath -SkipProvision -InstallRoot $validFixtureRoot -RegistryRoot $validFixtureRegistry -TestSafetyBase $root -TestHostExecutable $fakeExe -TestSelfCheckMode response -TestSelfCheckTimeoutMilliseconds 2000 | Out-Null
+    Invoke-TestUninstall $validFixtureRoot $validFixtureRegistry
 
     New-Item -Path (Join-Path $chromeKey 'existing-child') -Force | Out-Null
     Set-Item -LiteralPath $chromeKey -Value 42
@@ -161,6 +219,8 @@ try {
     Assert-True (-not (Test-Path $mismatchSignal) -and (Get-RootFingerprint $mismatchRoot) -eq $before) 'Wrong command signaled or mutated.'
     Assert-Fails { Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'PidChanged' $mismatchSignal } 'Changed owned PID did not fail.'
     Assert-True (-not (Test-Path $mismatchSignal) -and (Get-RootFingerprint $mismatchRoot) -eq $before) 'Changed PID signaled or mutated.'
+    Assert-Fails { Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'PidfdUnavailable' $mismatchSignal } 'Missing pidfd support did not safely refuse uninstall.'
+    Assert-True (-not (Test-Path $mismatchSignal) -and (Get-RootFingerprint $mismatchRoot) -eq $before) 'Missing pidfd support fell back to a raw PID signal or mutated state.'
     Invoke-TestUninstall $mismatchRoot $mismatchRegistry 'Verified' $mismatchSignal
 
     # An unowned process seam is never signaled, while prior value types and
@@ -244,7 +304,7 @@ try {
     Assert-True ((Get-Content $outsideSentinel -Raw) -eq 'outside') 'Reparse test changed the outside target.'
     [IO.Directory]::Delete($junction, $false)
 
-    Write-Host 'PASS: PS5-safe transaction, BOM-free writes, exact ACL/ownership, rollback seams, lock/process preflight, default-only registry ownership, idempotent uninstall, pinned uv supply, and reparse containment.'
+    Write-Host 'PASS: early confirmation, bounded strict self-checks, pidfd-only signaling, PS5-safe transaction, BOM-free writes, exact ACL/ownership, rollback seams, lock/process preflight, default-only registry ownership, idempotent uninstall, pinned uv supply, and reparse containment.'
 } finally {
     if (Test-Path -LiteralPath $registryBase) { Remove-Item -LiteralPath $registryBase -Recurse -Force }
     if (Test-Path -LiteralPath $root) { Remove-TestTree $root }

@@ -92,8 +92,11 @@ newer session:
 Omit `-ProjectPath` to select the project with a Windows folder picker. Use
 `-Distro <name>` to override default WSL detection, `-SkipProvision` to skip
 the WSL `make install` and `make build` steps, and `-WhatIf` to validate and
-print the complete plan without changing files or the registry. The installer
-pins PyInstaller 6.16.0, builds a complete sibling staging installation, and
+print the complete plan without changing files or the registry. One
+operation-wide confirmation gate runs before creating directories,
+provisioning dependencies, acquiring Windows uv, packaging, staging, or
+writing registry values; refusing confirmation has no side effects. The
+installer pins PyInstaller 6.16.0, builds a complete sibling staging installation, and
 performs BOM-free atomic JSON writes before swapping it into
 `%LOCALAPPDATA%\SiteFilter\NativeHost`, writes the exact config and manifest,
 restricts that directory to the current user, and registers both Chrome and
@@ -123,17 +126,22 @@ Named values and subkeys are never serialized or replayed. Uninstall restores
 or removes a prior default only while the current default still points to this
 installation, preserves later changes, removes only recorded files, and
 removes `NativeHost` only when it is empty. Before mutation it validates any
-owned runtime PID in one WSL operation: the descriptor PID must still identify
-the exact configured project cwd, executable, and NUL-separated backend
-argument vector. Only that same verified process is sent bounded graceful
-termination. `-WhatIf` performs the read-only validation but does not signal
-the process or change files/registry; an interactive confirmation refusal has
+owned runtime PID in one WSL operation: it opens a Linux pidfd, then verifies
+that bound process has the exact configured project cwd, executable, and
+NUL-separated backend argument vector before sending TERM through that same
+pidfd. If pidfd APIs are unavailable, the operation safely refuses rather than
+falling back to signaling a raw PID. `-WhatIf` performs read-only validation
+but does not signal the process or change files/registry; an interactive confirmation refusal has
 the same no-side-effect behavior. The installer uses the same exact check
 before a root swap. If a final self-check starts a new owned Collector and the
 transaction then fails, rollback first stops that exact new process, restores
 the old root and guarded registry defaults, and safely restarts a previously
 running owned Collector from the restored installation. Every owned file is
 checked for locks before uninstall.
+Native host self-check stdout and stderr are drained concurrently under one
+70-second deadline that covers the complete frame and process exit. The
+response must match the exact version-1 ping schema, including strict JSON
+types, a valid loopback port range, and the exact Collector status `ok`.
 Unexpected files added after installation remain in place. The uninstaller
 does not remove `%LOCALAPPDATA%\SiteFilter`, Collector data, downloads,
 browser profiles, or project environments.

@@ -1,0 +1,78 @@
+# SiteFilter Native Messaging Host
+
+This directory contains the allowlisted Windows bridge between the SiteFilter
+extension and Universal Web Collector. The host uses Native Messaging protocol
+version 1 and reserves stdout exclusively for four-byte little-endian framed
+JSON responses. Diagnostics go to stderr and rotating files under
+`%LOCALAPPDATA%\SiteFilter\NativeHost`.
+
+The installer (Task 6) owns `config.json` at that fixed location. Its required
+fields are `protocol_version`, `allowed_origins`, `distro`, `project_path`, and
+`runtime_file`; `startup_timeout_seconds` is the only optional field. No other
+keys are accepted. `protocol_version` is the integer `1`, `allowed_origins`
+contains exactly one `chrome-extension://<32 lowercase a-p characters>/`
+origin, `distro` is a bounded WSL distribution name, `project_path` is a
+bounded absolute Linux path without controls, backslashes, or `..`, and
+`runtime_file` is a bounded absolute Windows path without controls or `..`.
+The optional startup timeout is a number from 1 through 120 seconds. Browser
+requests cannot override any of these values. The manifest
+template placeholders are also replaced by the installer with the packaged
+host path and the exact stable SiteFilter extension origin.
+
+## Allowlisted operations
+
+| Action | Collector operation |
+| --- | --- |
+| `ping` | `GET /healthz` after Collector-specific health/config validation |
+| `preview` | `POST /tasks/preview` with a 150-second response timeout |
+| `create-or-reuse` | `POST /tasks/create` with deduplication and incremental reuse enabled |
+| `get-task` | `GET /tasks/<positive integer>` |
+| `open-task` | Open `http://127.0.0.1:<descriptor-port>/?task=<positive integer>` |
+| `start-login` | `POST /sessions/login` |
+
+Only exact HTTPS `xchina.co` photo/video detail URL shapes are accepted. Query
+and fragment variants are accepted as the same approved page location, but the
+host strips both before forwarding the URL to Collector. Collector still owns
+canonical content identity. The protocol rejects unknown fields, arbitrary
+endpoints, commands, executable paths, WSL distributions, project paths,
+ports, and shell fragments.
+
+If no healthy descriptor is available, the host invokes this fixed argument
+array with `shell=False`:
+
+```text
+wsl.exe -d <configured-distro> --cd <configured-project-path> -- make start-native
+```
+
+Collector remains the owner of URL resolution, canonical identity, duplicate
+decisions, login state, task state, downloads, and output settings.
+
+Ordinary proxied API requests use a 15-second timeout. Preview alone uses 150
+seconds because the existing collector may make two attempts (anonymous and
+saved state), each with up to 30 seconds of navigation plus a 25-second wait.
+That valid path consumes a 110-second base budget before fallback work; the
+remaining 40 seconds provides bounded processing and scheduling margin.
+Startup retains its separately bounded 60-second readiness window.
+
+Host discovery is intentionally stricter than the generic Task 4 supervisor
+probe: in addition to `/healthz`, `/config` must report `auto_collector` as
+`auto`, both `xchina_gallery` and `xchina_video`, and the `image` and `video`
+resource types. This prevents an unrelated service with similarly shaped
+health/config responses from being trusted by the bridge without changing the
+shared Task 4 discovery contract.
+
+All local HTTP calls refuse redirects and require the final URL to remain the
+exact fixed loopback URL. Discovery and action response bodies are capped at 1
+MiB before strict JSON parsing; runtime descriptors use the same file-size
+bound. JSON nesting is capped at 256 levels, and `NaN` and infinities are
+rejected. Unexpected host failures log only a stable stage and exception type,
+never exception text or traceback content.
+
+## Development verification
+
+```powershell
+uv run pytest -q tests/test_sitefilter_native_host.py
+```
+
+Installer/registry registration, PyInstaller packaging, and real Chrome/Edge
+round trips are deliberately deferred to Task 6.

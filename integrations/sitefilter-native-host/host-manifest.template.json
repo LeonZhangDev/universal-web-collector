@@ -1,0 +1,9 @@
+{
+  "name": "dev.zackzhang.sitefilter_collector",
+  "description": "SiteFilter to Universal Web Collector bridge",
+  "path": "__HOST_EXECUTABLE_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "__SITEFILTER_EXTENSION_ORIGIN__"
+  ]
+}

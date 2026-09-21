@@ -228,6 +228,34 @@ def list_tasks():
     return query("SELECT * FROM tasks ORDER BY id DESC")
 
 
+def find_tasks_by_content_key(content_key):
+    """Return all exact matches newest-first, lazily keying historical rows."""
+    from core.content_identity import canonical_content_key
+
+    matches = []
+    for task in query("SELECT * FROM tasks ORDER BY id DESC"):
+        try:
+            options = json.loads(task["options"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(options, dict):
+            continue
+        stored_key = options.get("content_key")
+        computed_key = canonical_content_key(task["url"], task["collector"])
+        if stored_key != computed_key:
+            if computed_key is None:
+                options.pop("content_key", None)
+            else:
+                options["content_key"] = computed_key
+            execute(
+                "UPDATE tasks SET options=? WHERE id=?",
+                (json.dumps(options, ensure_ascii=False), task["id"]),
+            )
+        if computed_key == content_key:
+            matches.append(task)
+    return matches
+
+
 def update_task(task_id, **fields):
     if not fields:
         return

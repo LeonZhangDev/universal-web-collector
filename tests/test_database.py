@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import core.database as db
@@ -39,3 +41,74 @@ def test_migrate_adds_hash_column(tmp_db):
     conn = tmp_db.get_conn()
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(resources)")}
     assert "hash" in cols
+
+
+def test_find_tasks_by_content_key_returns_exact_matches_newest_first(tmp_db):
+    older = tmp_db.create_task(
+        "https://xchina.co/photo/id-6664761937f5a.html",
+        "xchina_gallery",
+        options={"content_key": "xchina_gallery:6664761937f5a"},
+    )
+    tmp_db.create_task(
+        "https://xchina.co/photo/id-6aa5136f606fe.html",
+        "xchina_gallery",
+        options={"content_key": "xchina_gallery:6aa5136f606fe"},
+    )
+    newer = tmp_db.create_task(
+        "https://xchina.co/photo/id-6664761937f5a/2.html",
+        "xchina_gallery",
+        options={"content_key": "xchina_gallery:6664761937f5a"},
+    )
+
+    hits = tmp_db.find_tasks_by_content_key("xchina_gallery:6664761937f5a")
+
+    assert [hit["id"] for hit in hits] == [newer, older]
+
+
+def test_find_tasks_by_content_key_lazily_normalizes_historical_task(tmp_db):
+    task_id = tmp_db.create_task(
+        "https://xchina.co/photo/id-6664761937f5a/2.html",
+        "xchina_gallery",
+        options={"quality": "1200"},
+    )
+
+    hits = tmp_db.find_tasks_by_content_key(
+        "xchina_gallery:6664761937f5a"
+    )
+
+    assert [hit["id"] for hit in hits] == [task_id]
+    assert json.loads(tmp_db.get_task(task_id)["options"])["content_key"] == (
+        "xchina_gallery:6664761937f5a"
+    )
+
+
+def test_find_tasks_by_content_key_rejects_and_removes_spoofed_identity(tmp_db):
+    task_id = tmp_db.create_task(
+        "https://example.com/unrelated",
+        "generic",
+        options={"content_key": "xchina_gallery:6664761937f5a"},
+    )
+
+    hits = tmp_db.find_tasks_by_content_key(
+        "xchina_gallery:6664761937f5a"
+    )
+
+    assert hits == []
+    assert "content_key" not in json.loads(tmp_db.get_task(task_id)["options"])
+
+
+def test_find_tasks_by_content_key_repairs_stored_key_from_canonical_source(tmp_db):
+    task_id = tmp_db.create_task(
+        "https://xchina.co/photo/id-6664761937f5a.html",
+        "xchina_gallery",
+        options={"content_key": "xchina_gallery:spoofed"},
+    )
+
+    hits = tmp_db.find_tasks_by_content_key(
+        "xchina_gallery:6664761937f5a"
+    )
+
+    assert [hit["id"] for hit in hits] == [task_id]
+    assert json.loads(tmp_db.get_task(task_id)["options"])["content_key"] == (
+        "xchina_gallery:6664761937f5a"
+    )

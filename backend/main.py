@@ -88,7 +88,19 @@ if _dist.is_dir():
     app.mount("/", StaticFiles(directory=_dist, html=True), name="frontend")
 
 
-if __name__ == "__main__":
+def run_server():
     import uvicorn
 
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    # Browser service workers keep the SSE endpoint open.  Bound graceful
+    # connection draining below the native installer shutdown gate so a
+    # verified SIGTERM cannot leave the API closed but the PID still alive.
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        timeout_graceful_shutdown=5,
+    )
+
+
+if __name__ == "__main__":
+    run_server()

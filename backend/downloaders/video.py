@@ -62,7 +62,7 @@ from .ratelimit import DomainLimiter
 REJECT_CT = "text/html"
 
 ENGINES = ("auto", "ffmpeg", "builtin")
-MIN_HLS_DURATION_RATIO = 0.90
+MIN_HLS_DURATION_RATIO = 0.99
 
 
 def _short(err, limit=180):

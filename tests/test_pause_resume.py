@@ -123,16 +123,51 @@ def test_shutdown_broadcasts_cancel_to_active_workers(tmp_db):
     """服务退出必须唤醒长视频 worker，不能只关闭监听后留下进程。"""
     mgr = tm.TaskManager(max_workers=1, download_workers=1)
     try:
-        entry = {"future": None, "cancel": threading.Event(), "hb": time.monotonic()}
+        closed = []
+        entry = {
+            "future": None,
+            "cancel": threading.Event(),
+            "hb": time.monotonic(),
+            "closers": {lambda: closed.append(True)},
+        }
         with mgr._active_lock:
             mgr._active[123] = entry
 
         mgr.shutdown(wait=False)
 
         assert entry["cancel"].is_set()
+        assert closed == [True]
     finally:
         # shutdown 可重复调用；这里确保测试退出时线程池也完整回收。
         mgr.shutdown(wait=True)
+
+
+def test_shutdown_closes_blocked_network_worker_before_join(tmp_db):
+    """A task-owned session close must release a blocked I/O worker promptly."""
+    mgr = tm.TaskManager(max_workers=1, download_workers=1)
+    entered = threading.Event()
+    released = threading.Event()
+
+    def blocked_read():
+        entered.set()
+        assert released.wait(5), "session close did not release blocked read"
+
+    future = mgr._download_executor.submit(blocked_read)
+    assert entered.wait(1)
+    entry = {
+        "future": None,
+        "cancel": threading.Event(),
+        "hb": time.monotonic(),
+        "closers": {released.set},
+    }
+    with mgr._active_lock:
+        mgr._active[456] = entry
+
+    started = time.monotonic()
+    mgr.shutdown(wait=True)
+
+    assert time.monotonic() - started < 2
+    assert future.done()
 
 
 def test_cannot_pause_terminal_task(tmp_db):

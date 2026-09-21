@@ -234,7 +234,8 @@ def safe_filename(url, default_ext=".bin"):
 
 
 def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
-                require_image=False, reject_ct=None, info=None):
+                require_image=False, reject_ct=None, info=None,
+                request_timeout=None):
     """对单个 URL 做带重试的流式下载, 返回 (sha256, Content-Type)。
 
     Content-Type 校验提供互补的两种用法:
@@ -259,7 +260,7 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
 
             with domain_slot(url):
                 resp = sess.get(url, headers=req_headers, stream=True,
-                                timeout=_timeout())
+                                timeout=request_timeout or _timeout())
             # ⚠️ 必须保证关闭: 416/429/内容校验这几条**提前退出**的路径都没读过响应体,
             # 连接不会被自动归还。配合 pool_block=True 就是"泄漏到池满 → 永久阻塞",
             # 症状是任务卡死而非报错。读完的路径 close() 是幂等的。
@@ -400,7 +401,7 @@ def _swap_ext(path, url):
 
 def download_with_mirrors(url, path, headers, retries=None, resume=True, session=None,
                           progress_cb=None, mirrors=None, log=None, require_image=False,
-                          reject_ct=None, info=None):
+                          reject_ct=None, info=None, request_timeout=None):
     """主 URL 失败时依次尝试备用下载点(mirrors), 返回 (sha256, 实际路径)。
 
     mirrors 由采集器给出(如同一张图的多个尺寸/CDN 变体), 下载层只负责
@@ -433,7 +434,7 @@ def download_with_mirrors(url, path, headers, retries=None, resume=True, session
             # 只有主 URL 用断点续传; 切换后是全新 URL, 必须从头下
             sha, ctype = _stream_one(cand, cur, headers, retries, resume and i == 0,
                                      sess, progress_cb, require_image, reject_ct,
-                                     info)
+                                     info, request_timeout)
             fill_info(info, cand, ctype)
             return sha, cur
         except TaskCancelled:
@@ -457,9 +458,11 @@ def resolve_target(save_dir, url, filename=None, default_ext=".bin"):
     return target
 
 
-def sha256_file(path):
+def sha256_file(path, progress_cb=None):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(CHUNK), b""):
             h.update(chunk)
+            if progress_cb:
+                progress_cb()
     return h.hexdigest()

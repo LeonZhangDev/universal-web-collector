@@ -73,7 +73,12 @@ def test_xchina_video_403_uses_browser_session_and_closes_it(monkeypatch, tmp_pa
     monkeypatch.setattr(video_mod, "browser_session_for", lambda url: session)
 
     def reject_403(url, path, headers, **kwargs):
-        captured.update(url=url, headers=headers, session=kwargs["session"])
+        captured.update(
+            url=url,
+            headers=headers,
+            session=kwargs["session"],
+            timeout=kwargs["request_timeout"],
+        )
         raise requests.HTTPError("403 Client Error")
 
     monkeypatch.setattr(video_mod, "download_with_mirrors", reject_403)
@@ -89,4 +94,5 @@ def test_xchina_video_403_uses_browser_session_and_closes_it(monkeypatch, tmp_pa
     assert captured["session"] is session
     assert captured["headers"]["Referer"] == "https://xchina.co/video/id-example.html"
     assert captured["headers"]["Cookie"] == "session=kept"
+    assert captured["timeout"] == video_mod.SHUTDOWN_IO_TIMEOUT
     assert session.closed is True

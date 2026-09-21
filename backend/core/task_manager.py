@@ -229,7 +229,12 @@ class TaskManager:
     # ---- 对外接口 ----
 
     def submit(self, task_id, resume=False):
-        entry = {"future": None, "cancel": threading.Event(), "hb": time.monotonic()}
+        entry = {
+            "future": None,
+            "cancel": threading.Event(),
+            "hb": time.monotonic(),
+            "closers": set(),
+        }
         with self._active_lock:
             self._active[task_id] = entry
         entry["future"] = self._executor.submit(self._run, task_id, resume)
@@ -480,6 +485,15 @@ class TaskManager:
             entries = list(self._active.values())
         for entry in entries:
             entry["cancel"].set()
+        # Close task-owned network sessions before joining executors. This
+        # wakes workers blocked in socket reads so the installer's bounded
+        # shutdown is not held hostage by a 120-second read timeout.
+        for entry in entries:
+            for closer in list(entry.get("closers") or ()):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
         self._watchdog_stop.set()
         # 退出登记: 本实例不再持有任何任务, 它留下的活动任务应可被回收
@@ -488,6 +502,22 @@ class TaskManager:
         if wait:
             self._executor.shutdown(wait=True)
             self._download_executor.shutdown(wait=True)
+
+    def _register_closer(self, task_id, closer):
+        if not callable(closer):
+            return
+        with self._active_lock:
+            entry = self._active.get(task_id)
+            if entry is not None:
+                entry.setdefault("closers", set()).add(closer)
+
+    def _unregister_closer(self, task_id, closer):
+        if not callable(closer):
+            return
+        with self._active_lock:
+            entry = self._active.get(task_id)
+            if entry is not None:
+                entry.setdefault("closers", set()).discard(closer)
 
     # ---- 任务配置辅助 ----
 
@@ -983,6 +1013,8 @@ class TaskManager:
             self._publish_resource(task_id, rid, "skipped")
             self._safe_log(task_id, f"skip [{r['type']}] no downloader: {r['url']}")
             return
+        closer = getattr(downloader, "close", None)
+        self._register_closer(task_id, closer)
 
         def tick():
             """下载过程中的心跳: 顺带检查取消, 让停止操作立刻生效。
@@ -1131,6 +1163,8 @@ class TaskManager:
             # 没有这一段, 这类 bug 会表现成"某个资源莫名失败", 复盘时无从下手。
             logger.debug("unclassified failure on %s\n%s", r["url"],
                          traceback.format_exc())
+        finally:
+            self._unregister_closer(task_id, closer)
 
     def _mark_perceptual_dup(self, task_id, rid, path, url, threshold):
         """算 dHash, 并在**本任务内**找出最接近的一张, 只做标记。

@@ -64,6 +64,7 @@ REJECT_CT = "text/html"
 
 ENGINES = ("auto", "ffmpeg", "builtin")
 MIN_HLS_DURATION_RATIO = 0.99
+SHUTDOWN_IO_TIMEOUT = 4.0
 
 
 def _short(err, limit=180):
@@ -83,32 +84,46 @@ def _is_dash(url):
     return _path_only(url).endswith(".mpd")
 
 
-def _probe_media_duration(path, ff):
+def _probe_media_duration(path, ff, progress_cb=None):
     """用 ffprobe 读取最终容器时长；本机没有探测器时返回 None。"""
     sibling = Path(ff).with_name("ffprobe.exe" if Path(ff).suffix.lower() == ".exe" else "ffprobe")
     probe = str(sibling) if sibling.is_file() else shutil.which("ffprobe")
     if not probe:
         return None
+    cmd = [
+        probe, "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ]
     try:
-        result = subprocess.run(
-            [
-                probe, "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return float(result.stdout.strip())
+        if progress_cb is None:
+            result = subprocess.run(
+                cmd, check=True, capture_output=True, text=True, timeout=30
+            )
+            stdout = result.stdout
+        else:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            stdout, _ = VideoDownloader._communicate_process(
+                proc, cmd, timeout=30, progress_cb=progress_cb
+            )
+            if proc.returncode:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return float(stdout.strip())
+    except TaskCancelled:
+        raise
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
-def _validate_hls_duration(path, info, ff):
+def _validate_hls_duration(path, info, ff, progress_cb=None):
     """拒绝 ffmpeg 退出码为 0、但只封装了播放列表前一小段的假成功。"""
     expected = float((info or {}).get("duration") or 0)
-    actual = _probe_media_duration(path, ff)
+    actual = (
+        _probe_media_duration(path, ff, progress_cb=progress_cb)
+        if progress_cb is not None
+        else _probe_media_duration(path, ff)
+    )
     if expected <= 0:
         return actual
     if actual is None:
@@ -138,6 +153,10 @@ class VideoDownloader:
         # Tests/collectors may inject a session. Sessions created by download()
         # are owned by that call and closed on every success/failure path.
         self.session = None
+    def close(self):
+        session, self.session = self.session, None
+        if session is not None:
+            session.close()
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None,
                  info=None, **kw):
@@ -157,8 +176,7 @@ class VideoDownloader:
                                        filename, info)
         finally:
             if owned:
-                self.session.close()
-                self.session = None
+                self.close()
 
     # ---- mp4 直链 ----
 
@@ -176,6 +194,7 @@ class VideoDownloader:
             log=log,
             reject_ct=REJECT_CT,
             info=info,
+            request_timeout=SHUTDOWN_IO_TIMEOUT,
         )
         return real, sha
 
@@ -225,7 +244,9 @@ class VideoDownloader:
         leaf, info, last_err = murl, None, None
         for cand in [murl] + [m for m in (mirrors or []) if m and m != murl]:
             try:
-                leaf, info = self._preflight_hls(cand, headers, log)
+                leaf, info = self._preflight_hls(
+                    cand, headers, log, progress_cb=progress_cb
+                )
                 break
             except Exception as e:
                 last_err = e
@@ -241,13 +262,13 @@ class VideoDownloader:
             path = out / f"{stem}.mp4"
             try:
                 self._ffmpeg_pull(leaf, headers, path, ff, progress_cb=progress_cb)
-                _validate_hls_duration(path, info, ff)
+                _validate_hls_duration(path, info, ff, progress_cb=progress_cb)
                 if progress_cb:
                     progress_cb()
                 if log:
                     log(f"ffmpeg 拉流完成: {path.name}")
                 fill_info(info, leaf, "video/mp4")
-                return path, sha256_file(path)
+                return path, sha256_file(path, progress_cb=progress_cb)
             except TaskCancelled:
                 # ⚠️ 用户点了停止。这不是"ffmpeg 拉流失败" —— 落到下面的
                 # `except Exception` 里会被当成一次普通失败, 于是在 engine=auto
@@ -310,7 +331,13 @@ class VideoDownloader:
             with open(merged, "wb") as dst:
                 for p in parts:
                     with open(p, "rb") as src:
-                        shutil.copyfileobj(src, dst, CHUNK)
+                        while True:
+                            chunk = src.read(CHUNK)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            if progress_cb:
+                                progress_cb()
                     # 长视频几百片, 合并阶段也要能响应"停止"
                     if progress_cb:
                         progress_cb()
@@ -327,20 +354,22 @@ class VideoDownloader:
         if ff:
             mp4 = out / f"{stem}.mp4"
             try:
-                self._ffmpeg_remux(merged, mp4, ff)
+                self._ffmpeg_remux(
+                    merged, mp4, ff, progress_cb=progress_cb
+                )
                 merged.unlink(missing_ok=True)
                 if log:
                     log(f"已 remux 为 {mp4.name}")
                 fill_info(info, base, "video/mp4")
-                return mp4, sha256_file(mp4)
+                return mp4, sha256_file(mp4, progress_cb=progress_cb)
             except Exception as e:
                 if log:
                     log(f"remux 失败, 保留 .ts 容器: {_short(e)}")
 
         fill_info(info, base, "video/mp2t")
-        return merged, sha256_file(merged)
+        return merged, sha256_file(merged, progress_cb=progress_cb)
 
-    def _preflight_hls(self, murl, headers, log):
+    def _preflight_hls(self, murl, headers, log, progress_cb=None):
         """下载前预检播放列表, 返回 (leaf_url, info)。
 
         info.ok 为 False 时本方法**抛异常**(带人话原因), 调用方不该继续下载。
@@ -350,9 +379,17 @@ class VideoDownloader:
         seen = set()
         url = murl
         for _ in range(4):
+            if progress_cb:
+                progress_cb()
             info = inspect_playlist(
-                url, headers=headers, session=self.session, log=log
+                url,
+                headers=headers,
+                session=self.session,
+                log=log,
+                timeout=SHUTDOWN_IO_TIMEOUT,
             )
+            if progress_cb:
+                progress_cb()
             if not info["ok"]:
                 raise RuntimeError(f"播放列表校验未通过: {info['reason']}")
             # master: 没有分片、只有变体 -> 选最高码率继续下钻
@@ -396,7 +433,7 @@ class VideoDownloader:
                     with limiter.slot():
                         resp = self.session.get(
                             segments[i], headers=headers, stream=True,
-                            timeout=settings.request_timeout,
+                            timeout=SHUTDOWN_IO_TIMEOUT,
                         )
                     resp.raise_for_status()
                     with open(tmp, "wb") as f:
@@ -416,7 +453,9 @@ class VideoDownloader:
                     last = e
                     tmp.unlink(missing_ok=True)
                     if attempt < settings.segment_retries:
-                        time.sleep(min(2 ** attempt, 5))
+                        self._interruptible_sleep(
+                            min(2 ** attempt, 5), progress_cb
+                        )
             raise RuntimeError(f"分片 {i + 1}/{total} 失败: {_short(last)}")
 
         errors = []
@@ -444,6 +483,17 @@ class VideoDownloader:
                 f"{len(errors)}/{total} 个分片下载失败 (首条: {errors[0]})"
             )
         return paths
+
+    @staticmethod
+    def _interruptible_sleep(seconds, progress_cb=None):
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.5, remaining))
+            if progress_cb:
+                progress_cb()
 
     # ---- ffmpeg ----
 
@@ -475,9 +525,10 @@ class VideoDownloader:
             "-i", url, "-c", "copy", str(path),
         ], progress_cb=progress_cb)
 
-    def _ffmpeg_remux(self, src, dst, ff):
+    def _ffmpeg_remux(self, src, dst, ff, progress_cb=None):
         self._run_ffmpeg(
-            [ff, "-y", "-nostats", "-i", str(src), "-c", "copy", str(dst)]
+            [ff, "-y", "-nostats", "-i", str(src), "-c", "copy", str(dst)],
+            progress_cb=progress_cb,
         )
 
     @staticmethod
@@ -489,25 +540,12 @@ class VideoDownloader:
         """
         proc = None
         try:
-            if progress_cb is None:
-                subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
-                return
-
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            deadline = time.monotonic() + 3600
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(cmd, 3600)
-                try:
-                    stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
-                    break
-                except subprocess.TimeoutExpired:
-                    # ffmpeg 拉一个长 HLS 资源时，任务级进度会一直停在 20%。
-                    # 周期回调既刷新 watchdog 心跳，也让用户取消及时穿透到子进程。
-                    progress_cb()
+            stdout, stderr = VideoDownloader._communicate_process(
+                proc, cmd, timeout=3600, progress_cb=progress_cb
+            )
             if proc.returncode:
                 raise subprocess.CalledProcessError(
                     proc.returncode, cmd, output=stdout, stderr=stderr
@@ -534,3 +572,27 @@ class VideoDownloader:
             raise RuntimeError(
                 f"ffmpeg 退出码 {e.returncode}: {tail[-1] if tail else '无 stderr'}"
             ) from e
+
+    @staticmethod
+    def _communicate_process(proc, cmd, timeout, progress_cb=None):
+        """Poll a child so cancellation can terminate it within the Host gate."""
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    return proc.communicate(timeout=min(0.5, remaining))
+                except subprocess.TimeoutExpired:
+                    if progress_cb:
+                        progress_cb()
+        except (TaskCancelled, subprocess.TimeoutExpired):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+            raise

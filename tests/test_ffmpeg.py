@@ -216,6 +216,78 @@ def test_ffmpeg_pull_heartbeats_and_terminates_on_cancel(monkeypatch):
     assert ("kill", None) not in calls
 
 
+def test_ffmpeg_remux_is_cancellation_aware(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if self.returncode is None:
+                raise video_mod.subprocess.TimeoutExpired(["ffmpeg"], timeout)
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append(("terminate", None))
+            self.returncode = -15
+
+        def kill(self):
+            calls.append(("kill", None))
+            self.returncode = -9
+
+    monkeypatch.setattr(video_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+
+    with pytest.raises(TaskCancelled):
+        VideoDownloader()._ffmpeg_remux(
+            tmp_path / "in.ts",
+            tmp_path / "out.mp4",
+            "ffmpeg",
+            progress_cb=lambda: (_ for _ in ()).throw(TaskCancelled()),
+        )
+
+    assert ("terminate", None) in calls
+
+
+def test_ffprobe_is_cancellation_aware(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if self.returncode is None:
+                raise video_mod.subprocess.TimeoutExpired(["ffprobe"], timeout)
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append(("terminate", None))
+            self.returncode = -15
+
+        def kill(self):
+            calls.append(("kill", None))
+            self.returncode = -9
+
+    monkeypatch.setattr(video_mod.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(video_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+
+    with pytest.raises(TaskCancelled):
+        video_mod._probe_media_duration(
+            tmp_path / "out.mp4",
+            "/usr/bin/ffmpeg",
+            progress_cb=lambda: (_ for _ in ()).throw(TaskCancelled()),
+        )
+
+    assert ("terminate", None) in calls
+
+
 def test_hls_duration_validation_rejects_successful_but_truncated_output(
     monkeypatch, tmp_path
 ):

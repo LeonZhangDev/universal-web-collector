@@ -1,5 +1,5 @@
 from downloaders.base import build_headers, safe_filename
-from downloaders.image import ImageDownloader
+from downloaders.image import ImageDownloader, _session_for
 from downloaders.video import VideoDownloader
 
 
@@ -20,3 +20,12 @@ def test_build_headers():
 def test_downloader_interfaces():
     assert callable(ImageDownloader().download)
     assert callable(VideoDownloader().download)
+
+
+def test_xchina_images_use_browser_tls_session():
+    assert _session_for("https://example.com/pic.jpg") is None
+    session = _session_for("https://img.xchina.io/photos/id/0001.jpg")
+    try:
+        assert session.impersonate == "chrome"
+    finally:
+        session.close()

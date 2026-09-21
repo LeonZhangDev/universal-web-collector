@@ -7,6 +7,7 @@ dependencies=[
 "uvicorn",
 "playwright",
 "requests",
+"curl-cffi",
 "pydantic",
 "pyyaml"
 ]

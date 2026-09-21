@@ -106,6 +106,7 @@ XCHINA = GallerySite(
     # 让 _base_candidates 自动生成 photos2..photos5 —— 手写三个的话下次出现 photos4
     # 就会整批判空, 而用户只看到"任务失败", 根本看不出是路径变了。
     base_candidate_digits=5,
+    browser_impersonation="chrome",
     # 按画质从高到低
     variants=[".jpg", "_1200x0.webp", "_800x0.webp", "_600x0.webp"],
     quality_map={

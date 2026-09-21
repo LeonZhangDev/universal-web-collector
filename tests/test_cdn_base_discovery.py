@@ -136,6 +136,11 @@ def test_seq_width_variants_cover_neighbours():
     assert "{seq:04d}" in out and "{seq:06d}" in out
 
 
+def test_xchina_opts_into_browser_tls_impersonation():
+    """The WSL transport must match Chromium or the live CDN returns 403."""
+    assert XCHINA.browser_impersonation == "chrome"
+
+
 # ---- 候选基址: 单一来源 + 自动展开 ----
 
 def test_base_candidates_expands_digit_suffixes():
@@ -321,7 +326,7 @@ def test_preview_sample_name_uses_page_seq_width(monkeypatch):
 def test_preview_reports_resource_roots_after_enumeration(monkeypatch):
     """走枚举的路径由 diag 给出实际生效的根, 这是"为什么没采到"的第一手证据。"""
     sess = Routes("https://nowhere.example/")
-    monkeypatch.setattr(G, "_session", lambda proxy=None: sess)
+    monkeypatch.setattr(G, "_session", lambda proxy=None, impersonate=None: sess)
     d = _preview_with_meta(monkeypatch, _meta(), media="image")
     assert d["sampled"] is True
     got = d["resource_roots"]["image"]
@@ -343,7 +348,7 @@ def test_preview_reports_hint_source_when_not_enumerating(monkeypatch):
 def test_preview_warns_when_enumeration_finds_nothing(monkeypatch):
     """采不到时不能只回一个 0, 要把"下一步做什么"一并给出。"""
     sess = Routes("https://nowhere.example/")
-    monkeypatch.setattr(G, "_session", lambda proxy=None: sess)
+    monkeypatch.setattr(G, "_session", lambda proxy=None, impersonate=None: sess)
     d = _preview_with_meta(monkeypatch, _meta(), media="image")
     assert d["warning"], "0 资源的预告必须带上可行动提示"
     assert GID in d["warning"]

@@ -127,7 +127,15 @@ class XChinaVideoSpider:
             "headers": {"referer": url},
             "mirrors": [],
             "size": size,
-            "filename": f"{base}.mp4",
+            # ⚠️ 文件名用 **gid**, 不用页面标题: 视频是平铺在下载根目录的
+            # (见 core/layout.py), 那一层没有相册文件夹可以依赖, 名字必须自带
+            # 唯一性 —— 两个不同视频的标题一模一样是常事, 撞名只能靠 `xx(2).mp4`
+            # 兜底, 越兜越乱。gid 是站点自己的标识(它的播放列表就叫
+            # `{gid}.m3u8`), 既是"网站中的文件名", 也稳定且唯一。
+            "filename": f"{gid}.mp4",
+            # 标题仍然带出去: 任务列表拿它做展示名(见 _infer_name), 撞名时也拿它
+            # 当区分词 —— 文件名里看不到标题, 至少别让信息在这里丢掉。
+            "album": base,
         }]
 
     # --- 创建前预览 ---
@@ -155,8 +163,9 @@ class XChinaVideoSpider:
             "page": None,
             "tags": [],
             "maker": None,
-            "sample_files": [f"{base}.mp4"],
-            "video_items": [{"name": f"{base}.mp4", "url": m3u8,
+            # 示例名与实际落盘一致(视频平铺在下载根目录, 名字是 gid, 见 crawl)
+            "sample_files": [f"{gid}.mp4"],
+            "video_items": [{"name": f"{gid}.mp4", "url": m3u8,
                              "size": info.get("key_bytes") or 0}],
             "logs": [],
         }

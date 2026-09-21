@@ -113,32 +113,35 @@ def test_album_name_id_mode_ignores_meta():
     assert sp.album_name(_meta(), "id", GID) == GID
 
 
-def test_group_name_off_by_default():
+def test_group_name_is_only_the_album_folder():
+    """目录树里只有相册名一层 —— "标签分层"开关已取消(布局规则定死了)。
+
+    曾经的 `album_tags_dir` 会在相册名外套一层 `丝袜-情趣内衣/相册名/`, 但布局
+    规则(下载目录的下一级只有相册文件夹)会把它削掉 —— 结果是"日志和预览显示的
+    路径"与"实际落盘的路径"对不上, 用户照预览去找文件会找不到。标签本身没丢,
+    完整写在 album.json / manifest 里。
+    """
     sp = XChinaGallerySpider()
-    assert sp.group_name(_meta(tags=["丝袜"]), "套图名", {}) == "套图名"
-    assert sp.group_name(_meta(tags=["丝袜"]), "套图名",
-                         {"album_tags_dir": "false"}) == "套图名"
+    assert sp.group_name("套图名", GID) == "套图名"
+    # 标签不再参与目录名, 传什么标签结果都一样
+    assert sp.group_name(_meta(tags=["丝袜", "情趣内衣"])["album"], GID) == "套图名"
 
 
-def test_group_name_prepends_tags_when_enabled():
+def test_group_name_falls_back_to_gid():
     sp = XChinaGallerySpider()
-    got = sp.group_name(_meta(tags=["丝袜", "情趣内衣", "吊带袜", "第四个", "第五个"]),
-                        "套图名", {"album_tags_dir": True})
-    assert got == "丝袜-情趣内衣-吊带袜/套图名", "只取前 3 个标签, 再多只是废话"
+    assert sp.group_name("", GID) == GID, "取不到相册名时回退图集 ID"
+    assert sp.group_name("..", GID) == GID, "纯点段没有可用内容, 同样回退"
 
 
-def test_group_name_sanitizes_tags():
+def test_group_with_slash_is_flattened_by_layout():
+    """相册标题里带 `/` 时, 归位规则只保留最深一段, 不会多出一层目录。"""
+    from core import layout
+
     sp = XChinaGallerySpider()
-    got = sp.group_name(_meta(tags=["a/b", ".."]), "套图名",
-                        {"album_tags_dir": True})
-    assert got.startswith("a_b") or got == "套图名"
-    assert ".." not in got.split("/")[0]
-
-
-def test_group_name_ignores_empty_tags():
-    sp = XChinaGallerySpider()
-    assert sp.group_name(_meta(tags=[]), "套图名",
-                         {"album_tags_dir": True}) == "套图名"
+    group = sp.group_name("a/b", GID)
+    rel, album = layout.place("image", f"{group}/00001.jpg", "a/b")
+    assert rel == "b/00001.jpg"
+    assert album == "b"
 
 
 # ---- read_album_meta: id 模式完全不开浏览器 ----
@@ -311,7 +314,7 @@ def test_preview_group_matches_discover_group(monkeypatch):
     monkeypatch.setattr(G, "_video_at_first_seq", lambda *a, **kw: False)
 
     sp = XChinaGallerySpider()
-    data = sp.preview(GID, {"album_tags_dir": True})
+    data = sp.preview(GID, {})
 
     assert seen[0]["album"] == data["group"]
 

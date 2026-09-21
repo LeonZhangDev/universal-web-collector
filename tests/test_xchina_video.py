@@ -146,7 +146,11 @@ def test_crawl_yields_one_video_resource_with_size_estimate():
     r = res[0]
     assert r["type"] == "video"
     assert r["url"] == PLAYLIST_URL
-    assert r["filename"].endswith(".mp4")
+    # 文件名取 gid, 不取页面标题: 视频平铺在下载根目录, 那一层没有相册文件夹可
+    # 依赖, 名字必须自带唯一性(标题会重名)。gid 也是站点自己的标识。
+    assert r["filename"] == "6aaa517d3f106.mp4"
+    # 标题没丢: 它是任务展示名(_infer_name)与撞名时的区分词
+    assert r["album"]
     # size 由 estimate_size 给出(单片 896768 x 1 片 ≈ 876KB), 不是 m3u8 的几 KB
     assert isinstance(r["size"], int) and r["size"] > 100_000
 
@@ -163,4 +167,6 @@ def test_preview_reports_video_only():
     assert d["photos"] == 0
     assert d["videos"] == 1
     assert d["encrypted"] is True
-    assert d["sample_files"][0].endswith(".mp4")
+    # 预告里的示例名必须与实际落盘的一致(否则用户照预览去找文件会找不到)
+    assert d["sample_files"] == ["6aaa517d3f106.mp4"]
+    assert d["video_items"][0]["name"] == "6aaa517d3f106.mp4"

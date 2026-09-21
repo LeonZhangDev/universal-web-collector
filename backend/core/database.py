@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS watches(
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_resources_task ON resources(task_id);
 CREATE INDEX IF NOT EXISTS idx_resources_hash ON resources(hash);
+CREATE INDEX IF NOT EXISTS idx_resources_path ON resources(local_path);
+CREATE INDEX IF NOT EXISTS idx_resources_filename ON resources(filename);
 CREATE INDEX IF NOT EXISTS idx_logs_task ON task_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 """
@@ -329,6 +331,64 @@ def find_done_resource(url):
         " AND local_path IS NOT NULL ORDER BY id DESC LIMIT 1",
         (url,),
     )
+
+
+def find_resource_by_path(local_path):
+    """按落盘路径反查资源(跨任务): 判断"这一格现在归谁"。
+
+    布局规则消解重名时必须知道盘上那个文件是哪条 URL 下的 —— 只按"同名就复用"
+    是不行的: 下载器会把已有文件当成"同一个文件的半成品"接管续传, 不同来源的
+    同名文件会被拼成一份产物还报成功(见 core/layout.py 的警告)。
+    库里有记录才能分辨"同一张图重下一次"与"另一个文件恰好重名"。
+    """
+    if not local_path:
+        return None
+    return query_one(
+        "SELECT * FROM resources WHERE local_path=? ORDER BY id DESC LIMIT 1",
+        (str(local_path),),
+    )
+
+
+def find_resource_by_filename(filename):
+    """按**计划落盘路径**(resources.filename)反查资源(跨任务)。
+
+    与 `find_resource_by_path` 的分工: 那条查的是"已在盘上的绝对路径", 这条查的
+    是"计划放哪" —— 覆盖**还没下载完**的占位(pending/downloading)以及下载时被
+    换了扩展名(镜像回退 .jpg->.webp)的行。重名消解两个都要看: 只看盘上有没有,
+    两个任务并发跑同一个相册时会各自认为自己是第一个。
+    """
+    if not filename:
+        return None
+    return query_one(
+        "SELECT * FROM resources WHERE filename=? ORDER BY id DESC LIMIT 1",
+        (str(filename),),
+    )
+
+
+def find_place_owner(relative, local_path=None):
+    """这一格(相对落盘路径)现在归谁: 返回 resources 行, 空着返回 None。
+
+    先看绝对路径(盘上真有的那个最权威), 再看计划名。两步都有索引(见 INDEXES),
+    取重名消解时的"占用者", 见 core/layout.py::claim。
+    """
+    row = find_resource_by_path(local_path) if local_path else None
+    return row or find_resource_by_filename(relative)
+
+
+def count_place_refs(relative, local_path=None, exclude_task=None):
+    """除 `exclude_task` 外, 还有几个任务指向这一格。
+
+    删除任务的磁盘文件前用它判定"这份文件是不是只有我用": 内容去重会让别的任务
+    复用同一个文件(见 task_manager._purge_files), 删掉它等于把那些任务的结果
+    一并毁掉。
+    """
+    sql = ("SELECT COUNT(*) AS n FROM resources WHERE (local_path=? OR filename=?)")
+    args = [str(local_path or ""), str(relative or "")]
+    if exclude_task is not None:
+        sql += " AND task_id<>?"
+        args.append(exclude_task)
+    row = query_one(sql, tuple(args))
+    return int(row["n"]) if row else 0
 
 
 def count_resources(task_id):

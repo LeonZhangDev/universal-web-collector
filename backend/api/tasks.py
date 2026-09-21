@@ -22,6 +22,7 @@ from collectors.gallery_base import (
 )
 from core import database as db
 from core import events
+from core import layout
 from core.config import settings
 from core.filters import parse_size
 from core.manifest import read_manifest
@@ -73,7 +74,7 @@ def _validate_download_dir(value):
 
 
 def _gallery_options(filters=None, quality=None, media=None, album_title=None,
-                     album_tags_dir=None, max_items=None, aggregate_depth=None):
+                     max_items=None, aggregate_depth=None):
     """收集并校验采集器相关 options(**创建任务与预览共用**)。
 
     共用是有意的: 否则"预览通过、创建却被拒"(或反过来)这种不一致
@@ -111,8 +112,6 @@ def _gallery_options(filters=None, quality=None, media=None, album_title=None,
                        f"可选: {', '.join(ALBUM_TITLE_MODES)}",
             )
         options["album_title"] = album_title
-    if album_tags_dir is not None:
-        options["album_tags_dir"] = bool(album_tags_dir)
     # 聚合页闸门。上界是保护而不是限制意志: 一个索引页挂着上百个模特, depth=3
     # 就是几百次页面读取, 站点会先把我们封掉。要更多就分批来。
     if max_items is not None:
@@ -194,7 +193,6 @@ def create(payload: TaskCreateIn):
         quality=payload.quality,
         media=payload.media,
         album_title=payload.album_title,
-        album_tags_dir=payload.album_tags_dir,
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
     )
@@ -213,7 +211,6 @@ class PreviewIn(BaseModel):
     quality: Optional[str] = None
     media: Optional[str] = None
     album_title: Optional[str] = None
-    album_tags_dir: Optional[bool] = None
     # 抽样上限: 预览不该因为"想看全"把接口拖成几分钟
     max_items: int = 12
     # 聚合页采集器: 还能再往下钻几层(模特索引 -> 模特 -> 相册 = 2 层)
@@ -243,7 +240,6 @@ def preview(payload: PreviewIn):
         quality=payload.quality,
         media=payload.media,
         album_title=payload.album_title,
-        album_tags_dir=payload.album_tags_dir,
         aggregate_depth=payload.aggregate_depth,
     )
     limit = max(1, min(int(payload.max_items or 12), 50))
@@ -581,7 +577,6 @@ class WatchIn(BaseModel):
     quality: Optional[str] = None
     media: Optional[str] = None
     album_title: Optional[str] = None
-    album_tags_dir: Optional[bool] = None
     # 聚合页: 一次巡检展开的范围(与创建任务同一套选项)
     max_items: Optional[int] = None
     aggregate_depth: Optional[int] = None
@@ -598,13 +593,12 @@ def create_watch(payload: WatchIn):
     if payload.interval_minutes < 1:
         raise HTTPException(status_code=400, detail="interval_minutes 至少为 1")
     # 与创建任务/预览**共用**同一个选项构造器。原先这里手抄了一份校验,
-    # 结果是 album_tags_dir 这类新选项在前端传了却被静默丢掉 —— 订阅会长期
-    # 反复跑, 悄悄少一个选项比直接报错难查得多。
+    # 结果是新选项在前端传了却被静默丢掉 —— 订阅会长期反复跑, 悄悄少一个选项
+    # 比直接报错难查得多。
     options = _gallery_options(
         quality=payload.quality,
         media=payload.media,
         album_title=payload.album_title,
-        album_tags_dir=payload.album_tags_dir,
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
     )
@@ -666,7 +660,7 @@ def task_manifest(task_id: int):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    data = read_manifest(task_base_dir(task) / str(task_id))
+    data = read_manifest(layout.meta_dir(task_base_dir(task), task_id))
     if data is None:
         raise HTTPException(status_code=404, detail="manifest not found")
     return data

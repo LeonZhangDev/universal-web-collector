@@ -116,9 +116,9 @@ const albumTitleLabel = {
   h1: "页面 <h1> (信息更全)",
   id: "图集 ID (不开浏览器)",
 };
-// 相册名外面再套一层站点标签目录: 丝袜-情趣内衣/相册名/00001.jpg。
-// 标签来自相册页(实测该类站每册 3~6 个), 只取前 3 个 —— 再多只会把路径撑长。
-const albumTagsDir = ref(false);
+// 目录结构固定为"下载目录 / 相册文件夹 / 文件"(视频平铺在下载根目录), 规则
+// 唯一定义在后端 core/layout.py —— 前端不再提供"标签分层"开关: 布局只有一种,
+// 开关关不掉也开不了, 留着只会让人以为按了有用。
 
 // ---- 聚合页 (模特/系列/索引页) ----
 // 「展开层数」是从入口页再往下钻几层去找内容链接; 「条目上限」是相册+视频页
@@ -259,7 +259,6 @@ function savePrefs() {
         quality: quality.value,
         media: media.value,
         albumTitle: albumTitle.value,
-        albumTagsDir: albumTagsDir.value,
         selTypes: selTypes.value,
         exts: exts.value,
         excludeExts: excludeExts.value,
@@ -291,7 +290,6 @@ function loadPrefs() {
     if (p.albumTitle && albumTitles.value.includes(p.albumTitle)) {
       albumTitle.value = p.albumTitle;
     }
-    albumTagsDir.value = !!p.albumTagsDir;
     selTypes.value = Array.isArray(p.selTypes) ? p.selTypes : [];
     exts.value = p.exts || "";
     excludeExts.value = p.excludeExts || "";
@@ -345,7 +343,6 @@ async function submit() {
       quality: isGallery.value ? quality.value : null,
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
-      album_tags_dir: isGallery.value ? albumTagsDir.value : null,
       ...aggregateOpts(),
     });
     // 手选采集器时后端只做**软校验**(形状不像本站 ID 就提醒), 任务是照常创建的。
@@ -384,7 +381,6 @@ async function runPreview() {
       quality: isGallery.value ? quality.value : null,
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
-      album_tags_dir: isGallery.value ? albumTagsDir.value : null,
       ...aggregateOpts(),
     });
   } catch (e) {
@@ -580,7 +576,6 @@ async function addWatch() {
       quality: isGallery.value ? quality.value : null,
       media: isGallery.value ? media.value : null,
       album_title: isGallery.value ? albumTitle.value : null,
-      album_tags_dir: isGallery.value ? albumTagsDir.value : null,
       ...aggregateOpts(),
     });
     watchUrl.value = "";
@@ -815,15 +810,10 @@ onUnmounted(() => {
     </div>
 
     <div class="dir-row" v-if="isGallery">
-      <span class="lbl">标签分层</span>
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px">
-        <input type="checkbox" v-model="albumTagsDir" @change="savePrefs" />
-        在相册名外再套一层站点标签目录
-      </label>
-      <span class="tip" v-if="albumTagsDir">
-        如 丝袜-情趣内衣/相册名/00001.jpg（取前 3 个标签）
+      <span class="lbl">目录结构</span>
+      <span class="tip">
+        下载目录 / 相册名 / 图片；视频直接放在下载目录根下，文件名取站点原名
       </span>
-      <span class="tip" v-else>关闭时直接用相册名当目录</span>
     </div>
 
     <div class="dir-row" v-if="isAggregate">
@@ -861,7 +851,9 @@ onUnmounted(() => {
       <template v-else>
         <div>
           <b>{{ isAggregate ? "将展开到" : "将保存到" }}</b>
-          <code>{{ preview.group }}</code>
+          <!-- 视频是平铺在下载根目录的(见后端 core/layout.py), 显示相册名会让人
+               以为下面有个以它命名的文件夹 —— 预告必须与实际落盘一致 -->
+          <code>{{ isAggregate ? preview.group : (isVideo ? "下载目录根目录" : preview.group) }}</code>
           <span class="tip" v-if="!isVideo && !isAggregate">
             （命名方式: {{ albumTitleLabel[preview.album_source] || preview.album_source }}）
           </span>

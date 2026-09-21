@@ -4,6 +4,10 @@
   * 去重机制下别的任务可能正在引用这些文件(删了会让它们的 manifest 指向空),
   * "从列表里划掉一行"和"把已下载的东西删掉"应该分开决定。
 另外删除时路径算错就等于删用户的目录, 所以越界校验必须有测试兜着。
+
+⚠️ 布局改版后文件**不再**集中在 `<下载根>/<任务ID>/`: 它们在
+`<下载根>/<相册名>/`(视频直接平铺在下载根), 与别的任务共用同一个根。所以
+"删文件"不再是删目录, 而是**按库里的记录逐条删** —— 这里的用例正是守着这条。
 """
 import time
 
@@ -50,48 +54,101 @@ def env(tmp_path, tmp_db, monkeypatch):
     e.shutdown()
 
 
-def _task_with_files(env, name, n=2, size=100):
-    """建一个任务并在它的下载目录里放几个文件, 返回 (task_id, 目录)。"""
-    tid = env.db.create_task("https://x/album", "generic", None, {})
-    d = env.base / str(tid)
-    d.mkdir(parents=True, exist_ok=True)
+def _task_with_files(env, name, n=2, size=100, album="套图名", tid=None):
+    """建任务 + 按**新布局**落几个文件, 返回 (task_id, 文件路径列表)。
+
+    ⚠️ 文件与库记录要配套: 删除是按库里那些 `filename`/`local_path` 走的,
+    只落文件不写库(或反过来)都测不出真实行为。
+    """
+    if tid is None:
+        tid = env.db.create_task(f"https://x/{name}", "generic", None, {})
+    paths = []
     for i in range(1, n + 1):
-        (d / f"{i:05d}.jpg").write_bytes(b"j" * size)
-    return tid, d
+        rel = f"{album}/{i:05d}.jpg"
+        p = env.base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"j" * size)
+        env.db.add_resource(tid, "image", f"https://img/{i:05d}.jpg",
+                            filename=rel, status="done", local_path=str(p))
+        paths.append(p)
+    return tid, paths
 
 
 def test_delete_keeps_files_by_default(env):
-    tid, d = _task_with_files(env, "keep")
+    tid, paths = _task_with_files(env, "keep")
     mgr = env.manager()
 
     info = mgr.delete(tid)
 
     assert info == {"files": 0, "bytes": 0}
     assert env.db.get_task(tid) is None, "记录应被删除"
-    assert d.is_dir(), "默认必须保留磁盘文件"
-    assert len(list(d.iterdir())) == 2
+    assert all(p.exists() for p in paths), "默认必须保留磁盘文件"
 
 
-def test_delete_with_files_removes_dir_and_reports(env):
-    tid, d = _task_with_files(env, "purge", n=3, size=100)
+def test_delete_with_files_removes_only_recorded_files(env):
+    tid, paths = _task_with_files(env, "purge", n=3, size=100)
     mgr = env.manager()
 
     info = mgr.delete(tid, with_files=True)
 
     assert info["files"] == 3
     assert info["bytes"] == 300
-    assert not d.exists(), "选了删文件就必须真的删掉"
+    assert not any(p.exists() for p in paths), "选了删文件就必须真的删掉"
     assert env.db.get_task(tid) is None
 
 
-def test_delete_with_files_tolerates_missing_dir(env):
-    """目录本来就不存在(比如用户手工删过)时不能报错。"""
+def test_delete_with_files_tolerates_missing_file(env):
+    """库里有记录但文件已经不在了(用户手工删过)时不能报错, 也不能算进统计。"""
     tid = env.db.create_task("https://x/album", "generic", None, {})
+    env.db.add_resource(tid, "image", "https://img/1.jpg",
+                        filename="套图名/00001.jpg", status="done",
+                        local_path=str(env.base / "套图名" / "00001.jpg"))
     mgr = env.manager()
 
     info = mgr.delete(tid, with_files=True)
 
     assert info == {"files": 0, "bytes": 0}
+
+
+def test_purge_skips_file_another_task_points_at(env):
+    """去重: 两个任务指向同一份文件时, 删其中一个不能动它。
+
+    内容 hash 重复时后来者直接复用前者的文件(见 task_manager._download_one),
+    删掉它等于把另一个任务的结果一并毁掉。
+    """
+    a = env.db.create_task("https://x/a", "generic", None, {})
+    b = env.db.create_task("https://x/b", "generic", None, {})
+    p = env.base / "套图名" / "00001.jpg"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"z" * 50)
+    for tid, url in ((a, "https://img/1.jpg"), (b, "https://img/1.jpg?sd=600")):
+        env.db.add_resource(tid, "image", url, filename="套图名/00001.jpg",
+                            status="done", local_path=str(p))
+    mgr = env.manager()
+
+    info = mgr.delete(a, with_files=True)
+
+    assert info == {"files": 0, "bytes": 0}
+    assert p.exists(), "别的任务还在引用这份文件, 不能删"
+
+
+def test_purge_removes_meta_dir_only_for_this_task(env):
+    """清单目录 `_meta/<任务ID>/` 整棵清掉, 别的任务那份一个字节都不能碰。"""
+    tid = env.db.create_task("https://x/album", "generic", None, {})
+    mine = env.base / "_meta" / str(tid)
+    mine.mkdir(parents=True, exist_ok=True)
+    (mine / "manifest.json").write_bytes(b"{}")
+    (mine / "album.json").write_bytes(b"{}")
+    other = env.base / "_meta" / "9999"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "manifest.json").write_bytes(b"{}")
+    mgr = env.manager()
+
+    info = mgr.delete(tid, with_files=True)
+
+    assert info["files"] == 2
+    assert not mine.exists()
+    assert (other / "manifest.json").exists(), "别的任务的清单不能被牵连"
 
 
 def test_delete_unknown_task_is_noop(env):
@@ -100,9 +157,10 @@ def test_delete_unknown_task_is_noop(env):
 
 
 def test_purge_never_touches_download_root_itself(env):
-    """越界保护: 下载根目录里放的"别人的东西"一个都不能动。
+    """越界保护: 下载根目录里"没被记录过的东西"一个都不能动。
 
-    这里把 task_id 目录构造成不存在, 并确认根目录里的旁支文件安然无恙。
+    ⚠️ 这正是改版后风险变大的地方 —— 用户可能把下载根设成 `D:/图片`,
+    里面本来就有他自己的文件。删除只认库里的记录, 别的一律不碰。
     """
     env.base.mkdir(parents=True, exist_ok=True)
     bystander = env.base / "keep-me.txt"
@@ -116,16 +174,36 @@ def test_purge_never_touches_download_root_itself(env):
     assert bystander.exists(), "绝不能删到下载根目录下的其他内容"
 
 
+def test_purge_refuses_path_outside_download_root(env, tmp_path):
+    """库里若有越界路径(手工改库/换了自定义目录), 那份文件绝不能被删。"""
+    outsider = tmp_path / "外面" / "重要.jpg"
+    outsider.parent.mkdir(parents=True, exist_ok=True)
+    outsider.write_bytes(b"x" * 12)
+    tid = env.db.create_task("https://x/album", "generic", None, {})
+    env.db.add_resource(tid, "image", "https://img/1.jpg",
+                        filename="../外面/重要.jpg", status="done",
+                        local_path=str(outsider))
+    mgr = env.manager()
+
+    info = mgr.delete(tid, with_files=True)
+
+    assert info["files"] == 0
+    assert outsider.exists(), "下载根之外的文件一个都不能删"
+
+
 def test_purge_respects_custom_download_dir(env, tmp_path):
-    """自定义输出目录下同样只删 <dir>/<task_id>/ 这一层。"""
+    """自定义下载目录下同样只删该任务记录过的文件。"""
     custom = tmp_path / "user-picked"
     custom.mkdir(parents=True, exist_ok=True)
     outsider = custom / "别删我.txt"
     outsider.write_bytes(b"x")
     tid = env.db.create_task("https://x/album", "generic", str(custom), {})
-    inside = custom / str(tid)
-    inside.mkdir(parents=True)
-    (inside / "a.jpg").write_bytes(b"y" * 10)
+    inside = custom / "套图名" / "a.jpg"
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(b"y" * 10)
+    env.db.add_resource(tid, "image", "https://img/a.jpg",
+                        filename="套图名/a.jpg", status="done",
+                        local_path=str(inside))
     mgr = env.manager()
 
     info = mgr.delete(tid, with_files=True)
@@ -207,59 +285,6 @@ def test_task_with_zero_resources_fails_not_succeeds(env, empty_collector):
     assert "未发现任何资源" in (task["error"] or "")
     logs = [l["message"] for l in env.db.get_logs(tid)]
     assert any("未发现任何资源" in m or "task failed" in m for m in logs)
-
-
-# ---- 看门狗不能用"自己那本 _active"当唯一依据 ----
-#
-# 真实踩到: 诊断脚本(这里就是测试)另起一个 TaskManager 去观察任务, 模块级
-# 单例的看门狗同时也在跑。它看到 DB 里有个活动任务、自己的 _active 里却没有,
-# 就判成"服务重启遗留"标 failed —— 而那个任务的 worker 正在正常下载。
-# 这个坑很隐蔽: 生产单进程下不会出现, 但测试/脚本一创建第二个实例就中招。
-
-
-@pytest.fixture
-def slow_collector():
-    import time as _t
-
-    from collectors import register
-
-    @register("slow_spider_for_test")
-    class Slow:
-        def crawl(self, url, **kw):
-            _t.sleep(2.0)
-            return []
-
-    return "slow_spider_for_test"
-
-
-def test_other_manager_watchdog_does_not_kill_running_task(env, slow_collector):
-    tid = env.db.create_task("https://x/slow", slow_collector, None, {})
-    a = env.manager()
-    a.submit(tid)
-    deadline = time.time() + 5
-    while time.time() < deadline and env.db.get_task(tid)["status"] == "pending":
-        time.sleep(0.05)
-    assert env.db.get_task(tid)["status"] in tm.ACTIVE_STATES
-
-    other = env.manager()  # 模拟"另一个实例"
-    other._watchdog_pass()
-
-    task = env.db.get_task(tid)
-    assert task["status"] in tm.ACTIVE_STATES, "别的实例正在跑的任务不能被判成 stale"
-    assert "stale" not in (task["error"] or "")
-
-
-def test_watchdog_still_reclaims_orphan_task(env):
-    """真正没人持有的任务(服务重启遗留)仍必须被回收。"""
-    tid = env.db.create_task("https://x/orphan", "generic", None, {})
-    env.db.update_task_status(tid, "downloading")
-
-    mgr = env.manager()
-    mgr._watchdog_pass()
-
-    task = env.db.get_task(tid)
-    assert task["status"] == "failed"
-    assert "stale" in (task["error"] or "")
 
 
 # ---- 看门狗不能用"自己那本 _active"当唯一依据 ----

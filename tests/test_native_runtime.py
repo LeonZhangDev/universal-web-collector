@@ -123,6 +123,9 @@ def test_native_fallback_passes_uv_to_internal_sync(tmp_path):
     uv = home / ".local" / "bin" / "uv"
     capture = tmp_path / "uv-calls.txt"
     _fake_runtime_uv(uv)
+    with __import__("socket").socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        isolated_port = probe.getsockname()[1]
 
     result = subprocess.run(
         [make, "start-native"],
@@ -132,6 +135,7 @@ def test_native_fallback_passes_uv_to_internal_sync(tmp_path):
             "HOME": str(home),
             "PATH": str(path_dir),
             "UWC_RUNTIME_FILE": str(tmp_path / "runtime.json"),
+            "UWC_PORT": str(isolated_port),
             "UWC_SKIP_BROWSER_CHECK": "1",
             "UWC_TEST_PYTHON": sys.executable,
             "UWC_UV_CAPTURE": str(capture),

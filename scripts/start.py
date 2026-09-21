@@ -249,7 +249,12 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="一键启动前后端")
     ap.add_argument("--dev", action="store_true", help="开发模式(vite dev + 后端)")
     ap.add_argument("--build", action="store_true", help="强制重新构建前端")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="后端起始端口(默认8000)")
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=os.environ.get("UWC_PORT", DEFAULT_PORT),
+        help="后端起始端口(默认8000，可由 UWC_PORT 隔离)",
+    )
     ap.add_argument("--front-port", type=int, default=DEFAULT_FRONT_PORT,
                     help="dev 模式前端起始端口(默认5173)")
     ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")

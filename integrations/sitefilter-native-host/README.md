@@ -74,5 +74,51 @@ never exception text or traceback content.
 uv run pytest -q tests/test_sitefilter_native_host.py
 ```
 
-Installer/registry registration, PyInstaller packaging, and real Chrome/Edge
-round trips are deliberately deferred to Task 6.
+## Windows installation
+
+The fixed unpacked-extension identity is derived from the public-only
+`manifest.key`: extension ID `jaihdgjnnpmiabeoefmihmjhoodcjlhf`, origin
+`chrome-extension://jaihdgjnnpmiabeoefmihmjhoodcjlhf/`. The private key used
+to establish that identity is not retained. Task 7 must copy this exact public
+key into the extension manifest.
+
+Run the installer from a normal (non-administrator) PowerShell session:
+
+```powershell
+.\integrations\sitefilter-native-host\install-native-host.ps1 -ProjectPath C:\path\to\universal_web_collector_v9
+```
+
+Omit `-ProjectPath` to select the project with a Windows folder picker. Use
+`-Distro <name>` to override default WSL detection, `-SkipProvision` to skip
+the WSL `make install` and `make build` steps, and `-WhatIf` to validate and
+print the complete plan without changing files or the registry. The installer
+pins PyInstaller 6.16.0, packages the host under
+`%LOCALAPPDATA%\SiteFilter\NativeHost`, writes the exact config and manifest,
+restricts that directory to the current user, and registers both Chrome and
+Edge under HKCU. It never needs elevation.
+If the target directory already contains files without this installer's
+ownership marker, the installer moves the directory to a timestamped sibling
+`NativeHost.preinstall-backup-*` before proceeding; the uninstaller leaves
+that backup untouched.
+
+Uninstall only the owned host files and matching registrations:
+
+```powershell
+.\integrations\sitefilter-native-host\uninstall-native-host.ps1
+```
+
+The uninstaller verifies an ownership marker and matching registry values. It
+does not remove `%LOCALAPPDATA%\SiteFilter`, Collector data, downloads,
+browser profiles, or project environments.
+
+The hidden `-InstallRoot`, `-RegistryRoot`, `-TestHostExecutable`, and
+`-SkipSelfCheck` parameters are exclusively for disposable integration tests:
+
+```powershell
+.\integrations\sitefilter-native-host\test-install-native-host.ps1 -ProjectPath (Get-Location)
+```
+
+For release verification, `test-browser-native-host.ps1` creates a temporary
+unpacked probe extension and browser profile, sends one native `ping`, then
+removes both. Pass `-Browser Chrome` or `-Browser Edge` and the corresponding
+browser executable path. It never opens or changes a normal browser profile.

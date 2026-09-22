@@ -56,7 +56,16 @@ python scripts/selfcheck.py                # 站点声明自检 + CDN 画像快�
 
 ⚠️ **本机 Bash 环境限制（2026-09-21 实测）**：`cat`/heredoc 不可用，`git -C <绝对路径>` 解析失败（报 not a git repository）。
 git 命令直接用 Bash 工具的默认 cwd（已是项目根 `C:/Users/admin/Desktop/universal_web_collector_v9`），提交用多个 `-m` 而非 heredoc。
-`uwc-verify` 虚拟环境已不存在，全量 pytest 重跑需先 `uv sync` 或重建 env。
+`uv` 在 PATH 上（0.12.15），`uwc-verify` 环境**仍在**
+（`C:/Users/admin/.workbuddy/binaries/python/envs/uwc-verify/Scripts/python.exe`，里面是旧的 `httpx 0.28.1`）；
+模拟 CI 环境用 `UV_PROJECT_ENVIRONMENT=<临时目录> uv sync --group dev`。
+
+⚠️ **本仓库有"自动提交"机制，会在会话之间提交并移动 HEAD**（V32 期间 HEAD 从 `2492fe3` 变成 `f389338`）。
+所以**每轮开始必须先 `git rev-parse HEAD` + `git ls-remote origin refs/heads/main`**，
+不要拿上一轮记的 SHA 当事实。
+
+⚠️ **CI 跑的是 `origin/main`，不是本地 HEAD**。"本地全绿 / CI 全红"的第一个诊断命令是
+`git log --oneline origin/main..HEAD` —— 本地可能有几十个没推的提交（V32 时是 29 个）。
 
 ## ⚠️ 第 7 条静默坑：前端传"代号/别名/意图"，后端必须先翻译再查库
 V29 的 `active`（状态组代号）、V31 的 `auto`（采集器意图，非落库名）两次同型缺陷 —— 多传一个词就静默返回 0 条。
@@ -73,6 +82,12 @@ V32 加 Pexels 时，自写 `parse_gid(strict=False)` 把 xchina 的 `/photo/id-
 - GitHub 远端：**https://github.com/LeonZhangDev/universal-web-collector**（分支 `main`）。
   本机**无 `gh` CLI**；用 `git credential fill` 取 GCM 里的 `gho_` token 调 REST API 建仓。
   `git credential fill` 需要 `printf "protocol=https\nhost=github.com\n\n" | ...`。
+- **CI**：`.github/workflows/ci.yml`，三个 job — `backend`(`uv sync --group dev` + `pytest`) /
+  `frontend`(`npm install` + `build`) / `docker`(`docker build`，`needs: [backend, frontend]`)。
+  首次在 `f389338` 上跑绿（run 35717962425）。
+- 看 job 日志：`GET /repos/{o}/{r}/actions/jobs/{job_id}/logs` —— **带 token 时返回纯文本不是 zip**。
+- ⚠️ 依赖声明别漏：`curl-cffi`（xchina TLS 伪装，主依赖）与 `httpx2`（`starlette.testclient` 必需，dev 组）。
+  漏了不会在导入期报错，而是**测试 collection 阶段整片红**（5 个 import TestClient 的文件）。
 
 ## 最近大版本
 - V28（c14d6c3/d2573cb）：落盘目录重构 — 相册单层 + 视频平铺 + 清单与媒体分离。

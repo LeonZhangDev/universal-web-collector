@@ -14,12 +14,13 @@ class ImageDownloader:
     """
 
     def download(self, url, referer=None, save_dir="downloads", headers=None,
-                 progress_cb=None, mirrors=None, log=None, filename=None, info=None):
+                 progress_cb=None, mirrors=None, log=None, filename=None, info=None,
+                 session=None):
         h = build_headers(referer, headers, accept=IMAGE_ACCEPT)
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         path = resolve_target(save_dir, url, filename, ".jpg")
         sha, real = download_with_mirrors(
             url, path, h, progress_cb=progress_cb, mirrors=mirrors, log=log,
-            require_image=True, info=info,
+            require_image=True, info=info, session=session,
         )
         return real, sha

@@ -1,10 +1,57 @@
+# ---- Python ----
 .venv/
+venv/
 __pycache__/
+*.py[cod]
+*.egg-info/
 .pytest_cache/
-.worktrees/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Node / 前端 ----
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 运行期产物(数据, 不入库) ----
 data/
 downloads/
 browser_state/
-frontend/node_modules/
-frontend/dist/
-*.pyc
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.part
+*.part.src
+
+# ---- 环境与密钥 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+cookies*.json
+
+# ---- Git 工作区 ----
+.worktrees/
+.workbuddy/memory/*.tmp
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

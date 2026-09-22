@@ -8,6 +8,7 @@ export function listTasks(opts = {}) {
   const params = {};
   if (opts.q) params.q = opts.q;
   if (opts.status) params.status = opts.status; // 数组或单值均可
+  if (opts.collector) params.collector = opts.collector;
   if (opts.page) params.page = opts.page;
   if (opts.page_size) params.page_size = opts.page_size;
   return api.get("/tasks", { params }).then((r) => r.data);
@@ -72,6 +73,13 @@ export function retryFailed(taskId) {
 // 统计面板数据
 export function getStats() {
   return api.get("/tasks/stats").then((r) => r.data);
+}
+// 通知中心
+export function getNotifications() {
+  return api.get("/notifications").then((r) => r.data);
+}
+export function markNotificationsRead(ids) {
+  return api.post("/notifications/read", { ids: ids || null }).then((r) => r.data);
 }
 export function retryResource(taskId, resourceId) {
   return api.post(`/tasks/${taskId}/resources/${resourceId}/retry`).then((r) => r.data);

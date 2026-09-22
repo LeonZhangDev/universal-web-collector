@@ -93,7 +93,12 @@ class VideoDownloader:
 
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None,
-                 info=None, **kw):
+                 info=None, session=None, **kw):
+        # 任务级代理(session)覆盖实例默认(基于全局 settings.proxy)。
+        # 每个资源下载前 task_manager 都新建实例(见 DOWNLOADERS[type]()),
+        # 故这里覆盖 self.session 不会与并发任务互相污染。
+        if session is not None:
+            self.session = session
         h = build_headers(referer, headers)
         if _is_dash(url):
             raise RuntimeError("暂不支持 DASH(.mpd), 请改用 ffmpeg 手工下载")

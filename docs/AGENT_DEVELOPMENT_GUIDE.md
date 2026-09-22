@@ -1785,3 +1785,68 @@ finally:
 回归用例不等时序碰运气：拦住"写终态"这个动作，在它发生的**那一刻**查 manifest 在不在
 （`test_sidecar.py::test_manifest_lands_before_task_is_marked_done/_failed`）。次序一反过来必红，
 与调度快慢无关 —— 验证过。
+
+## 10. V28–V31 — 落盘布局 + 交互功能 + 前后端收尾
+
+前四轮的"坑"多集中在**接口与展示的边界**：后端自己测得通，用户按界面点却不对。
+下面按版本记关键决策，细节见各节。
+
+### 10.1 V28 落盘目录重构（唯一入口 `core/layout.py`）
+
+`下载根/相册名/图片`；**视频一律平铺到下载根**（文件名取站点原名，m3u8 用 `gid.mp4`）。
+清单与媒体分离：`downloads/_meta/{任务ID}/{manifest.json,album.json}`。
+
+- **重名必须在下载前消解**（`layout.claim`）：下载器见"目标已存在"就当**半成品**续传 →
+  两个不同来源的同名文件被拼成一份、字节数还常恰好对上 → 报成功。只查库不够，
+  要加"本次采集内"的占位表。
+- 采集器的 `album_tags_dir`（标签层）**已废弃** —— 别再引回来，"按了没反应"多半是它。
+
+### 10.2 V29 三接口 + 前端改版（两个真缺陷由测试抓出）
+
+接口：`GET /tasks`（搜索/筛选/分页，返回 `{items,total,page,page_size,pages}` 而非裸数组）、
+`POST /tasks/batch-create`（逐行预检重复/无效）、`GET /env/diagnose`（五项诊断）。
+
+**两条被测试抓出的真缺陷（都属"看起来能用、结果不对"）**：
+
+1. **`batch-create` 缺 `BatchTaskItemOut` 的 import** → 一旦被调用就 `NameError` → 生产 500。
+2. **状态分组未展开** → 前端下拉发组代号 `"active"`，后端直接塞进 `status IN ('active')`，
+   **永远 0 条**。修法：`STATUS_GROUPS` + `_expand_statuses()`，查库前展开成真实状态列表。
+
+教训：**"前端发的值"和"库里存的值"不是一回事**。凡是前端传"组/别名/意图"
+（`active`、`auto`），后端必须先翻译再查库，否则就是静默 0 条。
+
+### 10.3 V30 批量操作 / 失败重试 / 统计 / 代理字段
+
+`POST /tasks/bulk-action`（逐任务归类 ok/skipped/not_found，单个失败不阻断其他）、
+`POST /tasks/{id}/retry-failed`（只重下 `failed`/`skipped`，保留已成功部分）、
+`GET /tasks/stats`、创建时落库任务级 `proxy`。
+
+### 10.4 V31 代理联动 / 通知 / 图表 / 采集器筛选（本轮）
+
+**代理真正跑起来**：`downloaders/base.py` 加 `ProxyPool` + `make_proxy_session`；
+`task_manager._download_all` 从 `options.proxy` 建池，`_download_one` 按**资源 id 序号**
+轮换注入会话。每个资源下载都新建 downloader 实例（`DOWNLOADERS[type]()`），
+所以覆盖 `self.session` 无并发竞态。
+
+> ⚠️ **只在该传时传可选关键字**：`session=` 起初**无条件**传给 `downloader.download(...)`，
+> 直接打挂了 9 个注入式测试（它们塞的精简假下载器不接受这个参数）。改成
+> "池非空才传"，无代理（常态路径）不多带参数。**给可选能力加参数时，先想清楚
+> "没启用时"的调用方会不会因此被迫改签名。**
+
+**通知**：结算钩子挂进 `_settle_status`（已约定"绝不抛异常"），整体包 try。
+`cancelled` 不发通知（用户自己点的停止，推"已取消"是噪声）。SMTP 可选，失败只记日志。
+
+**统计增强**：`by_date` / `download_series` / `failure_reasons` / `duplicates` 四组聚合，
+前端用**纯 SVG**画折线 + 饼图（不引图表库，~50 行）。
+
+**采集器筛选**：`_task_filters` 新增 `collector`，**刻意排除 `"auto"`** —— 那是
+"让系统自己识别"的输入意图，不是落库后的采集器名（呼应 10.2 的教训）。
+
+### 10.5 建议（继续开发时优先看）
+
+| 优先级 | 建议 | 为什么 |
+| --- | --- | --- |
+| P2 | 字节级实时速率曲线 | 进度目前只回传百分比，画真实 sparkline 需后端补字节增量 |
+| P2 | 代理健康检查与自动降级 | 轮换现在按序号，可加"失败换线 + 熔断" |
+| P2 | 骨架屏分区块 / 主题 accent | 视觉打磨，改动小、感知强 |
+| 按需求 | 新站点插件 | 复用现有下载与清单机制，配样本测试 |

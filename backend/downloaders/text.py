@@ -57,10 +57,10 @@ class TextDownloader:
     """
 
     def download(self, url, referer=None, save_dir="downloads", headers=None,
-                 progress_cb=None, filename=None, info=None, **kw):
+                 progress_cb=None, filename=None, info=None, session=None, **kw):
         h = build_headers(referer, headers)
         with domain_slot(url):
-            resp = SESSION.get(url, headers=h, timeout=settings.request_timeout)
+            resp = (session or SESSION).get(url, headers=h, timeout=settings.request_timeout)
         resp.raise_for_status()
         if info is not None:
             info["resolved_url"] = url

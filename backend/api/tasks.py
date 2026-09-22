@@ -39,6 +39,9 @@ from models.schemas import (
     BatchTaskOut,
     BulkActionIn,
     BulkActionOut,
+    MarkReadIn,
+    NotificationListOut,
+    NotificationOut,
     ResourceOut,
     RetryFailedOut,
     TaskCreateIn,
@@ -609,10 +612,11 @@ def env_diagnose():
 def list_tasks(
     q: Optional[str] = Query(None, description="按 URL 或任务名模糊搜索"),
     status: Optional[List[str]] = Query(None, description="状态筛选, 可重复传入"),
+    collector: Optional[str] = Query(None, description="按采集器精确筛选"),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ):
-    """任务列表: 搜索 / 状态筛选 / 分页。
+    """任务列表: 搜索 / 状态筛选 / 采集器筛选 / 分页。
 
     ⚠️ 返回结构从"裸数组"改成了 `{items, total, ...}`。分页只有拿到总数才知道
     有几页, 而总数不该靠前端拉全量自己数 —— 那正是分页要避免的事。
@@ -621,9 +625,15 @@ def list_tasks(
     不转义的话搜 `100%` 会变成"匹配任意串", 搜索看起来能用但结果不对,
     而用户只会以为是自己记错了。
     """
-    total = db.count_tasks(q=q, status=_expand_statuses(status))
+    total = db.count_tasks(q=q, status=_expand_statuses(status), collector=collector)
     offset = (page - 1) * page_size
-    rows = db.list_tasks(q=q, status=_expand_statuses(status), limit=page_size, offset=offset)
+    rows = db.list_tasks(
+        q=q,
+        status=_expand_statuses(status),
+        collector=collector,
+        limit=page_size,
+        offset=offset,
+    )
     return TaskListOut(
         items=[TaskOut(**dict(t)) for t in rows],
         total=total,
@@ -676,7 +686,37 @@ def task_stats():
         by_status=by_status,
         by_collector=db.count_tasks_by_collector(),
         active=active,
+        by_date=db.resources_by_date(30),
+        download_series=db.stats_download_series(30),
+        failure_reasons=db.failure_reasons(8),
+        duplicates=db.duplicate_stats(),
     )
+
+
+@router.get("/notifications", response_model=NotificationListOut)
+def list_notifications():
+    """通知中心数据源: 最近通知 + 未读数。前端轮询或经 SSE 拉取。"""
+    rows = db.list_notifications(limit=50)
+    items = [
+        NotificationOut(
+            id=r["id"],
+            task_id=r["task_id"],
+            level=r["level"],
+            title=r["title"],
+            body=r["body"],
+            read=bool(r["read"]),
+            created_time=r["created_time"],
+        )
+        for r in rows
+    ]
+    return NotificationListOut(items=items, unread=db.unread_notification_count())
+
+
+@router.post("/notifications/read")
+def mark_notifications_read(payload: MarkReadIn):
+    """标记通知已读。不传 ids 则全部标记已读。"""
+    db.mark_notifications_read(payload.ids)
+    return {"ok": True}
 
 
 @router.post("/tasks/bulk-action", response_model=BulkActionOut)

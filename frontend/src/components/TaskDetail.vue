@@ -26,6 +26,22 @@ const active = () =>
   ["pending", "running", "extracting", "downloading"].includes(task.value?.status);
 
 const tab = ref("resources");
+// tab 记忆: 打开不同任务时保持上次看的那一栏(资源/日志/信息), 高频用户不用反复点。
+const TAB_KEY = "uwc.detail.tab.v1";
+try {
+  const saved = localStorage.getItem(TAB_KEY);
+  if (saved) tab.value = saved;
+} catch (e) {
+  /* ignore */
+}
+watch(tab, (v) => {
+  try {
+    localStorage.setItem(TAB_KEY, v);
+  } catch (e) {
+    /* ignore */
+  }
+});
+
 const STATUS_TABS = [
   { key: "all", label: "全部" },
   { key: "done", label: "已下载" },
@@ -97,6 +113,26 @@ const failedSkippedCount = computed(
       ["failed", "skipped"].includes(r.status)
     ).length
 );
+
+// 失败原因聚合: 解析失败资源的 note 归类成 403/超时/404/其他,
+// 让人一眼看出"该换代理还是该换采集器"。
+const failReasons = computed(() => {
+  const rs = (task.value?.resources || []).filter((r) =>
+    ["failed", "skipped"].includes(r.status)
+  );
+  const buckets = { "403/被封": 0, "超时": 0, "404/不存在": 0, "其他": 0 };
+  for (const r of rs) {
+    const n = String(r.note || "");
+    if (/\b403\b|forbidden|blocked|被封|风控/i.test(n)) buckets["403/被封"]++;
+    else if (/timeout|timed out|超时/i.test(n)) buckets["超时"]++;
+    else if (/\b404\b|not found|不存在/i.test(n)) buckets["404/不存在"]++;
+    else buckets["其他"]++;
+  }
+  const total = rs.length || 1;
+  return Object.entries(buckets)
+    .filter(([, n]) => n > 0)
+    .map(([label, n]) => ({ label, n, pct: Math.round((n / total) * 100) }));
+});
 
 function fmtSize(n) {
   if (n === null || n === undefined) return "";
@@ -280,6 +316,19 @@ onUnmounted(() => clearInterval(timer));
             <span class="di">⚠️</span>
             本任务有 <b>{{ dupCount }}</b> 张与已有资源疑似重复（依据感知指纹），文件已保留、未删除。
           </div>
+          <!-- 失败原因分布: 判断"换代理"还是"换采集器" -->
+          <div class="fail-report" v-if="failReasons.length">
+            <div class="fr-head">
+              失败原因分布 <em>{{ failedSkippedCount }} 项</em>
+              <span class="grow"></span>
+              <button class="ghost mini" @click="retryFailedRes">全部重试</button>
+            </div>
+            <div class="fr-row" v-for="f in failReasons" :key="f.label">
+              <span class="fr-lb">{{ f.label }}</span>
+              <span class="fr-bar"><span class="fr-fill" :style="{ width: f.pct + '%' }"></span></span>
+              <span class="fr-n">{{ f.n }}</span>
+            </div>
+          </div>
           <div class="view-tabs" v-if="task.resources.length">
             <button
               v-for="t in STATUS_TABS"
@@ -439,4 +488,17 @@ onUnmounted(() => clearInterval(timer));
 .tag.dup { color: var(--warn); cursor: help; }
 .m-tr.is-dup span:last-child, .m-tr.is-dup span:first-child { opacity: 0.7; }
 .m-note { margin-top: 8px; color: var(--err); font-size: 12px; }
+/* 失败原因分布 */
+.fail-report {
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+  margin-bottom: 10px; background: var(--panel-2);
+}
+.fr-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.fr-head em { font-style: normal; color: var(--err); }
+.fr-head .grow { flex: 1; }
+.fr-row { display: grid; grid-template-columns: 90px 1fr 36px; gap: 8px; align-items: center; font-size: 12px; margin: 3px 0; }
+.fr-lb { color: var(--muted); }
+.fr-bar { height: 7px; border-radius: 4px; background: var(--panel); overflow: hidden; }
+.fr-fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #e0654f, #c94a35); transition: width .3s ease; }
+.fr-n { text-align: right; color: var(--text); }
 </style>

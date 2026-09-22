@@ -38,18 +38,25 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | /tasks/create | 创建任务 `{"url": "...", "collector": "auto"}` |
+| POST | /tasks/batch-create | **批量创建**: 一次粘贴多行 URL, 创建前逐行预检重复/无效并返回逐条结论 |
 | POST | /tasks/preview | **创建前预告**: 只发现不下载不写库, 返回目录名/张数/视频体积/标签 |
 | GET | /collectors | 已注册采集器列表 |
 | GET | /collectors/resolve | **URL -> 采集器**(纯字符串判定, 不打网络请求), 用于"已识别为 X"回显 |
-| GET | /tasks | 任务列表 |
+| GET | /tasks | 任务列表, 支持 `q`(搜索) / `status`(可重复, 兼容组代号) / `collector` / `page` / `page_size`, 返回 `{items,total,page,page_size,pages}` |
+| GET | /tasks/stats | 采集统计: 总量 / 按状态 / 按采集器 / 近 30 天日期序列 / 失败原因聚合 / 去重报表 |
 | GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
+| GET | /env/diagnose | 环境诊断: Python / 浏览器 / ffmpeg / 磁盘 / 下载目录 五项 ok/warn/fail + 修复提示 |
 | GET | /tasks/{id} | 任务详情 + 资源 |
 | GET | /tasks/{id}/logs | 任务日志 |
 | POST | /tasks/{id}/resources/{rid}/retry | 资源级重试(强制下载, 跳过过滤规则) |
+| POST | /tasks/{id}/retry-failed | **失败资源选择性重试**: 只重下 `failed`/`skipped`, 保留已成功部分 |
+| POST | /tasks/bulk-action | **批量操作**: `{"action":"pause\|resume\|cancel\|retry\|delete","task_ids":[...]}` 逐任务归类 ok/skipped/not_found, 单个失败不阻断其他 |
 | POST | /tasks/{id}/cancel | 停止任务: 保留已下载文件, 未完成资源置 skipped |
 | DELETE | /tasks/{id}?with_files=true | 删除任务。**默认只删记录, 磁盘文件保留**; `with_files=true` 连任务目录一起删 |
 | POST | /tasks/bulk-delete | 批量清理 `{"statuses":[...], "with_files":false}`; 运行中的任务不会被删 |
 | POST | /tasks/{id}/archive | 打包导出该任务的产出(ZIP 流式, 可按状态过滤) |
+| GET | /notifications | 任务结算通知列表 + 未读数 |
+| POST | /notifications/read | 标记通知已读(不传 `ids` 表示全部) |
 | GET | /files/{task_id}/manifest | 产出清单 manifest.json(JSON) |
 | GET | /watches | 订阅源列表 |
 | POST | /watches | 新建订阅源 `{"url","collector","interval_minutes"}` |
@@ -79,6 +86,7 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
   "album_title": "clean",
   "incremental": true,
   "write_manifest": true,
+  "proxy": "http://127.0.0.1:7890",
   "filters": {
     "types": ["image", "video"],
     "exts": ["jpg", "png"],
@@ -93,6 +101,11 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 `download_dir` 必须是绝对路径、不含 `..`、不能是盘符根目录;
 文件落在该目录下的**相册文件夹**里(视频平铺在该目录根, 见下文「落盘目录结构」)。
 被过滤的资源标记 `filtered` 并把原因写入 `note`, 可在详情页"强制下载"单独补下。
+
+`proxy` 为**任务级代理**, 与全局环境变量 `UWC_PROXY` 相互独立: 写单个地址即该任务
+全程走它; 写多个(英文逗号分隔)则按资源序号**轮换**, 用来摊薄单 IP 的请求量。
+每个任务独占一个会话(不共享全局连接池), 所以任务之间不会互相污染代理设置。
+不填时下载器继续用全局 `SESSION`(含 `UWC_PROXY`) —— 不会把环境变量里的代理清掉。
 
 ### 采集器自动识别
 
@@ -340,9 +353,9 @@ python scripts/selfcheck.py --reset-profile
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (512 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序)
+make test           # pytest (557 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池 / 统计增强)
 make docker         # docker compose 构建并启动
-python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (33 项断言)
+python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
 python scripts/preview_probe.py <相册页URL或图集ID>   # 真实站点创建前预告
 python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
@@ -353,6 +366,34 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 站点解析探针: `uv run python scripts/probe.py <url>`。
 感知去重依赖 ffmpeg(与视频 remux 共用同一套探测, 见 `core/ffmpeg.py`) ——
 探测不到时自动降级为"不算指纹", 不影响任何下载。
+
+### 任务通知(可选)
+
+任务结算(`success` / `partial` / `failed`)时会写一条通知, 界面右上角铃铛可查看。
+`cancelled` 不发 —— 那是用户自己点的停止, 推一条"已取消"只是噪声。
+
+如需邮件推送, 额外配置以下环境变量(缺 `UWC_SMTP_HOST` 或 `UWC_SMTP_TO` 时不发送):
+
+| 变量 | 说明 |
+| --- | --- |
+| `UWC_SMTP_HOST` | SMTP 服务器地址 |
+| `UWC_SMTP_TO` | 收件人 |
+| `UWC_SMTP_PORT` | 端口, 默认 `465` |
+| `UWC_SMTP_USER` / `UWC_SMTP_PASS` | 账号与密码(可选) |
+| `UWC_SMTP_TLS` | 设为 `0`/`false`/`no` 关闭 TLS(默认开) |
+
+邮件发送失败只记日志, 不影响任务本身 —— 通知系统不该因为邮件服务器抖动向用户报错。
+
+## 键盘快捷键
+
+| 按键 | 作用 |
+| --- | --- |
+| `/` | 聚焦任务搜索框 |
+| `j` / `k`(或上下方向键) | 上下移动高亮任务 |
+| `Enter` | 打开高亮任务的详情 |
+| `Space` | 暂停 / 继续高亮任务 |
+| `Esc` | 关闭任务详情抽屉 |
+| 灯箱内 `+` / `-` / `0` / `R` | 放大、缩小、复位、旋转 |
 
 ## 健壮性(V27)
 

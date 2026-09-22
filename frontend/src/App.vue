@@ -5,6 +5,7 @@ import TaskTable from "./components/TaskTable.vue";
 import TaskDetail from "./components/TaskDetail.vue";
 import EnvDiagnose from "./components/EnvDiagnose.vue";
 import StatsPanel from "./components/StatsPanel.vue";
+import NotificationCenter from "./components/NotificationCenter.vue";
 import ToastHost from "./components/ToastHost.vue";
 import {
   bulkDeleteTasks,
@@ -30,7 +31,7 @@ import { groupToStatuses } from "./status";
 import { toast } from "./toast";
 
 // ---- 任务列表(分页 / 搜索 / 筛选) ----
-const query = ref({ q: "", status: "", page: 1, page_size: 20 });
+const query = ref({ q: "", status: "", page: 1, page_size: 20, collector: "" });
 const tasks = ref([]);
 const total = ref(0);
 const pages = ref(1);
@@ -55,6 +56,7 @@ async function load() {
     const r = await listTasks({
       q: query.value.q || undefined,
       status: groupToStatuses(query.value.status),
+      collector: query.value.collector || undefined,
       page: query.value.page,
       page_size: query.value.page_size,
     });
@@ -73,7 +75,12 @@ async function load() {
 }
 
 const filterActive = computed(
-  () => !!(query.value.q || (query.value.status && query.value.status !== "all"))
+  () =>
+    !!(
+      query.value.q ||
+      query.value.collector ||
+      (query.value.status && query.value.status !== "all")
+    )
 );
 
 function onSearch(q) {
@@ -83,6 +90,11 @@ function onSearch(q) {
 }
 function onFilter(statusValue) {
   query.value.status = statusValue;
+  query.value.page = 1;
+  load();
+}
+function onCollector(c) {
+  query.value.collector = c;
   query.value.page = 1;
   load();
 }
@@ -254,6 +266,7 @@ async function toggleW(w) {
 }
 async function runW(w) {
   await runWatch(w.id);
+  await loadWatches();
   await load();
 }
 async function removeW(w) {
@@ -338,6 +351,8 @@ onUnmounted(() => {
   <div class="header">
     <h1>Universal Web Collector</h1>
     <span class="sub">v10 · 资源采集平台</span>
+    <span class="grow"></span>
+    <NotificationCenter @changed="load" />
   </div>
 
   <EnvDiagnose />
@@ -372,8 +387,11 @@ onUnmounted(() => {
       :loading="loading"
       :active-id="activeId"
       :filter-active="filterActive"
+      :collectors="collectors.filter((c) => c !== 'auto')"
+      :collector-filter="query.collector"
       @search="onSearch"
       @filter="onFilter"
+      @collector="onCollector"
       @goto="onGoto"
       @select="select"
       @remove="askRemove"
@@ -441,6 +459,9 @@ onUnmounted(() => {
           <span class="ell grow" :title="w.url">{{ w.url }}</span>
           <span class="mono">每 {{ w.interval_minutes }} 分钟</span>
           <span class="mono">新增 {{ w.hits }}</span>
+          <span class="mono dim" :title="w.last_run || '尚未运行'">
+            {{ w.last_run ? "上次 " + (w.last_run || "").slice(5, 16) : "未运行" }}
+          </span>
           <button class="ghost mini" @click="toggleW(w)">{{ w.enabled ? "暂停" : "启用" }}</button>
           <button class="ghost mini" @click="runW(w)">立即跑</button>
           <button class="ghost mini" @click="removeW(w)">删除</button>
@@ -490,6 +511,7 @@ onUnmounted(() => {
 
 <style scoped>
 .list-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.header .grow { flex: 1; }
 .list-bar .lbl { color: var(--muted); font-size: 13px; }
 .list-bar .summary { color: var(--muted); font-size: 12px; }
 .list-bar .grow { flex: 1; }

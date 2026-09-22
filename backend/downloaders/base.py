@@ -214,6 +214,55 @@ if settings.proxy:
     SESSION.proxies.update({"http": settings.proxy, "https": settings.proxy})
 
 
+class ProxyPool:
+    """任务级代理池: 支持单代理或逗号分隔的多代理轮换。
+
+    一个任务的多个资源分散到不同代理(round-robin), 降低单代理被封风险,
+    同时避免同一会话频繁切 IP 触发风控 —— 这里按"任务内资源序号"轮换, 粒度适中。
+    """
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.proxies = [p.strip() for p in str(spec or "").split(",") if p.strip()]
+        self._i = 0
+
+    @property
+    def empty(self):
+        return not self.proxies
+
+    def pick(self, n=0):
+        """返回第 n 个(按资源序号)应使用的代理 URL; 无代理返回 None。"""
+        if not self.proxies:
+            return None
+        return self.proxies[n % len(self.proxies)]
+
+    def apply(self, session, n=0):
+        """把轮换到的代理设到 session 上。"""
+        p = self.pick(n)
+        if p:
+            session.proxies.update({"http": p, "https": p})
+        else:
+            session.proxies.clear()
+        return session
+
+    def session_for(self, n=0):
+        """返回一个带本池第 n 个代理的独立 session(每资源独占, 避免并发竞态)。"""
+        return make_proxy_session(self.spec, n)
+
+
+def make_proxy_session(spec=None, n=0):
+    """构造一个带(可选)任务级代理的 requests.Session, 供单个任务/资源独占。
+
+    与全局 SESSION 解耦: 全局 SESSION 走 settings.proxy(环境变量, 所有任务共享),
+    任务级 proxy 来自 options.proxy(V30 落库), 必须独立成 session 才不会互相污染连接池。
+    n: 多代理轮换时的序号(通常传资源 id), 让同一任务的资源分散到不同代理。
+    """
+    sess = _build_session()
+    if spec:
+        ProxyPool(spec).apply(sess, n)
+    return sess
+
+
 def build_headers(referer=None, extra=None, accept=None):
     headers = {"User-Agent": settings.user_agent, "Accept": accept or DEFAULT_ACCEPT}
     if referer:

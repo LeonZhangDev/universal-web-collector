@@ -22,6 +22,7 @@ from core.manifest import manifest_enabled, write_manifest, write_sidecar
 from core.naming import build_context, render, safe_relative
 from downloaders import ratelimit
 from downloaders.base import discard_partial
+from downloaders.base import ProxyPool, make_proxy_session
 from downloaders.file import FileDownloader
 from downloaders.image import ImageDownloader
 from downloaders.text import TextDownloader
@@ -31,6 +32,67 @@ from . import database as db
 logger = logging.getLogger("uwc")
 
 DOWNLOADS_DIR = settings.download_dir
+
+
+def _notification_for(task_id, status):
+    """把终态翻译成一条通知(level, title, body)。非终态返回 (None, None, None)。
+
+    ⚠️ `cancelled` 不发通知: 那是用户自己点的停止, 推一条"任务已取消"是噪声。
+    """
+    task = db.get_task(task_id)
+    name = (task["name"] if task and task["name"] else f"任务 #{task_id}")
+    stat = None
+    try:
+        stat = TaskManager._resource_stat(task_id)
+    except Exception:
+        stat = None
+    counts = ""
+    if stat:
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(stat.items()))
+    if status == TaskStatus.SUCCESS:
+        return ("success", f"{name} 采集完成", counts or "全部资源已下载")
+    if status == TaskStatus.PARTIAL:
+        return ("warning", f"{name} 部分完成", counts or "部分资源未下载成功")
+    if status == TaskStatus.FAILED:
+        err = (task["error"] if task and task["error"] else "未发现可用资源")
+        return ("error", f"{name} 采集失败", err)
+    return (None, None, None)
+
+
+def _dispatch_smtp(level, title, body):
+    """可选 SMTP 推送: 仅当配置了 UWC_SMTP_HOST 与 UWC_SMTP_TO 才发送。
+
+    放在模块级、同步发送(结算通知不频繁), 失败静默 —— 通知系统本身不该
+    因为邮件服务器抖动向用户报错。
+    """
+    host = os.environ.get("UWC_SMTP_HOST")
+    to = os.environ.get("UWC_SMTP_TO")
+    if not host or not to:
+        return
+    user = os.environ.get("UWC_SMTP_USER")
+    pwd = os.environ.get("UWC_SMTP_PASS")
+    port = int(os.environ.get("UWC_SMTP_PORT", "465"))
+    use_tls = os.environ.get("UWC_SMTP_TLS", "1") not in ("0", "false", "no")
+    sender = f"uwc@{host}"
+    try:
+        msg = (
+            f"From: {sender}\r\nTo: {to}\r\n"
+            f"Subject: [{level}] {title}\r\n\r\n{body or ''}"
+        ).encode("utf-8")
+        if use_tls and port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=10) as s:
+                if user:
+                    s.login(user, pwd or "")
+                s.sendmail(sender, [to], msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=10) as s:
+                if use_tls:
+                    s.starttls(context=ssl.create_default_context())
+                if user:
+                    s.login(user, pwd or "")
+                s.sendmail(sender, [to], msg)
+    except Exception as e:
+        logger.warning("SMTP 通知发送失败: %s", e)
 
 
 def _eta(count, url):
@@ -668,6 +730,16 @@ class TaskManager:
             return
         db.update_task_status(task_id, status)
         self._safe_log(task_id, f"status -> {status}")
+        # 结算钩子: 写通知中心 + (可选)SMTP 推送。
+        # ⚠️ 必须整体包在 try 里 —— _settle_status 的契约是"绝不抛异常",
+        # 通知只是锦上添花, 写通知失败绝不能把任务收尾一起带崩。
+        try:
+            level, title, body = _notification_for(task_id, status)
+            if title:
+                db.add_notification(task_id, level, title, body)
+                _dispatch_smtp(level, title, body)
+        except Exception as e:
+            self._safe_log(task_id, f"通知写入失败(不影响任务): {e}", "warn")
 
     def _write_sidecar(self, task_id, resources):
         """把"这次采集采的是什么"写成 album.json(集合级元数据)。
@@ -981,6 +1053,10 @@ class TaskManager:
 
         out_dir = self._root_dir(task_id)
         filters = self._filters(task_id)
+        # 任务级代理池: options.proxy 可写单个或用逗号分隔多个(轮换)。为空时
+        # 下游 session=None, 下载器继续用全局 SESSION —— 不能在这里就把全局
+        # 代理清掉, 否则"没配代理的任务"会失去环境变量里的代理。
+        proxy_pool = ProxyPool((self._options(task_id) or {}).get("proxy"))
         counter = [0]
         counter_lock = threading.Lock()
 
@@ -989,7 +1065,8 @@ class TaskManager:
         abort = threading.Event()
         futures = [
             self._download_executor.submit(
-                self._download_one, task_id, r, referer, out_dir, filters, abort
+                self._download_one, task_id, r, referer, out_dir, filters, abort,
+                proxy_pool,
             )
             for r in resources
         ]
@@ -1044,7 +1121,8 @@ class TaskManager:
             return TaskStatus.PARTIAL
         return TaskStatus.SUCCESS
 
-    def _download_one(self, task_id, r, referer, out_dir, filters=None, abort=None):
+    def _download_one(self, task_id, r, referer, out_dir, filters=None, abort=None,
+                      proxy_pool=None):
         rid = r["id"]
         filters = filters or Filters()
         if self._cancelled(task_id):
@@ -1108,6 +1186,15 @@ class TaskManager:
             self._publish_resource(task_id, rid, "downloading")
             # 下载层回填实际生效的下载点与响应类型, 供 manifest 溯源
             info = {}
+            # 任务级代理: 资源按 id 序号轮换到池里的某个代理。没有配代理时
+            # 传 None, 下载器保持使用全局 SESSION(含环境变量代理)。
+            #
+            # ⚠️ 参数名 `session` 不是所有假实现都接受(测试会注入精简的假下载器),
+            # 所以只在真有代理时才传 —— 无代理是常态路径, 不该因为多传一个
+            # 关键字参数把注入式测试/第三方下载器打挂。
+            dl_kwargs = {}
+            if proxy_pool is not None and not proxy_pool.empty:
+                dl_kwargs["session"] = make_proxy_session(proxy_pool.pick(rid))
             path, sha = downloader.download(
                 r["url"],
                 referer=referer,
@@ -1118,6 +1205,7 @@ class TaskManager:
                 log=lambda m: self._safe_log(task_id, m),
                 filename=self._row_field(r, "filename"),
                 info=info,
+                **dl_kwargs,
             )
             meta = {"resolved_url": info.get("resolved_url"),
                     "content_type": info.get("content_type")}

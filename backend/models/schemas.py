@@ -209,6 +209,29 @@ class TaskStatsOut(BaseModel):
     by_collector: dict = {}
     active: int = 0
     warning: Optional[str] = None
+    by_date: dict = {}            # 资源按日期新增数(近 30 天, 供折线图)
+    download_series: dict = {}     # 已下载资源体积按日期(字节)
+    failure_reasons: List[dict] = []  # [{reason, count}] 失败原因聚合
+    duplicates: dict = {}          # {marked, bytes_saved} 感知去重报表
+
+
+class NotificationOut(BaseModel):
+    id: int
+    task_id: Optional[int] = None
+    level: str = "info"       # info | success | warning | error
+    title: str
+    body: Optional[str] = None
+    read: bool = False
+    created_time: Optional[str] = None
+
+
+class NotificationListOut(BaseModel):
+    items: List[NotificationOut] = []
+    unread: int = 0
+
+
+class MarkReadIn(BaseModel):
+    ids: Optional[List[int]] = None
 
 
 class BatchTaskOut(BaseModel):

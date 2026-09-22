@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS watches(
     hits INTEGER NOT NULL DEFAULT 0,
     created_time TEXT NOT NULL
 );
+
+-- 任务结算通知: 任务进入终态(success/partial/failed)时写入, 供前端通知中心拉取。
+-- 也可被 SMTP 钩子消费(若配置了 UWC_SMTP_*)。
+CREATE TABLE IF NOT EXISTS notifications(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    level TEXT NOT NULL DEFAULT 'info',   -- info | success | warning | error
+    title TEXT NOT NULL,
+    body TEXT,
+    read INTEGER NOT NULL DEFAULT 0,
+    created_time TEXT NOT NULL
+);
 """
 
 # 索引在列迁移之后创建(旧库可能缺列)
@@ -238,7 +250,7 @@ def _like_pattern(s):
     return f"%{esc}%"
 
 
-def _task_filters(q=None, status=None):
+def _task_filters(q=None, status=None, collector=None):
     """搜索与状态筛选的 WHERE 片段。两个查询(取列表 / 数总数)共用一份,
     否则"分页显示 12 条"和"共 15 条"迟早对不上。"""
     where, args = [], []
@@ -247,6 +259,11 @@ def _task_filters(q=None, status=None):
         if vals:
             where.append(f"status IN ({','.join('?' for _ in vals)})")
             args.extend(vals)
+    if collector and str(collector).strip() and str(collector).strip() != "auto":
+        # 采集器筛选: 精确匹配 tasks.collector。刻意排除 "auto" —— 它是"让系统
+        # 自己识别"的**输入意图**, 不是落库后的采集器名, 拿它筛必然 0 条。
+        where.append("collector = ?")
+        args.append(str(collector).strip())
     if q and str(q).strip():
         # 同时匹配 URL 与任务名: 用户手上的线索常常只有一半(记得相册名不记得
         # 链接, 或反过来)。name 为 NULL 时 LIKE 结果是 NULL, 自然不匹配 —— 正确。
@@ -256,16 +273,16 @@ def _task_filters(q=None, status=None):
     return where, args
 
 
-def list_tasks(q=None, status=None, limit=None, offset=0):
-    """任务列表(搜索 / 状态筛选 / 分页), 按 id 倒序。
+def list_tasks(q=None, status=None, collector=None, limit=None, offset=0):
+    """任务列表(搜索 / 状态筛选 / 采集器筛选 / 分页), 按 id 倒序。
 
-    三个参数都可省略(省略 = 不限制), 老调用点不用改。
+    参数都可省略(省略 = 不限制), 老调用点不用改。
 
     ⚠️ 分页要配**稳定排序**, 否则同一页刷新两次顺序可能不同 —— 用户会以为
     列表在乱跳。这里固定 id DESC; 翻页期间有新任务插入仍会让 OFFSET 整体
     位移(任务本来就在持续新增), 这是分页固有的, 不假装能解决。
     """
-    where, args = _task_filters(q, status)
+    where, args = _task_filters(q, status, collector)
     sql = "SELECT * FROM tasks"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -278,9 +295,9 @@ def list_tasks(q=None, status=None, limit=None, offset=0):
     return query(sql, tuple(args))
 
 
-def count_tasks(q=None, status=None):
+def count_tasks(q=None, status=None, collector=None):
     """满足同样筛选条件的任务总数(分页要用)。"""
-    where, args = _task_filters(q, status)
+    where, args = _task_filters(q, status, collector)
     sql = "SELECT COUNT(*) AS n FROM tasks"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -516,6 +533,81 @@ def get_resources_with_status(task_id, statuses):
         f"SELECT * FROM resources WHERE task_id=? AND status IN ({marks}) ORDER BY id",
         (task_id, *statuses),
     )
+
+
+# ---- 通知 ----
+def add_notification(task_id, level, title, body=None):
+    """写入一条任务结算通知。调用方已在 try 内, 写失败不影响任务本身。"""
+    execute(
+        "INSERT INTO notifications(task_id, level, title, body, created_time) "
+        "VALUES (?,?,?,?,?)",
+        (task_id, level, title, body, _now()),
+    )
+    return get_conn().execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def list_notifications(limit=50, unread_only=False):
+    sql = "SELECT * FROM notifications"
+    if unread_only:
+        sql += " WHERE read=0"
+    sql += " ORDER BY id DESC LIMIT ?"
+    return query(sql, (limit,))
+
+
+def unread_notification_count():
+    row = query_one("SELECT COUNT(*) AS n FROM notifications WHERE read=0")
+    return row["n"] if row else 0
+
+
+def mark_notifications_read(ids=None):
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        execute(f"UPDATE notifications SET read=1 WHERE id IN ({marks})", tuple(ids))
+    else:
+        execute("UPDATE notifications SET read=1")
+
+
+# ---- 统计聚合(供首页图表) ----
+def resources_by_date(days=30):
+    """按日期统计每日新增资源数(done, 用资源创建日期近似下载日期)。"""
+    rows = query(
+        "SELECT substr(created_time,1,10) AS d, COUNT(*) AS n "
+        "FROM resources WHERE created_time >= date('now', ?) "
+        "GROUP BY d ORDER BY d",
+        (f"-{days} days",),
+    )
+    return {r["d"]: r["n"] for r in rows}
+
+
+def failure_reasons(limit=8):
+    """失败资源的 note 聚合(去重计数), 帮用户判断要不要换代理/采集器。"""
+    rows = query(
+        "SELECT note, COUNT(*) AS n FROM resources "
+        "WHERE status IN ('failed','skipped') AND note IS NOT NULL AND note <> '' "
+        "GROUP BY note ORDER BY n DESC LIMIT ?",
+        (limit,),
+    )
+    return [{"reason": r["note"], "count": r["n"]} for r in rows]
+
+
+def duplicate_stats():
+    """感知去重报表: 被标记 duplicate_of 的资源数与省下的体量。"""
+    row = query_one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes "
+        "FROM resources WHERE duplicate_of IS NOT NULL"
+    )
+    return {"marked": row["n"] if row else 0, "bytes_saved": row["bytes"] if row else 0}
+
+
+def stats_download_series(days=30):
+    """按日期聚合已下载资源体积(字节), 与 resources_by_date 配套。"""
+    rows = query(
+        "SELECT substr(created_time,1,10) AS d, COALESCE(SUM(size),0) AS b "
+        "FROM resources WHERE status='done' AND created_time >= date('now', ?) "
+        "GROUP BY d ORDER BY d",
+        (f"-{days} days",),
+    )
+    return {r["d"]: r["b"] for r in rows}
 
 
 def iter_tasks_with_status(statuses):

@@ -14,6 +14,8 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   activeId: { type: Number, default: 0 },
   filterActive: { type: Boolean, default: false },
+  collectors: { type: Array, default: () => [] },
+  collectorFilter: { type: String, default: "" },
 });
 const emit = defineEmits([
   "search",
@@ -24,6 +26,7 @@ const emit = defineEmits([
   "pause",
   "resume",
   "changed",
+  "collector",
 ]);
 
 const q = ref("");
@@ -125,6 +128,15 @@ async function runBulk(action) {
         <option v-for="g in STATUS_GROUPS" :key="g.value" :value="g.value">
           {{ g.label }}
         </option>
+      </select>
+      <select
+        v-if="collectors.length"
+        class="status-select"
+        :value="collectorFilter"
+        @change="emit('collector', $event.target.value)"
+      >
+        <option value="">全部采集器</option>
+        <option v-for="c in collectors" :key="c" :value="c">{{ c }}</option>
       </select>
       <span class="grow"></span>
       <span class="pginfo">共 {{ total }} 个任务</span>

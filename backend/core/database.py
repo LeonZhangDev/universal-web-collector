@@ -97,6 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_resources_path ON resources(local_path);
 CREATE INDEX IF NOT EXISTS idx_resources_filename ON resources(filename);
 CREATE INDEX IF NOT EXISTS idx_logs_task ON task_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);
 """
 
 
@@ -226,8 +227,83 @@ def get_task(task_id):
     return query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
 
 
-def list_tasks():
-    return query("SELECT * FROM tasks ORDER BY id DESC")
+def _like_pattern(s):
+    """把用户输入的关键词转成 LIKE 模式: 转义通配符, 两侧补 %。
+
+    ⚠️ 不转义就会出"搜索能用但结果不对"这种最难怀疑的偏差: 搜 `100%` 里的
+    `%` 会被当成"匹配任意串", 搜 `a_b` 里的 `_` 会连 `axb` 一起捞出来。
+    用户看到的只是"怎么多出来几条", 不会想到是自己输入的字符被吃掉了。
+    """
+    esc = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _task_filters(q=None, status=None):
+    """搜索与状态筛选的 WHERE 片段。两个查询(取列表 / 数总数)共用一份,
+    否则"分页显示 12 条"和"共 15 条"迟早对不上。"""
+    where, args = [], []
+    if status:
+        vals = [v for v in (status if isinstance(status, (list, tuple, set)) else [status]) if v]
+        if vals:
+            where.append(f"status IN ({','.join('?' for _ in vals)})")
+            args.extend(vals)
+    if q and str(q).strip():
+        # 同时匹配 URL 与任务名: 用户手上的线索常常只有一半(记得相册名不记得
+        # 链接, 或反过来)。name 为 NULL 时 LIKE 结果是 NULL, 自然不匹配 —— 正确。
+        where.append("(url LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
+        pat = _like_pattern(str(q).strip())
+        args.extend([pat, pat])
+    return where, args
+
+
+def list_tasks(q=None, status=None, limit=None, offset=0):
+    """任务列表(搜索 / 状态筛选 / 分页), 按 id 倒序。
+
+    三个参数都可省略(省略 = 不限制), 老调用点不用改。
+
+    ⚠️ 分页要配**稳定排序**, 否则同一页刷新两次顺序可能不同 —— 用户会以为
+    列表在乱跳。这里固定 id DESC; 翻页期间有新任务插入仍会让 OFFSET 整体
+    位移(任务本来就在持续新增), 这是分页固有的, 不假装能解决。
+    """
+    where, args = _task_filters(q, status)
+    sql = "SELECT * FROM tasks"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        # 负数 OFFSET 在 SQLite 里表示"从末尾往前数", 静默换个含义 ——
+        # 前端算出负页码时不能让它悄悄成立
+        sql += " LIMIT ? OFFSET ?"
+        args.extend([max(int(limit), 0), max(int(offset or 0), 0)])
+    return query(sql, tuple(args))
+
+
+def count_tasks(q=None, status=None):
+    """满足同样筛选条件的任务总数(分页要用)。"""
+    where, args = _task_filters(q, status)
+    sql = "SELECT COUNT(*) AS n FROM tasks"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    row = query_one(sql, tuple(args))
+    return int(row["n"]) if row else 0
+
+
+def find_tasks_by_urls(urls):
+    """批量查这些 URL 是否已建过任务, 返回 {url: 最新任务 id}。
+
+    一次查完而不是逐条查: 批量创建时逐条查就是 N 次扫描, 而这是一次能拿完的。
+    同一 URL 可能被建过多次(上次失败又建了一次), 取**最新**那条 —— 用户想
+    对照的是最近那次的结果。
+    """
+    keys = [u for u in urls if u]
+    if not keys:
+        return {}
+    marks = ",".join("?" for _ in keys)
+    rows = query(
+        f"SELECT url, MAX(id) AS id FROM tasks WHERE url IN ({marks}) GROUP BY url",
+        tuple(keys),
+    )
+    return {r["url"]: r["id"] for r in rows}
 
 
 def find_tasks_by_content_key(content_key):

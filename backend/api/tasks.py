@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -35,9 +35,35 @@ from core.task_manager import (
     task_base_dir,
     task_manager,
 )
-from models.schemas import ResourceOut, TaskCreateIn, TaskCreateOut, TaskDetail, TaskOut
+from models.schemas import (
+    BatchTaskIn,
+    BatchTaskItemOut,
+    BatchTaskOut,
+    ResourceOut,
+    TaskCreateIn,
+    TaskCreateOut,
+    TaskDetail,
+    TaskListOut,
+    TaskOut,
+)
 
 router = APIRouter()
+
+
+# 列表筛选用的状态分组。前端下拉只发一个组代号(如 "active"), 后端必须展开成
+# 真实 status 值再去查 —— 否则 `status IN ('active')` 永远 0 条。
+# 单个真实状态(如 "success")原样透传。空串/None 表示不过滤。
+STATUS_GROUPS = {
+    "active": ["pending", "running", "extracting", "downloading"],
+}
+
+
+def _expand_statuses(vals):
+    """把查询参数里的状态组代号展开成真实 status 列表。"""
+    out = []
+    for v in vals or []:
+        out.extend(STATUS_GROUPS.get(v, [v]))
+    return out or None
 
 
 def _file_url(task, local_path):
@@ -233,6 +259,120 @@ def create(payload: TaskCreateIn):
     )
 
 
+# ---- 批量创建 ----
+#: 单次批量创建的行数上限。粘贴几百条是合理的; 一次几万条多半是误操作
+#: (比如把整个网页的文本粘进来了), 那会把任务队列整个堵死。
+BATCH_MAX_URLS = 500
+
+#: 单行长度上限。URL 与图集 ID 都不会这么长, 超过基本可以断定粘错了东西。
+_MAX_URL_LEN = 2000
+
+
+def _batch_key(s):
+    """批量去重用的比较键。
+
+    ⚠️ 只做最保守的归一化(去首尾空白 + 去结尾斜杠), 不改写协议/host 大小写。
+    看起来"更聪明"的归一化会把 `/a` 和 `/A` 判成同一个, 而图片直链改大小写
+    就 404 的站点是真实存在的。误判成重复的代价是**该下的东西没下**, 比
+    "多下一次"严重得多 —— 后者用户一眼能看出来, 前者不会有人发现。
+    """
+    return s.strip().rstrip("/")
+
+
+def _shape_reject(s):
+    """最保守的形状校验, 只拦"明显不是输入"的行。返回原因或 None。
+
+    ⚠️ 这不是采集器识别(那是 `_pick_collector` 的事), 也刻意不顺便当它用:
+    手选采集器时自动识别是被跳过的, 若这里又用识别结果当门槛, 手选模式下的
+    批量创建就退化成"必须自动认得出才能提交", 而用户手选恰恰是因为认不出。
+    """
+    if any(c.isspace() for c in s):
+        return "含空格或换行, 一行只能放一个链接"
+    if len(s) > _MAX_URL_LEN:
+        return f"超过 {_MAX_URL_LEN} 字符, 不像链接"
+    return None
+
+
+@router.post("/tasks/batch-create", response_model=BatchTaskOut)
+def batch_create(payload: BatchTaskIn):
+    """一次创建多个任务, 并在创建**之前**把每一行的问题标出来。
+
+    与"前端循环调 /tasks/create"的区别不在于快, 而在于**结论出现得更早**:
+    重复与无效输入在创建之前就摊在界面上, 而不是变成 40 个任务里 12 个失败、
+    用户还得自己猜是哪 12 行粘错了。
+
+    ⚠️ 公共参数(下载目录 / 画质 / 过滤条件)的校验放在逐行处理**之前**:
+    那是"这一次提交"的问题, 不是某一行的问题, 报错就该整体 400。
+    """
+    download_dir = _validate_download_dir(payload.download_dir)
+    options = _gallery_options(
+        filters=payload.filters,
+        quality=payload.quality,
+        media=payload.media,
+        album_title=payload.album_title,
+        max_items=payload.max_items,
+        aggregate_depth=payload.aggregate_depth,
+    )
+
+    lines = list(payload.urls or [])
+    truncated = 0
+    if len(lines) > BATCH_MAX_URLS:
+        truncated = len(lines) - BATCH_MAX_URLS
+        lines = lines[:BATCH_MAX_URLS]
+
+    # 一次性查出哪些 URL 已经建过任务(逐条查就是 N 次扫描)
+    cleaned = [(raw or "").strip() for raw in lines]
+    keys = {_batch_key(s): s for s in cleaned if s}
+    existing = db.find_tasks_by_urls(list(keys.keys())) if keys else {}
+
+    items = []
+    seen = {}                       # 比较键 -> 首次出现的行号
+    for idx, raw in enumerate(lines, 1):
+        s = cleaned[idx - 1]
+        if not s:
+            items.append(BatchTaskItemOut(line=idx, raw=raw or "", ok=False,
+                                          reason="empty", message="空行"))
+            continue
+        why = _shape_reject(s)
+        if why:
+            items.append(BatchTaskItemOut(line=idx, raw=raw, url=s, ok=False,
+                                          reason="invalid", message=why))
+            continue
+        key = _batch_key(s)
+        if key in seen:
+            items.append(BatchTaskItemOut(
+                line=idx, raw=raw, url=s, ok=False, reason="duplicate_in_batch",
+                message=f"与第 {seen[key]} 行重复"))
+            continue
+        seen[key] = idx
+        if not payload.allow_duplicates and key in existing:
+            items.append(BatchTaskItemOut(
+                line=idx, raw=raw, url=s, ok=False, reason="duplicate_existing",
+                existing_task_id=existing[key],
+                message=f"已经建过任务 #{existing[key]}"))
+            continue
+        try:
+            name, _resolved, warning = _pick_collector(s, payload.collector)
+        except HTTPException as e:
+            # 自动识别认不出是最常见的"粘错了"信号, 这里转成行级结论而不是
+            # 整个请求 400 —— 一行粘错不该让另外 39 行也建不了
+            items.append(BatchTaskItemOut(line=idx, raw=raw, url=s, ok=False,
+                                          reason="invalid", message=e.detail))
+            continue
+        task_id = db.create_task(s, name, download_dir, options)
+        task_manager.submit(task_id)
+        items.append(BatchTaskItemOut(line=idx, raw=raw, url=s, ok=True,
+                                      task_id=task_id, collector=name,
+                                      warning=warning))
+
+    return BatchTaskOut(
+        items=items,
+        created_count=sum(1 for i in items if i.ok),
+        rejected_count=sum(1 for i in items if not i.ok),
+        truncated_count=truncated,
+    )
+
+
 class PreviewIn(BaseModel):
     url: str
     collector: str = AUTO_COLLECTOR
@@ -351,9 +491,167 @@ def get_config():
     }
 
 
-@router.get("/tasks", response_model=list[TaskOut])
-def list_tasks():
-    return [dict(t) for t in db.list_tasks()]
+#: 单页上限。不设上限的话一个 `page_size=100000` 就能把整表打出来, 分页白做。
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 200
+
+
+@router.get("/env/diagnose")
+def env_diagnose():
+    """环境自检: Python / 浏览器 / ffmpeg / 磁盘 / 下载目录。
+
+    每一项都给三件事:**能不能用**、**现在是什么**、**不能用时怎么办**。
+    前两件机器都会算, 诊断面板的全部价值在第三件 —— 只显示"ffmpeg 未找到",
+    用户照样不知道下一步该干嘛。
+
+    ⚠️ 等级区分 ok / warn / fail, 且**只有真正挡路的项目才是 fail**:
+    ffmpeg 缺失不影响图片采集, 标成红色会让用户以为整个工具坏了, 于是先去
+    解决一个其实不影响他当前任务的问题。
+    """
+    import os as _os
+    import platform as _platform
+    import shutil as _shutil
+    import sys as _sys
+    import time as _time
+
+    from core.ffmpeg import find_ffmpeg
+
+    items = []
+
+    # ---- Python ----
+    major, minor = _sys.version_info[:2]
+    py_ok = (major, minor) >= (3, 11)
+    items.append({
+        "key": "python", "label": "Python",
+        "level": "ok" if py_ok else "fail",
+        "value": _platform.python_version(),
+        "detail": _sys.executable,
+        "hint": None if py_ok else "需要 Python 3.11 或更高版本(见 pyproject.toml)",
+    })
+
+    # ---- 浏览器(Playwright) ----
+    # 两层都要查: 装了包但没下载浏览器是**最常见**的状态(install 与 install
+    # chromium 是两个命令), 只查 import 会给出"浏览器正常"的假象。
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+        try:
+            with sync_playwright() as p:
+                exe = p.chromium.executable_path
+            if exe and Path(exe).is_file():
+                items.append({
+                    "key": "browser", "label": "浏览器", "level": "ok",
+                    "value": "Chromium 可用", "detail": str(exe), "hint": None,
+                })
+            else:
+                items.append({
+                    "key": "browser", "label": "浏览器", "level": "warn",
+                    "value": "浏览器未下载", "detail": str(exe or ""),
+                    "hint": "执行 playwright install chromium 下载浏览器; "
+                            "在此之前相册名会退回图集 ID, 视频页无法采集",
+                })
+        except Exception as e:
+            items.append({
+                "key": "browser", "label": "浏览器", "level": "warn",
+                "value": "已安装但启动失败", "detail": str(e),
+                "hint": "重新执行 playwright install chromium 试试",
+            })
+    except Exception:
+        items.append({
+            "key": "browser", "label": "浏览器", "level": "warn",
+            "value": "未安装",
+            "detail": "playwright 不可用",
+            "hint": "pip install playwright && playwright install chromium; "
+                    "不装也能采图片直链, 但取不到相册名与 m3u8",
+        })
+
+    # ---- ffmpeg ----
+    # warn 而不是 fail: 只有 HLS 视频转封装需要它, 图片采集完全不受影响。
+    exe = find_ffmpeg(refresh=True)
+    items.append({
+        "key": "ffmpeg", "label": "ffmpeg",
+        "level": "ok" if exe else "warn",
+        "value": Path(exe).name if exe else "未找到",
+        "detail": exe or "",
+        "hint": None if exe else
+                "只影响 m3u8 视频(HLS 分片合流)。装法见 README; "
+                "装好后无需重启服务, 这里点“重新检测”即可",
+    })
+
+    # ---- 磁盘 ----
+    try:
+        usage = _shutil.disk_usage(str(settings.download_dir))
+        free, total = usage.free, usage.total
+        floor = max(int(getattr(settings, "min_free_bytes", 0)), 0)
+        if free < floor:
+            level, hint = "fail", (f"剩余空间低于最低水位, 下载会被直接中止。"
+                                   f"清理到 {floor // 1024 // 1024}MB 以上再开始")
+        elif free < floor * 3:
+            level, hint = "warn", "空间偏低, 大相册可能下到一半被中止"
+        else:
+            level, hint = "ok", None
+        items.append({
+            "key": "disk", "label": "磁盘空间", "level": level,
+            "value": f"{free / 1024 ** 3:.1f}GB 可用 / 共 {total / 1024 ** 3:.1f}GB",
+            "detail": str(settings.download_dir), "hint": hint,
+        })
+    except Exception:
+        # 磁盘信息拿不到不是故障(见 core.disk.free_bytes 的说明), 别谎报红色
+        items.append({
+            "key": "disk", "label": "磁盘空间", "level": "warn",
+            "value": "读取失败", "detail": str(settings.download_dir),
+            "hint": "拿不到该分区信息, 下载不会因为这一项被拦住",
+        })
+
+    # ---- 下载目录可写 ----
+    d = Path(settings.download_dir)
+    try:
+        writable = d.is_dir() and _os.access(str(d), _os.W_OK)
+    except Exception:
+        writable = False
+    items.append({
+        "key": "download_dir", "label": "下载目录",
+        "level": "ok" if writable else "fail",
+        "value": "可写" if writable else ("不存在" if not d.exists() else "不可写"),
+        "detail": str(d),
+        "hint": None if writable else "检查目录是否存在、当前用户是否有写权限",
+    })
+
+    return {
+        "items": items,
+        "all_ok": all(i["level"] == "ok" for i in items),
+        # 只要没有 fail 就还能干活; warn 是"部分能力打折", 不该拦住用户
+        "usable": not any(i["level"] == "fail" for i in items),
+        "checked_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@router.get("/tasks", response_model=TaskListOut)
+def list_tasks(
+    q: Optional[str] = Query(None, description="按 URL 或任务名模糊搜索"),
+    status: Optional[List[str]] = Query(None, description="状态筛选, 可重复传入"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """任务列表: 搜索 / 状态筛选 / 分页。
+
+    ⚠️ 返回结构从"裸数组"改成了 `{items, total, ...}`。分页只有拿到总数才知道
+    有几页, 而总数不该靠前端拉全量自己数 —— 那正是分页要避免的事。
+
+    ⚠️ 搜索走 SQL LIKE, 关键词里的 `%` `_` 已被转义(见 database._like_pattern):
+    不转义的话搜 `100%` 会变成"匹配任意串", 搜索看起来能用但结果不对,
+    而用户只会以为是自己记错了。
+    """
+    total = db.count_tasks(q=q, status=_expand_statuses(status))
+    offset = (page - 1) * page_size
+    rows = db.list_tasks(q=q, status=_expand_statuses(status), limit=page_size, offset=offset)
+    return TaskListOut(
+        items=[TaskOut(**dict(t)) for t in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+        # 空结果时 pages=0 而不是 1: 显示"第 1 / 0 页"比"共 0 条"更让人困惑
+        pages=(total + page_size - 1) // page_size,
+    )
 
 
 # ⚠️ 必须声明在 /tasks/{task_id} **之前**: FastAPI 按注册顺序匹配, 否则

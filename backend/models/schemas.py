@@ -42,6 +42,20 @@ class TaskDetail(TaskOut):
     resources: List[ResourceOut]
 
 
+class TaskListOut(BaseModel):
+    """任务列表(分页)。
+
+    ⚠️ 不再是裸数组: 分页必须知道总数才能算有几页, 而总数不该靠前端把全量
+    数据拉回去自己数 —— 那正是分页要避免的事。
+    """
+
+    items: List[TaskOut]
+    total: int        # 满足筛选条件的总数(不是本页条数)
+    page: int
+    page_size: int
+    pages: int
+
+
 class FilterIn(BaseModel):
     """资源过滤条件。全部字段可选, 留空表示该维度不限制。
 
@@ -110,3 +124,53 @@ class TaskCreateOut(BaseModel):
     # **软**提示: 任务已创建, 只是提醒用户多半粘错了输入(见 api.tasks._manual_warning)。
     # 不要当错误显示 —— 界面一旦用红色报错的样子呈现它, 用户会以为创建失败了。
     warning: Optional[str] = None
+
+
+# ---- 批量创建 ----
+# 一次粘贴几十条 URL 是常态, 而粘贴里几乎必然混着空行、重复行和"不是链接"的行。
+# 逐条调用单创建接口也能做, 但那样重复与无效要等任务真跑起来才暴露 —— 用户会
+# 看到 40 个任务里 12 个失败, 还得自己猜哪 12 个是粘错了。所以批量接口在
+# **创建之前**就把每一行的结论算出来, 让用户在按下"开始"之前就能看见。
+
+class BatchTaskIn(BaseModel):
+    # 原始输入行(未清洗)。保留原始值是为了让用户能对照自己粘贴的内容 ——
+    # 后端悄悄 trim 之后, 用户看到的"第 3 行无效"会对不上他自己的第 3 行。
+    urls: List[str]
+    collector: str = "auto"
+    download_dir: Optional[str] = None
+    filters: Optional[FilterIn] = None
+    quality: Optional[str] = None
+    media: Optional[str] = None
+    album_title: Optional[str] = None
+    max_items: Optional[int] = None
+    aggregate_depth: Optional[int] = None
+    # 已存在相同 URL 的任务时是否仍然创建。默认否 —— 批量粘贴最常见的失误就是
+    # 同一批粘了两次, 默认重下会把几百张图再下一遍。前端要能显式打开它,
+    # 因为"上次失败了想重下"是合理诉求。
+    allow_duplicates: bool = False
+
+
+class BatchTaskItemOut(BaseModel):
+    line: int               # 第几行(1-based), 便于对照原始输入
+    raw: str                # 原始输入(未 trim), 用户要能看清自己粘了什么
+    url: Optional[str] = None   # 清洗后的值; 被拒时可能为 None
+    ok: bool                # 是否已创建
+    task_id: Optional[int] = None
+    # 被拒原因: empty / invalid / duplicate_in_batch / duplicate_existing / too_many
+    reason: Optional[str] = None
+    # 给用户看的一句话说明, 不是异常堆栈
+    message: Optional[str] = None
+    collector: Optional[str] = None
+    # 已存在同 URL 的任务 id(duplicate_existing 时给出, 前端可链过去)
+    existing_task_id: Optional[int] = None
+    warning: Optional[str] = None
+
+
+class BatchTaskOut(BaseModel):
+    # 按输入顺序返回**全部**行的结论, 不做分组 —— 用户是按粘贴的顺序在读,
+    # 分成"成功/失败"两堆反而要对回去数第几行。
+    items: List[BatchTaskItemOut]
+    created_count: int
+    rejected_count: int
+    # 超过单次上限被整行丢弃的数量(见 api.tasks.BATCH_MAX_URLS)
+    truncated_count: int

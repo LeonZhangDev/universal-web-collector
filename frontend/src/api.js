@@ -2,11 +2,35 @@ import axios from "axios";
 
 const api = axios.create({ baseURL: "/" });
 
+// 旧签名 listTasks() 返回裸数组; 现在后端改成 {items,total,...} 且支持分页/筛选。
+// 这里统一收一个 options 对象, 没传参数时退化为"拉第一页全量", 老调用方不报错。
+export function listTasks(opts = {}) {
+  const params = {};
+  if (opts.q) params.q = opts.q;
+  if (opts.status) params.status = opts.status; // 数组或单值均可
+  if (opts.page) params.page = opts.page;
+  if (opts.page_size) params.page_size = opts.page_size;
+  return api.get("/tasks", { params }).then((r) => r.data);
+}
+export function getTask(id) {
+  return api.get(`/tasks/${id}`).then((r) => r.data);
+}
+export function getLogs(id) {
+  return api.get(`/tasks/${id}/logs`).then((r) => r.data);
+}
 export function createTask(url, collector = "auto", options = {}) {
   return api.post("/tasks/create", { url, collector, ...options }).then((r) => r.data);
 }
+// 批量创建: 一次粘贴多行, 后端在创建前逐行标出重复/无效。
+// payload: { urls:[...], collector, download_dir, filters, quality, media,
+//           album_title, max_items, aggregate_depth, allow_duplicates }
+export function batchCreateTasks(payload) {
+  return api.post("/tasks/batch-create", payload).then((r) => r.data);
+}
+export function getEnvDiagnose() {
+  return api.get("/env/diagnose").then((r) => r.data);
+}
 // URL -> 采集器(纯字符串判定, 不打网络请求), 用于"已识别为 X"回显。
-// collector 为 null 表示无法识别, 界面应提示用户手动选择。
 export function resolveCollector(url) {
   return api
     .get("/collectors/resolve", { params: { url } })
@@ -16,15 +40,6 @@ export function resolveCollector(url) {
 // 创建前预告: 只发现不下载, 不写库。返回目录名/张数/视频体积等。
 export function previewTask(payload) {
   return api.post("/tasks/preview", payload).then((r) => r.data);
-}
-export function listTasks() {
-  return api.get("/tasks").then((r) => r.data);
-}
-export function getTask(id) {
-  return api.get(`/tasks/${id}`).then((r) => r.data);
-}
-export function getLogs(id) {
-  return api.get(`/tasks/${id}/logs`).then((r) => r.data);
 }
 export function retryTask(id) {
   return api.post(`/tasks/${id}/retry`).then((r) => r.data);

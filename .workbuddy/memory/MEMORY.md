@@ -62,6 +62,18 @@ git 命令直接用 Bash 工具的默认 cwd（已是项目根 `C:/Users/admin/D
 V29 的 `active`（状态组代号）、V31 的 `auto`（采集器意图，非落库名）两次同型缺陷 —— 多传一个词就静默返回 0 条。
 凡筛选参数取值不在库内，后端必须显式映射或排除，不能直接拼 SQL。
 
+## ⚠️ 第 8 条静默坑：认领 URL 的逻辑是全局共享资源，任何站点不得自写宽松版
+V32 加 Pexels 时，自写 `parse_gid(strict=False)` 把 xchina 的 `/photo/id-6aa5136f606fe.html`
+解析成 `id-6aa5136f606fe` 抢走 → **任务不报错但采不到东西**。修法：必须复用
+`gallery_base._match_score(site, raw)`。另：纯 ID 样本存在跨站歧义（通用 `[0-9A-Za-z_-]{6,}` 什么都能装），
+两站同分时胜负由**采集器名字字典序**决定（`pexels` < `xchina_gallery`）——
+所以每个站点都要用自己的 `gid_shape` 对纯 ID 再复判一次，不能只靠通用正则。
+
+## 落盘/远端
+- GitHub 远端：**https://github.com/LeonZhangDev/universal-web-collector**（分支 `main`）。
+  本机**无 `gh` CLI**；用 `git credential fill` 取 GCM 里的 `gho_` token 调 REST API 建仓。
+  `git credential fill` 需要 `printf "protocol=https\nhost=github.com\n\n" | ...`。
+
 ## 最近大版本
 - V28（c14d6c3/d2573cb）：落盘目录重构 — 相册单层 + 视频平铺 + 清单与媒体分离。
 - V29（c300198）：批量创建 / 搜索筛选分页 / 环境诊断三接口 + 前端全面改版（创建区/表格/详情抽屉/诊断面板/样式统一+大图预览）。
@@ -69,3 +81,9 @@ V29 的 `active`（状态组代号）、V31 的 `auto`（采集器意图，非�
 - V31（609f2c7）：代理池轮换**真正联动下载层**（`ProxyPool`/`make_proxy_session`，任务独占 Session）+
   任务通知中心（`_settle_status` 钩子 + SMTP，cancelled 静默）+ 统计纯 SVG 图表 + 采集器筛选 +
   Lightbox 缩放旋转 + tab 记忆 + 空状态插画；`.gitignore` 扩展；三份文档同步。测试 557 passed。
+- V32（2edbc62 + d410551）：**四条 P2 全部实施** — ① 代理熔断（3 次失败 / 冷却 300s / 到期半开 /
+  全池熔断退化按序号；`GET /tasks/{id}/proxy`）② 字节级进度（`progress_cb(nbytes)` + `0.4s` 节流 +
+  只走内存不落库 + 前端 `byterate.js` 差分类 + 相对峰值归一化）③ 跨任务资源库
+  （`library_filters` 单一 WHERE 源 + 相册精确匹配 + `refs` 引用计数 + `/library`、`/library/albums`）
+  ④ Pexels 采集器（验证声明式契约可撑第二站）。测试 587 passed，前端 89 modules / 200.07 kB。
+  首次配远端并推送成功。**新增第 8 条静默坑（见上）。**

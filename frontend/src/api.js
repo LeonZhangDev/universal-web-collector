@@ -59,6 +59,20 @@ export function bulkDeleteTasks(statuses, withFiles = false) {
 export function getStorageOverview() {
   return api.get("/tasks/storage").then((r) => r.data);
 }
+// 批量操作: 对一组 task_id 执行同一动作(pause/resume/cancel/retry/delete)
+export function bulkAction(action, taskIds, withFiles = false) {
+  return api
+    .post("/tasks/bulk-action", { action, task_ids: taskIds, with_files: withFiles })
+    .then((r) => r.data);
+}
+// 失败资源选择性重试: 只重下 failed/skipped 的资源
+export function retryFailed(taskId) {
+  return api.post(`/tasks/${taskId}/retry-failed`).then((r) => r.data);
+}
+// 统计面板数据
+export function getStats() {
+  return api.get("/tasks/stats").then((r) => r.data);
+}
 export function retryResource(taskId, resourceId) {
   return api.post(`/tasks/${taskId}/resources/${resourceId}/retry`).then((r) => r.data);
 }

@@ -96,3 +96,32 @@ function parseSize(s) {
   if (!m) return { num: "", unit: "KB" };
   return { num: m[1], unit: m[2].toUpperCase() };
 }
+
+// ---- 预设配置导入/导出(可迁移分享, 不依赖 localStorage) ----
+// 导出: 把内置 + 用户预设序列化成一段 JSON 文本。
+export function exportPresetsText() {
+  const payload = {
+    kind: "uwc.presets",
+    version: 1,
+    builtin: BUILTIN_PRESETS.map((p) => ({ name: p.name, icon: p.icon, opts: p.opts })),
+    user: loadUserPresets(),
+  };
+  return JSON.stringify(payload, null, 2);
+}
+// 导入: 解析上面格式的 JSON, 合并进 localStorage 的用户预设(同名覆盖)。
+// 返回成功导入的用户预设数量; 格式不对抛出错误。
+export function importPresetsText(text) {
+  const data = JSON.parse(text);
+  if (!data || typeof data !== "object" || !Array.isArray(data.user)) {
+    throw new Error("不是有效的预设导出文件");
+  }
+  const existing = loadUserPresets();
+  let added = 0;
+  for (const p of data.user) {
+    if (!p || !p.name || !p.opts) continue;
+    saveUserPreset(p.name, p.opts);
+    added += 1;
+  }
+  // saveUserPreset 内部已写回, 这里再读一次确保返回最新列表供 UI 刷新
+  return { imported: added, presets: loadUserPresets() };
+}

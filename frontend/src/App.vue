@@ -4,6 +4,7 @@ import CreatePanel from "./components/CreatePanel.vue";
 import TaskTable from "./components/TaskTable.vue";
 import TaskDetail from "./components/TaskDetail.vue";
 import EnvDiagnose from "./components/EnvDiagnose.vue";
+import StatsPanel from "./components/StatsPanel.vue";
 import ToastHost from "./components/ToastHost.vue";
 import {
   bulkDeleteTasks,
@@ -35,6 +36,8 @@ const total = ref(0);
 const pages = ref(1);
 const loading = ref(false);
 const selectedId = ref(null);
+// 键盘导航: 当前高亮行(不一定打开抽屉)
+const activeId = ref(0);
 
 const collectors = ref(["auto"]);
 const config = ref({});
@@ -58,12 +61,20 @@ async function load() {
     tasks.value = r.items;
     total.value = r.total;
     pages.value = r.pages;
+    // 高亮行若已不在当前页, 跟随到第一项(若有)
+    if (!tasks.value.find((t) => t.id === activeId.value) && tasks.value.length) {
+      activeId.value = tasks.value[0].id;
+    }
   } catch (e) {
     /* 后端不可达时保持原列表 */
   } finally {
     loading.value = false;
   }
 }
+
+const filterActive = computed(
+  () => !!(query.value.q || (query.value.status && query.value.status !== "all"))
+);
 
 function onSearch(q) {
   query.value.q = q;
@@ -81,6 +92,50 @@ function onGoto(page) {
 }
 function select(id) {
   selectedId.value = id;
+  activeId.value = id;
+}
+
+// ---- 键盘快捷键: / 聚焦搜索, j/k 上下选, 回车打开, 空格暂停/继续, Esc 关抽屉 ----
+function onKey(e) {
+  const tag = (e.target.tagName || "").toLowerCase();
+  const typing = tag === "input" || tag === "textarea" || tag === "select";
+  if (e.key === "/" && !typing) {
+    e.preventDefault();
+    const el = document.querySelector(".search-input");
+    if (el) el.focus();
+    return;
+  }
+  if (e.key === "Escape") {
+    if (selectedId.value) selectedId.value = null;
+    return;
+  }
+  if (typing) return;
+  if (e.key === "j" || e.key === "ArrowDown") {
+    moveActive(1);
+    e.preventDefault();
+  } else if (e.key === "k" || e.key === "ArrowUp") {
+    moveActive(-1);
+    e.preventDefault();
+  } else if (e.key === "Enter") {
+    if (activeId.value) select(activeId.value);
+  } else if (e.key === " ") {
+    if (activeId.value) {
+      const t = tasks.value.find((x) => x.id === activeId.value);
+      if (t) {
+        if (["pending", "running", "extracting", "downloading"].includes(t.status)) doPause(t.id);
+        else if (t.status === "paused") doResume(t.id);
+      }
+      e.preventDefault();
+    }
+  }
+}
+function moveActive(dir) {
+  if (!tasks.value.length) return;
+  const ids = tasks.value.map((t) => t.id);
+  let idx = ids.indexOf(activeId.value);
+  if (idx < 0) idx = 0;
+  else idx = Math.min(ids.length - 1, Math.max(0, idx + dir));
+  activeId.value = ids[idx];
 }
 
 function connectSSE() {
@@ -269,11 +324,13 @@ onMounted(async () => {
   loadWatches();
   loadSessions();
   refreshStorage();
+  window.addEventListener("keydown", onKey);
 });
 onUnmounted(() => {
   if (es) es.close();
   clearInterval(loginTimer);
   clearTimeout(reloadTimer);
+  window.removeEventListener("keydown", onKey);
 });
 </script>
 
@@ -286,6 +343,8 @@ onUnmounted(() => {
   <EnvDiagnose />
 
   <CreatePanel :collectors="collectors" :config="config" @created="load" />
+
+  <StatsPanel />
 
   <div class="card">
     <div class="list-bar">
@@ -311,6 +370,8 @@ onUnmounted(() => {
       :page-size="query.page_size"
       :status-filter="query.status"
       :loading="loading"
+      :active-id="activeId"
+      :filter-active="filterActive"
       @search="onSearch"
       @filter="onFilter"
       @goto="onGoto"
@@ -318,7 +379,9 @@ onUnmounted(() => {
       @remove="askRemove"
       @pause="doPause"
       @resume="doResume"
+      @changed="load"
     />
+    <p class="kbd-hint">快捷键: <b>/</b> 搜索 · <b>j/k</b> 上下选 · <b>Enter</b> 打开 · <b>Space</b> 暂停/继续 · <b>Esc</b> 关闭</p>
   </div>
 
   <TaskDetail
@@ -430,6 +493,8 @@ onUnmounted(() => {
 .list-bar .lbl { color: var(--muted); font-size: 13px; }
 .list-bar .summary { color: var(--muted); font-size: 12px; }
 .list-bar .grow { flex: 1; }
+.kbd-hint { margin: 10px 2px 0; color: #6c7885; font-size: 11px; }
+.kbd-hint b { color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; font-family: ui-monospace, Consolas, monospace; }
 .panel-toggle { display: flex; align-items: center; gap: 10px; }
 .panel-toggle .summary { color: var(--accent); font-size: 12px; }
 .panel-toggle .muted { color: var(--muted); }

@@ -12,6 +12,8 @@ import {
   BUILTIN_PRESETS,
   applyPreset,
   deleteUserPreset,
+  exportPresetsText,
+  importPresetsText,
   loadUserPresets,
   saveUserPreset,
 } from "../presets";
@@ -71,6 +73,7 @@ const form = ref({
   minWidth: "",
   minHeight: "",
   dedupPerceptual: true,
+  proxy: "",
 });
 
 const mode = ref("single"); // single | batch
@@ -162,6 +165,34 @@ function saveCurrentPreset() {
 function removePreset(name) {
   userPresets.value = deleteUserPreset(name);
   if (activePreset.value === name) activePreset.value = "";
+}
+// ---- 预设配置导入/导出(可迁移分享) ----
+function exportPresets() {
+  const text = exportPresetsText();
+  const blob = new Blob([text], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "uwc-presets.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("已导出预设配置", "ok");
+}
+function onImportPresets(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const r = importPresetsText(String(reader.result || ""));
+      userPresets.value = r.presets;
+      toast(`已导入 ${r.imported} 个用户预设`, "ok");
+    } catch (err) {
+      toast(err.message || "导入失败", "err");
+    }
+  };
+  reader.onerror = () => toast("读取文件失败", "err");
+  reader.readAsText(file);
+  e.target.value = "";
 }
 // 把当前表单抽成「预设能套用的 opts」(供保存)
 function snapshotOpts() {
@@ -291,6 +322,7 @@ async function submitSingle() {
       quality: isGallery.value ? form.value.quality : null,
       media: isGallery.value ? form.value.media : null,
       album_title: isGallery.value ? form.value.albumTitle : null,
+      proxy: form.value.proxy.trim() || null,
       ...aggregateOpts(),
     });
     if (res.warning) toast(res.warning, "warn");
@@ -325,6 +357,7 @@ async function submitBatch() {
       quality: isGallery.value ? form.value.quality : null,
       media: isGallery.value ? form.value.media : null,
       album_title: isGallery.value ? form.value.albumTitle : null,
+      proxy: form.value.proxy.trim() || null,
       ...aggregateOpts(),
       allow_duplicates: allowDup.value,
     });
@@ -413,6 +446,7 @@ function savePrefs() {
         dedupPerceptual: form.value.dedupPerceptual,
         aggregateDepth: form.value.aggregateDepth,
         aggregateMax: form.value.aggregateMax,
+        proxy: form.value.proxy,
       })
     );
   } catch (e) {
@@ -443,9 +477,32 @@ function loadPrefs() {
       form.value.dedupPerceptual = !!p.dedupPerceptual;
     if (p.aggregateDepth) form.value.aggregateDepth = p.aggregateDepth;
     if (p.aggregateMax) form.value.aggregateMax = p.aggregateMax;
+    if (p.proxy) form.value.proxy = p.proxy;
   } catch (e) {
     /* ignore */
   }
+}
+
+// ---- 批量模式: 拖拽 .txt 导入 URL ----
+function onBatchDrop(e) {
+  const file = e.dataTransfer?.files?.[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".txt") && file.type !== "text/plain") {
+    toast("请拖入 .txt 文本文件(每行一个链接)", "warn");
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const text = String(reader.result || "");
+    const merged = (batchText.value ? batchText.value.replace(/\s*$/, "") + "\n" : "") + text;
+    batchText.value = merged.replace(/\r\n/g, "\n");
+    toast(`已从 ${file.name} 导入链接`, "ok");
+  };
+  reader.onerror = () => toast("读取文件失败", "err");
+  reader.readAsText(file);
+}
+function onBatchDragOver(e) {
+  e.preventDefault();
 }
 
 onMounted(() => {
@@ -482,6 +539,11 @@ onMounted(() => {
           >
         </span>
         <button type="button" class="ghost mini" @click="saveCurrentPreset">存为预设</button>
+        <label class="ghost mini import-btn">
+          导入预设
+          <input type="file" accept="application/json,.json" hidden @change="onImportPresets" />
+        </label>
+        <button type="button" class="ghost mini" @click="exportPresets">导出预设</button>
       </div>
     </div>
 
@@ -508,11 +570,16 @@ onMounted(() => {
     </form>
 
     <!-- 批量模式: 粘贴多行, 实时标注重复/无效 -->
-    <div v-else class="batch-wrap">
+    <div
+      v-else
+      class="batch-wrap"
+      @dragover="onBatchDragOver"
+      @drop.prevent="onBatchDrop"
+    >
       <textarea
         v-model="batchText"
         class="batch-input"
-        placeholder="每行一个链接或图集 ID, 支持空行与重复检测"
+        placeholder="每行一个链接或图集 ID, 支持空行与重复检测; 也可把存了链接的 .txt 拖进来"
         rows="6"
       ></textarea>
       <div class="batch-foot">
@@ -632,6 +699,18 @@ onMounted(() => {
       <div class="dir-row">
         <span class="lbl">目录结构</span>
         <span class="tip">下载目录 / 相册名 / 图片；视频直接放在下载目录根下，文件名取站点原名</span>
+      </div>
+
+      <div class="dir-row">
+        <span class="lbl">代理</span>
+        <input
+          type="text"
+          v-model="form.proxy"
+          class="proxy-input"
+          placeholder="可选, 如 http://127.0.0.1:7890 ; 留空用全局 UWC_PROXY"
+          style="flex:1"
+        />
+        <span class="tip">仅对本任务生效, 优先于全局代理</span>
       </div>
 
       <!-- 过滤条件 -->

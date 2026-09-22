@@ -8,6 +8,7 @@ import {
   getTask,
   pauseTask,
   resumeTask,
+  retryFailed,
   retryResource,
   retryTask,
 } from "../api";
@@ -33,6 +34,13 @@ const STATUS_TABS = [
   { key: "pending", label: "待处理" },
 ];
 const view = ref("all");
+const viewMode = ref("grid"); // grid | list —— 资源区列表/网格切换
+
+// 速率指示: 详情每 2 秒刷新一次, 用"已下载资源数"的差值估算采集速率(张/分)。
+// 不是真实字节速率(后端进度是百分比, 不回传字节), 但足够让人看出"还在动、快不快"。
+const ratePerMin = ref(0);
+let lastDone = null;
+let lastTs = 0;
 const visible = computed(() => {
   const rs = task.value?.resources || [];
   if (view.value === "all") return rs;
@@ -81,7 +89,13 @@ function badgeClass(s) {
   return "pending";
 }
 const dupCount = computed(
-  () => (manifest.value?.resources || []).filter((i) => i.duplicate_of).length
+  () => (task.value?.resources || []).filter((r) => r.duplicate_of).length
+);
+const failedSkippedCount = computed(
+  () =>
+    (task.value?.resources || []).filter((r) =>
+      ["failed", "skipped"].includes(r.status)
+    ).length
 );
 
 function fmtSize(n) {
@@ -101,6 +115,15 @@ async function load() {
   try {
     task.value = await getTask(props.taskId);
     logs.value = await getLogs(props.taskId);
+    // 估算采集速率: 用两次刷新间"已下载资源数"的增量
+    const done = (task.value?.resources || []).filter((r) => r.status === "done").length;
+    const now = Date.now();
+    if (lastDone !== null && lastTs && active()) {
+      const dt = (now - lastTs) / 1000;
+      if (dt > 0) ratePerMin.value = Math.round(((done - lastDone) / dt) * 60);
+    }
+    lastDone = done;
+    lastTs = now;
     if (!active()) {
       clearInterval(timer);
       timer = null;
@@ -117,6 +140,17 @@ async function refreshLogs() {
 async function retry() {
   try {
     await retryTask(props.taskId);
+    await load();
+    if (!timer) timer = setInterval(load, 2000);
+    emit("changed");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+async function retryFailedRes() {
+  try {
+    const r = await retryFailed(props.taskId);
+    toast(`已重新派发 ${r.count} 个失败资源`, "ok");
     await load();
     if (!timer) timer = setInterval(load, 2000);
     emit("changed");
@@ -211,6 +245,12 @@ onUnmounted(() => clearInterval(timer));
           class="ghost"
           @click="retry"
         >重跑任务</button>
+        <button
+          v-if="failedSkippedCount > 0"
+          class="ghost"
+          @click="retryFailedRes"
+          title="只重下失败/跳过的资源, 保留已成功的部分"
+        >重试失败资源 ({{ failedSkippedCount }})</button>
         <button class="ghost" @click="archive">打包下载</button>
         <button class="ghost" @click="loadManifest">清单</button>
         <button class="ghost danger" @click="doRemove">删除</button>
@@ -234,6 +274,11 @@ onUnmounted(() => clearInterval(timer));
           <div style="color:var(--muted); margin-bottom:8px; word-break:break-all;">{{ task.url }}</div>
           <div class="stat-line" v-if="Object.keys(stat).length">
             <span v-for="(v, k) in stat" :key="k" class="stat-item" :class="k">{{ k }} {{ v }}</span>
+            <span v-if="ratePerMin > 0 && active()" class="stat-item rate">≈ {{ ratePerMin }} 张/分</span>
+          </div>
+          <div class="dup-report" v-if="dupCount">
+            <span class="di">⚠️</span>
+            本任务有 <b>{{ dupCount }}</b> 张与已有资源疑似重复（依据感知指纹），文件已保留、未删除。
           </div>
           <div class="view-tabs" v-if="task.resources.length">
             <button
@@ -246,8 +291,11 @@ onUnmounted(() => clearInterval(timer));
               {{ t.label }}
               <em v-if="t.key !== 'all' && t.key !== 'pending'">{{ stat[t.key] || 0 }}</em>
             </button>
+            <span class="grow"></span>
+            <button class="tab" :class="{ on: viewMode === 'grid' }" @click="viewMode = 'grid'" title="网格">▦</button>
+            <button class="tab" :class="{ on: viewMode === 'list' }" @click="viewMode = 'list'" title="列表">☰</button>
           </div>
-          <div class="resource-grid" v-if="visible.length">
+          <div class="resource-grid" v-if="visible.length && viewMode === 'grid'">
             <div class="resource-item" v-for="(r, i) in visible" :key="r.id" :title="r.url">
               <a
                 v-if="r.file_url && r.type === 'image'"
@@ -272,6 +320,30 @@ onUnmounted(() => clearInterval(timer));
               </div>
             </div>
           </div>
+          <table class="res-list" v-else-if="visible.length && viewMode === 'list'">
+            <thead>
+              <tr><th>状态</th><th>文件</th><th>类型</th><th>大小</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in visible" :key="r.id">
+                <td><span class="badge" :class="badgeClass(r.status)">{{ r.status }}</span></td>
+                <td class="nm">
+                  <a v-if="r.file_url && r.type === 'image'" @click.prevent="openLb(lightboxImages.findIndex((x) => x.url === r.file_url))" class="lk">{{ (r.url || '').split('/').pop() || r.url }}</a>
+                  <span v-else>{{ (r.url || '').split('/').pop() || r.url }}</span>
+                  <span class="sz dup-hint" v-if="r.duplicate_of" title="感知指纹判定疑似相同, 文件已保留">疑似重复 #{{ r.duplicate_of }}</span>
+                </td>
+                <td>{{ typeIcon[r.type] || "📄" }} {{ r.type }}</td>
+                <td>{{ r.size ? fmtSize(r.size) : "—" }}</td>
+                <td>
+                  <button
+                    v-if="canRetryResource && ['failed', 'skipped', 'filtered'].includes(r.status)"
+                    class="ghost mini"
+                    @click="retryRes(r)"
+                  >{{ r.status === 'filtered' ? '强制下载' : '重试' }}</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
           <div v-else-if="task.resources.length" class="empty">该分类下没有资源</div>
           <div v-else class="empty">未发现资源</div>
         </div>

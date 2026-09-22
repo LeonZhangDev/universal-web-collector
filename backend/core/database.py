@@ -486,6 +486,38 @@ def count_tasks_by_status():
     return {r["status"]: r["n"] for r in rows}
 
 
+def count_tasks_by_collector():
+    """按采集器统计任务数量, 返回 dict。供统计面板分组展示。"""
+    rows = query("SELECT collector, COUNT(*) AS n FROM tasks GROUP BY collector")
+    return {r["collector"]: r["n"] for r in rows}
+
+
+def count_resources_total():
+    """全部资源记录数(跨任务)。"""
+    row = query_one("SELECT COUNT(*) AS n FROM resources")
+    return row["n"] if row else 0
+
+
+def sum_downloaded_bytes():
+    """已成功下载资源的体积合计(字节)。"""
+    row = query_one(
+        "SELECT COALESCE(SUM(size), 0) AS n FROM resources "
+        "WHERE status='done' AND size IS NOT NULL"
+    )
+    return row["n"] if row else 0
+
+
+def get_resources_with_status(task_id, statuses):
+    """取出某任务下处于指定状态的所有资源(供"重试失败资源"等)。"""
+    if not statuses:
+        return []
+    marks = ",".join("?" for _ in statuses)
+    return query(
+        f"SELECT * FROM resources WHERE task_id=? AND status IN ({marks}) ORDER BY id",
+        (task_id, *statuses),
+    )
+
+
 def iter_tasks_with_status(statuses):
     """按状态批量取任务(供批量删除使用)。"""
     if not statuses:

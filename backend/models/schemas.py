@@ -113,6 +113,9 @@ class TaskCreateIn(BaseModel):
     # 聚合页采集器: 还能再往下钻几层。默认 1(落地页 -> 它的相册);
     # 索引页要连模特一起展开时才需要 2。
     aggregate_depth: Optional[int] = None
+    # 任务级代理(可选)。优先于全局 UWC_PROXY。存入 options, 由下载层读取;
+    # 留空则沿用全局/环境变量配置。前端"高级设置"里可填。
+    proxy: Optional[str] = None
 
 
 class TaskCreateOut(BaseModel):
@@ -144,6 +147,7 @@ class BatchTaskIn(BaseModel):
     album_title: Optional[str] = None
     max_items: Optional[int] = None
     aggregate_depth: Optional[int] = None
+    proxy: Optional[str] = None
     # 已存在相同 URL 的任务时是否仍然创建。默认否 —— 批量粘贴最常见的失误就是
     # 同一批粘了两次, 默认重下会把几百张图再下一遍。前端要能显式打开它,
     # 因为"上次失败了想重下"是合理诉求。
@@ -163,6 +167,47 @@ class BatchTaskItemOut(BaseModel):
     collector: Optional[str] = None
     # 已存在同 URL 的任务 id(duplicate_existing 时给出, 前端可链过去)
     existing_task_id: Optional[int] = None
+
+
+class BulkActionIn(BaseModel):
+    """批量操作: 对一组 task_id 执行同一个动作。
+
+    action ∈ {pause, resume, cancel, retry, delete}。动作本身的可执行性由各
+    task_manager 方法判断(例如对已完成任务 pause 返回 409), 这里只负责批量派发
+    并把每个任务的结果归类, 让前端一次性知道"哪些成了、哪些被跳过"。
+    """
+
+    action: str
+    task_ids: List[int]
+    with_files: bool = False  # 仅 delete 生效: 同时删除已下载文件
+
+
+class BulkActionOut(BaseModel):
+    action: str
+    requested: int
+    ok: List[int] = []
+    skipped: List[int] = []       # 任务存在但动作不适用(如 pause 已完成任务 → 409)
+    not_found: List[int] = []     # 任务不存在
+    errors: dict = {}             # task_id(str) -> 错误信息
+
+
+class RetryFailedOut(BaseModel):
+    """失败资源选择性重试: 只把 failed/skipped 的资源重新派发下载。"""
+
+    task_id: int
+    retried: List[int] = []
+    count: int = 0
+
+
+class TaskStatsOut(BaseModel):
+    """首页统计面板用: 总量 + 按状态 + 按采集器 + 资源总量与体积。"""
+
+    total_tasks: int = 0
+    total_resources: int = 0
+    total_bytes: int = 0
+    by_status: dict = {}
+    by_collector: dict = {}
+    active: int = 0
     warning: Optional[str] = None
 
 

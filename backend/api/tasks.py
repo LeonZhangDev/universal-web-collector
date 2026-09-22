@@ -37,12 +37,16 @@ from models.schemas import (
     BatchTaskIn,
     BatchTaskItemOut,
     BatchTaskOut,
+    BulkActionIn,
+    BulkActionOut,
     ResourceOut,
+    RetryFailedOut,
     TaskCreateIn,
     TaskCreateOut,
     TaskDetail,
     TaskListOut,
     TaskOut,
+    TaskStatsOut,
 )
 
 router = APIRouter()
@@ -222,6 +226,8 @@ def create(payload: TaskCreateIn):
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
     )
+    if payload.proxy:
+        options["proxy"] = payload.proxy
 
     task_id = db.create_task(payload.url, collector, download_dir, options)
     task_manager.submit(task_id)
@@ -285,6 +291,8 @@ def batch_create(payload: BatchTaskIn):
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
     )
+    if payload.proxy:
+        options["proxy"] = payload.proxy
 
     lines = list(payload.urls or [])
     truncated = 0
@@ -651,6 +659,71 @@ def storage_overview():
     }
 
 
+@router.get("/tasks/stats", response_model=TaskStatsOut)
+def task_stats():
+    """首页统计面板: 总量 + 按状态 + 按采集器 + 资源总量与体积。
+
+    by_status 直接复用 count_tasks_by_status(); active 字段用 STATUS_GROUPS 的
+    "active" 组展开后求和, 让前端不必自己算"正在跑的有几个"。
+    """
+    by_status = db.count_tasks_by_status()
+    active_statuses = _expand_statuses(["active"])
+    active = sum(by_status.get(s, 0) for s in active_statuses)
+    return TaskStatsOut(
+        total_tasks=sum(by_status.values()),
+        total_resources=db.count_resources_total(),
+        total_bytes=db.sum_downloaded_bytes(),
+        by_status=by_status,
+        by_collector=db.count_tasks_by_collector(),
+        active=active,
+    )
+
+
+@router.post("/tasks/bulk-action", response_model=BulkActionOut)
+def bulk_action(payload: BulkActionIn):
+    """对一组 task_id 执行同一动作(pause/resume/cancel/retry/delete)。
+
+    每个任务独立调用对应的 task_manager 方法, 把结果归类成 ok / skipped /
+    not_found。正在运行的任务不会被 delete(交给已有的 bulk-delete 语义, 这里
+    直接按方法返回值归类), 单个任务失败不影响其它任务。
+    """
+    valid = {"pause", "resume", "cancel", "retry", "delete"}
+    if payload.action not in valid:
+        raise HTTPException(
+            status_code=400, detail=f"不支持的动作: {payload.action} (可选: {', '.join(sorted(valid))})"
+        )
+    out = BulkActionOut(action=payload.action, requested=len(payload.task_ids))
+    for tid in payload.task_ids:
+        try:
+            if payload.action == "pause":
+                ok, err = task_manager.pause(tid)
+            elif payload.action == "resume":
+                ok, err = task_manager.resume(tid)
+            elif payload.action == "cancel":
+                ok, err = task_manager.cancel(tid)
+            elif payload.action == "retry":
+                ok, err = task_manager.retry(tid)
+            else:  # delete
+                if not db.get_task(tid):
+                    out.not_found.append(tid)
+                    continue
+                task_manager.delete(tid, with_files=payload.with_files)
+                out.ok.append(tid)
+                continue
+            if ok is None:
+                out.not_found.append(tid)
+            elif ok:
+                out.ok.append(tid)
+            else:
+                out.skipped.append(tid)
+                if err:
+                    out.errors[str(tid)] = err
+        except Exception as e:  # 单个任务异常不阻断其它任务
+            out.errors[str(tid)] = str(e)
+            out.skipped.append(tid)
+    return out
+
+
 @router.get("/tasks/{task_id}", response_model=TaskDetail)
 def get_task(task_id: int):
     task = db.get_task(task_id)
@@ -795,6 +868,25 @@ def retry_resource(task_id: int, resource_id: int):
         raise HTTPException(status_code=400, detail=err)
     task = db.get_task(task_id)
     return _resource_out(db.get_resource(resource_id), task)
+
+
+@router.post("/tasks/{task_id}/retry-failed", response_model=RetryFailedOut)
+def retry_failed(task_id: int):
+    """失败资源选择性重试: 只把 failed / skipped 的资源重新派发下载。
+
+    与整任务 retry(删除全部资源重来)不同, 这里保留已成功的资源, 只重下失败的
+    那部分 —— 网络抖动/单张 403 这类局部失败时最省时。复用已有的单资源
+    submit_resource(它直接把资源丢进下载执行器), 逐个派发。
+    """
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    retried = []
+    for r in db.get_resources_with_status(task_id, ["failed", "skipped"]):
+        ok, err = task_manager.submit_resource(task_id, r["id"])
+        if ok:
+            retried.append(r["id"])
+    return RetryFailedOut(task_id=task_id, retried=retried, count=len(retried))
 
 
 # ---- 目录选择 ----

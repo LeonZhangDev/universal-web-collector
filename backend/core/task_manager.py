@@ -11,6 +11,7 @@ from pathlib import Path
 
 from collectors import get_collector
 from core import events
+from core import layout
 from core.cancel import TaskCancelled  # noqa: F401  (下载层要识别它, 在这里重导出)
 from core.config import settings
 from core.disk import ensure_free
@@ -104,10 +105,13 @@ DOWNLOADERS = {
 
 
 def task_base_dir(task):
-    """任务的下载根目录(不含 task_id 子层)。
+    """任务的下载根目录。
 
     优先任务创建时指定的自定义目录, 回退全局 settings.download_dir。
     API 层用它做文件访问的越权校验, 保证与任务实际输出目录一致。
+
+    ⚠️ 这里**不再**按任务再套一层 `<task_id>/`: 媒体文件的布局是
+    `下载根/相册名/文件`(视频平铺在下载根), 规则唯一定义在 `core/layout.py`。
     """
     custom = task["download_dir"] if task and task["download_dir"] else None
     return Path(custom) if custom else DOWNLOADS_DIR
@@ -340,7 +344,8 @@ class TaskManager:
 
         * `with_files=False`(默认) —— 只删数据库记录, **磁盘文件保留**。
           上级目录里那一堆下载好的图片不会因为"从列表里划掉一个任务"而消失。
-        * `with_files=True` —— 连同该任务的下载目录一起删除。
+        * `with_files=True` —— 连同**该任务下载的那些文件**一起删除(别的任务
+          复用过的文件会跳过, 见 `_purge_files`)。
 
         顺序有讲究: 必须先取消再删文件, 否则正在跑的 worker 会把文件写回来。
         取消只是置标志位(见 cancel), worker 还要收拾现场, 所以这里要等它
@@ -362,40 +367,66 @@ class TaskManager:
         return info
 
     def _purge_files(self, task):
-        """删除某个任务的下载目录, 返回 {"files": n, "bytes": n}。
+        """删除该任务**自己落的**文件与清单, 返回 {"files": n, "bytes": n}。
 
-        ⚠️ 只删 `<下载根目录>/<task_id>/` 这一层, 且做了双重越界校验 ——
-        下载根目录可由用户自定义, 路径算错就等于删用户的目录, 必须防。
-        另外: 内容 hash 去重时别的任务可能引用本任务目录里的文件(A 复用 B 的
-        同一张图), 删掉会让那些任务的 manifest 指向不存在的文件。这是去重的
-        固有代价, 所以**默认不删文件**, 由用户显式选择。
+        ⚠️ 布局改版后不能再 rmtree `<下载根>/<task_id>/`: 那个目录已经不存在了,
+        文件散在下载根里(相册文件夹 + 平铺的视频), 而且与其它任务共用同一个根。
+        现在改成**按资源逐条删**:
+          * 只删库里有记录、且真实路径确实落在下载根**之内**的文件;
+          * 内容去重时别的任务可能引用同一个文件(A 复用 B 的那张图), 只要还有
+            别的任务指向它, 就跳过不删 —— 删掉等于把那些任务的结果一并毁掉;
+          * 半成品(`.part` / `.partsrc`)一并清掉, 否则留下一堆谁也认领的残片。
+        清单目录 `_meta/<任务ID>/` 是我们自己建的, 整棵删掉, 但仍做越界校验。
         """
         try:
             base = task_base_dir(task).resolve()
         except OSError:
             return {"files": 0, "bytes": 0}
-        target = base / str(task["id"])
-        # 校验 1: 必须是 base 的直接子目录(不能是 base 本身, 也不能更深)
-        if target.parent != base or not target.is_dir():
-            return {"files": 0, "bytes": 0}
-        # 校验 2: 解析后的真实路径仍须落在 base 内(防软链接指到外面)
-        try:
-            real = target.resolve()
-        except OSError:
-            return {"files": 0, "bytes": 0}
-        if real == base or not real.is_relative_to(base):
-            return {"files": 0, "bytes": 0}
-
+        task_id = task["id"]
         count = 0
         total = 0
-        for p in real.rglob("*"):
+        seen = set()
+
+        def _drop(path):
+            """删掉一个候选路径(含半成品), 返回是否真的删到了文件。"""
+            nonlocal count, total
             try:
-                if p.is_file():
-                    count += 1
+                p = Path(path).resolve()
+            except (OSError, TypeError, ValueError):
+                return
+            if p == base or not p.is_relative_to(base) or str(p) in seen:
+                return
+            seen.add(str(p))
+            if p.is_file():
+                try:
                     total += p.stat().st_size
-            except OSError:
-                continue
-        shutil.rmtree(real, ignore_errors=True)
+                except OSError:
+                    pass
+                count += 1
+            # 取消/失败时内容可能还留在 .part 里, 只删最终文件会漏
+            discard_partial(p)
+
+        for r in db.get_resources(task_id):
+            rel = self._row_field(r, "filename")
+            local = self._row_field(r, "local_path")
+            if db.count_place_refs(rel, local, exclude_task=task_id):
+                continue  # 还有别的任务指向这一格, 不能删
+            if local:
+                _drop(local)
+            if rel:
+                _drop(base / rel)
+
+        # 清单目录: 只认 `<下载根>/_meta/<本任务ID>`, 多一层都不碰
+        meta = layout.meta_dir(base, task_id)
+        if meta.parent == base / layout.META_DIR_NAME and meta.is_dir():
+            for p in meta.rglob("*"):
+                try:
+                    if p.is_file():
+                        count += 1
+                        total += p.stat().st_size
+                except OSError:
+                    continue
+            shutil.rmtree(meta, ignore_errors=True)
         return {"files": count, "bytes": total}
 
     def submit_resource(self, task_id, resource_id):
@@ -415,7 +446,7 @@ class TaskManager:
             return False, f"resource status is {r['status']}"
 
         db.update_resource(resource_id, status="pending", note=None)
-        out_dir = self._out_dir(task_id)
+        out_dir = self._root_dir(task_id)
         self._safe_log(task_id, f"resource retry: {r['url']}")
         # 单资源重试视为用户"强制下载"这一个资源, 不再套用过滤规则
         self._download_executor.submit(
@@ -548,7 +579,7 @@ class TaskManager:
         return bool(self._options(task_id).get("incremental"))
 
     def _resource_name(self, task_id, r, seq, suggested=None):
-        """决定资源的输出相对路径。
+        """决定资源的输出相对路径(**过布局规则**, 见 core/layout.py)。
 
         优先级: 任务级 name_template > 采集器建议 filename > 全局模板。
         之所以把任务级模板放在最前: 它是用户这一次显式指定的意愿, 应当压过
@@ -557,6 +588,10 @@ class TaskManager:
 
         `{album}` 的取值顺序: 资源自带的相册名(采集器查到的相册标题) >
         options.album(用户显式指定) > 站点标识(见 naming.build_context)。
+
+        ⚠️ 无论哪条路径产出名字, 最后都要过 `layout.place()`: 视频平铺、相册
+        单层这两条规则是**用户对目录结构的明确要求**, 自定义模板也不能绕过
+        (否则设了模板就会重建出 `相册名/子层/0001.mp4` 这种结构)。
         """
         opts = self._options(task_id)
         # _row_field 同时兼容采集器内存字典与 sqlite3.Row
@@ -564,21 +599,60 @@ class TaskManager:
         template = opts.get("name_template")
         if template:
             ctx = build_context(task_id, r["url"], r["type"], seq, album=album)
-            return render(template, ctx, r["url"], r["type"])
-        if suggested:
+            name = render(template, ctx, r["url"], r["type"])
+        elif suggested:
             # 采集器给的相对路径同样要过一遍安全清洗, 防止 URL 里的奇怪字符
             # 拼出 `../` 逃出任务目录
-            cleaned = safe_relative(suggested)
-            if cleaned:
-                return cleaned
+            name = safe_relative(suggested) or ""
+        else:
+            ctx = build_context(task_id, r["url"], r["type"], seq, album=album)
+            name = render(getattr(settings, "name_template", "") or "{name}",
+                          ctx, r["url"], r["type"])
+        placed, _album = layout.place(r["type"], name, album)
+        if placed:
+            return placed
+        # place 都救不回来(名字被清成空): 退回 URL 末段, 绝不返回空名字 ——
+        # 空名字会让下载层落成"下载根目录这个文件", 一个任务就能把根目录搞乱
         ctx = build_context(task_id, r["url"], r["type"], seq, album=album)
-        return render(getattr(settings, "name_template", "") or "{name}",
-                      ctx, r["url"], r["type"])
+        fallback = render("{name}", ctx, r["url"], r["type"])
+        return layout.place(r["type"], fallback, album)[0] or fallback
+
+    def _claim_name(self, root, task_id, r, name, claimed):
+        """在下载前把重名消解掉, 返回最终相对路径。
+
+        ⚠️ 必须在**下载前**(这里是资源入库的那一刻): 下载器见到"目标路径已有
+        文件"会把它当半成品续传, 两个不同来源的同名文件会被拼成一份产物, 还
+        因为长度可能正好对上而报成功(见 `core/layout.py` 的模块注释)。
+
+        `claimed` 是本次采集内的占位表(相对路径 -> 来源 URL), 与库里的记录
+        合起来回答"这一格现在归谁"。本次采集内的占位必须优先 —— 库那两条查询
+        只看得到**已经写进去**的行, 同一个相册里两个同名资源会一起漏过。
+        """
+        rel, album = layout.place(r["type"], name, self._row_field(r, "album"))
+        if not rel:
+            return name
+
+        def owner(cand):
+            if cand in claimed:
+                return claimed[cand]
+            # 盘上已落地的那个最权威(可能是别的任务/上一次跑的成果),
+            # 其次是别的行**计划**要放的名字(还没下完, 但这一格已被预定)
+            row = db.find_place_owner(cand, str(Path(root) / cand))
+            return row["url"] if row else None
+
+        final = layout.claim(rel, album, owner, r["url"])
+        claimed[final] = r["url"]
+        if final != rel:
+            self._safe_log(task_id, f"重名消解: {rel} -> {final}")
+        return final
 
     def _write_manifest(self, task_id, status=None):
-        """把任务的产出清单写到输出目录。
+        """把任务的产出清单写到 `下载根/_meta/<任务ID>/manifest.json`。
 
         无论成功/部分失败/取消都写: 取消时用户最需要知道"哪几个下好了"。
+
+        ⚠️ 清单不跟媒体文件放一起: 视频平铺在下载根, 清单要是也在根目录, 每跑完
+        一个视频任务就会盖掉上一个的清单。
 
         ⚠️ `status` 覆盖库里读到的状态: 调用方要在**置终态之前**先把清单落盘
         (见 `_settle_status` 的注释), 那一刻库里还是 `downloading`, 但清单里该
@@ -592,15 +666,19 @@ class TaskManager:
         if status is not None:
             task = dict(task)
             task["status"] = status
-        out_dir = task_base_dir(task) / str(task_id)
+        root = task_base_dir(task)
+        meta_dir = layout.meta_dir(root, task_id)
         try:
             write_manifest(
                 task,
                 db.get_resources(task_id),
-                out_dir,
+                meta_dir,
                 stats=db.count_resources(task_id),
                 error=task["error"],
                 log=lambda m, level="info": self._safe_log(task_id, m, level),
+                # file 字段相对**下载根**(不是清单所在的 _meta/ 目录): 用户要拿
+                # 它去下载根下找文件, 而不是看到一串 `../../相册名/...`
+                rel_base=root,
             )
         except Exception as e:
             # manifest 是附属产物, 写不出来不能让任务失败
@@ -650,19 +728,26 @@ class TaskManager:
             return None
         try:
             return write_sidecar(
-                task, meta, self._out_dir(task_id), resources=resources,
+                task, meta, self._meta_dir(task_id), resources=resources,
                 log=lambda m, level="info": self._safe_log(task_id, m, level),
             )
         except Exception as e:
             self._safe_log(task_id, f"album.json 生成失败: {e}", "warn")
             return None
 
-    def _out_dir(self, task_id):
-        """任务输出目录: 优先任务自定义目录, 回退全局 download_dir。
+    def _root_dir(self, task_id):
+        """任务的下载根目录 —— 媒体的最终归宿就是它(或其下的相册文件夹)。
 
-        无论哪种情况都再套一层 task_id 子目录, 避免不同任务的文件混在一起。
+        ⚠️ 这里**不再**套 `<task_id>` 子目录: 布局规则是
+        `下载根/相册名/文件`(视频平铺在下载根), 见 `core/layout.py`。
+        "不同任务的文件混在一起"这件事改由文件名/相册名区分 —— 这是用户要的
+        结构, 也意味着同名不同源必须靠 `_claim_name` 在下载前分开。
         """
-        return task_base_dir(db.get_task(task_id)) / str(task_id)
+        return task_base_dir(db.get_task(task_id))
+
+    def _meta_dir(self, task_id):
+        """该任务的清单目录 `下载根/_meta/<任务ID>/`(与媒体文件分开)。"""
+        return layout.meta_dir(self._root_dir(task_id), task_id)
 
     # ---- 任务主流程 ----
 
@@ -734,7 +819,7 @@ class TaskManager:
                     )
                 self._set_progress(task_id, 20)
                 self._transition(task_id, TaskStatus.RUNNING, TaskStatus.DOWNLOADING)
-                self._safe_log(task_id, f"resume output dir: {self._out_dir(task_id)}")
+                self._safe_log(task_id, f"resume download root: {self._root_dir(task_id)}")
                 self._download_all(task_id, url)
                 self._check_cancel(task_id)
                 final = self._final_status(task_id)
@@ -761,12 +846,18 @@ class TaskManager:
             filters = self._filters(task_id)
             filtered = 0
             reused = 0
+            root = self._root_dir(task_id)
+            # 本次采集内的占位表(相对路径 -> 来源 URL): 库里的记录看不到"这一批
+            # 里已经认领但还没入库的名字", 只查库会让同批同名资源一起漏过
+            claimed = {}
             for seq, r in enumerate(resources, 1):
                 # 增量续采: 同一个 URL 历史上已经成功下载过 -> 直接复用磁盘上的
                 # 那份, 不再发请求。这是"相册更新后再跑一遍"能落地的前提:
                 # 否则每次重跑都是全量重下, 增量就只剩个名字。
                 prior = db.find_done_resource(r["url"]) if self._incremental(task_id) else None
                 name = self._resource_name(task_id, r, seq, r.get("filename"))
+                # 重名消解必须在入库前做完(下载器随后就按这个名字落盘)
+                name = self._claim_name(root, task_id, r, name, claimed)
                 rid = db.add_resource(
                     task_id,
                     r["type"],
@@ -811,7 +902,7 @@ class TaskManager:
             self._set_progress(task_id, 20)
 
             self._transition(task_id, TaskStatus.EXTRACTING, TaskStatus.DOWNLOADING)
-            self._safe_log(task_id, f"output dir: {self._out_dir(task_id)}")
+            self._safe_log(task_id, f"download root: {self._root_dir(task_id)}")
             # 让"上限 2 req/s"这类阈值**看得见**。看不见的阈值会被反复误调 ——
             # 用户以为把并发调大就会更快, 而真正顶住吞吐的是请求间隔。
             pacing = ratelimit.describe(url)
@@ -926,7 +1017,7 @@ class TaskManager:
                 self._safe_log(task_id, "no resource to download (采集器未发现任何资源)")
             return
 
-        out_dir = self._out_dir(task_id)
+        out_dir = self._root_dir(task_id)
         filters = self._filters(task_id)
         counter = [0]
         counter_lock = threading.Lock()
@@ -1204,7 +1295,22 @@ class TaskManager:
 
     @staticmethod
     def _infer_name(resources):
-        """从资源输出路径推断任务展示名: 图集取目录首段, 视频取去扩展名 base。"""
+        """从资源推断任务展示名: 优先采集器给的相册名, 再退回输出路径。
+
+        ⚠️ 光看输出路径在**视频任务**上会退化成文件名: 视频平铺在下载根目录,
+        `0001_葡萄一番街.mp4` 的目录段已经没有了, 直接取 stem 会让任务列表里
+        显示 `0001_葡萄一番街` 而不是相册名。采集器本来就知道相册叫什么
+        (`album` 字段), 先用它。
+        """
+        for r in resources:
+            album = r.get("album") if isinstance(r, dict) else None
+            if not album:
+                album = TaskManager._row_field(r, "album")
+            if album:
+                # 历史数据/自定义选项可能给多层("标签/相册名"), 展示名取最深一段
+                tail = str(album).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                if tail:
+                    return tail
         from pathlib import Path
 
         for r in resources:

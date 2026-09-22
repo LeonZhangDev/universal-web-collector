@@ -56,6 +56,7 @@ import requests
 
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings
 from core.filters import fmt_size
+from core import layout
 from core.naming import clean_segment, safe_relative
 from collectors.scores import SCORE_ALBUM_PAGE, SCORE_BARE_ID, SCORE_RESOURCE_URL
 
@@ -78,7 +79,8 @@ DEFAULT_MEDIA = "auto"
 ALBUM_TITLE_MODES = ("clean", "full", "h1", "id")
 DEFAULT_ALBUM_TITLE = "clean"
 # 说明: "id" 不只是"不用标题", 而是**完全不开浏览器**(见 crawl)。
-# 目录名前加一层标签(如 "丝袜-情趣内衣/相册名/...")由 options.album_tags_dir 控制。
+# 目录树固定是"下载目录 / 相册文件夹 / 文件"(视频平铺在下载根目录),
+# 规则唯一定义在 core/layout.py —— 采集器只提供相册名, 不决定层数。
 
 DEFAULT_START = 1
 DEFAULT_MAX = 1000         # 硬上限, 防止判定失效时无限枚举
@@ -1306,18 +1308,16 @@ class SequenceGallerySpider:
             return meta.get("h1") or meta.get("album") or gid
         return meta.get("album") or gid
 
-    def group_name(self, meta, album, opts, gid=""):
-        """输出分组目录: 可选在相册名外再套一层标签目录。
+    def group_name(self, album, gid=""):
+        """相册文件夹名 —— 整个输出目录树里**唯一**的一层分类目录。
 
-        如 `丝袜-情趣内衣/相册名/00001.jpg`。只取前 3 个标签 —— 再多会把路径
-        撑得过长, 而信息量递减。
+        ⚠️ 这里不再往相册名外面套标签层(`丝袜-情趣内衣/相册名/`)。布局规则是
+        "下载目录的下一级只有相册文件夹"(见 core/layout.py), 套上去的分类层
+        只会被布局规则削掉 —— 那就成了"日志和预览显示的路径与实际落盘的不是
+        一个", 用户照预览去找文件会找不到。标签本身没丢, 完整写在 album.json
+        与 manifest 里。
         """
-        if not _truthy(opts.get("album_tags_dir")):
-            return self.normalize_group(album, gid)
-        tags = [clean_segment(t) for t in ((meta or {}).get("tags") or [])]
-        tags = [t for t in tags if t][:3]
-        group = f"{'-'.join(tags)}/{album}" if tags else album
-        return self.normalize_group(group, gid)
+        return self.normalize_group(album, gid)
 
     @staticmethod
     def normalize_group(group, gid=""):
@@ -1325,8 +1325,15 @@ class SequenceGallerySpider:
 
         预览显示的文件名示例必须与真实落盘的路径一致 —— 否则用户照预览去别处
         找文件会找不到。所以规范化只做一次, 两边共用。
+
+        ⚠️ `clean_segment` 会把结尾的点换成下划线, 于是标题是 `..` 时得到 `._` ——
+        那是个谁也看不懂的目录名。纯点/下划线拼成的结果一律当作"没取到", 回退
+        图集 ID: 与其造一个莫名其妙的目录, 不如用一个能反查的标识。
         """
-        return safe_relative(group) or clean_segment(group) or gid
+        name = safe_relative(group) or clean_segment(group)
+        if name and set(name.strip()) <= {".", "_"}:
+            name = ""
+        return name or gid
 
     def plan_log(self, log, gid, group, medias, meta):
         """把"这次采什么"一次说清: 目录、媒体、相册页自报的数量与视频体积。"""
@@ -1379,7 +1386,7 @@ class SequenceGallerySpider:
         # 取不到页面不会让任务失败 —— 它只是命名与判定上的优化。
         meta = self.read_album_meta(site, gid, title_mode, log=log)
         album = self.album_name(meta, title_mode, gid)
-        group = self.group_name(meta, album, opts, gid)
+        group = self.group_name(album, gid)
 
         medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log,
                                     proxy=opts.get("proxy"))
@@ -1476,7 +1483,7 @@ class SequenceGallerySpider:
         meta = self.read_album_meta(site, gid, title_mode, log=log,
                                     use_cache=not _truthy(opts.get("refresh")))
         album = self.album_name(meta, title_mode, gid)
-        group = self.group_name(meta, album, opts, gid)
+        group = self.group_name(album, gid)
         medias = self.resolve_media(site, gid, media_opt, meta=meta, log=log,
                                     proxy=opts.get("proxy"))
 
@@ -1514,7 +1521,11 @@ class SequenceGallerySpider:
                 counts[name] = len(got)
                 for it in got[:3]:
                     if it.get("filename"):
-                        sample_files.append(it["filename"])
+                        # 预告里的文件名必须与真实落盘一致(见 normalize_group),
+                        # 而归位规则(视频平铺/相册单层)唯一定义在 core/layout.py
+                        sample_files.append(
+                            layout.place(it["type"], it["filename"], album)[0]
+                        )
             photos = counts.get("image")
             if videos_n is None and "video" in counts:
                 videos_n = counts["video"]
@@ -1543,8 +1554,11 @@ class SequenceGallerySpider:
                 mtype = site.media(name)
                 if not mtype:
                     continue
-                sample_files = [f"{group}/{fmt.format(seq=i)}{mtype.default_ext}"
-                                for i in (1, 2)]
+                sample_files = [
+                    layout.place(name, f"{group}/{fmt.format(seq=i)}{mtype.default_ext}",
+                                 album)[0]
+                    for i in (1, 2)
+                ]
 
         return {
             "collector": site.name,

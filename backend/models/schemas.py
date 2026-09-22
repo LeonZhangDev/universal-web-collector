@@ -101,8 +101,6 @@ class TaskCreateIn(BaseModel):
     # 输出目录名的取值: clean(去掉站点尾巴的 <title>) / full(完整标题) /
     # h1(页面 <h1>, 信息通常更全) / id(图集 ID, 且完全不开浏览器)
     album_title: Optional[str] = None
-    # 在相册名之外再套一层站点标签目录(如 丝袜-情趣内衣/相册名/...)
-    album_tags_dir: Optional[bool] = None
     # 聚合页采集器(xchina_aggregate): 一次最多展开多少个条目(相册 + 视频页)。
     # 模特页可能挂几十个相册、索引页挂着上百个模特 —— 不设闸门就是几万条资源。
     max_items: Optional[int] = None

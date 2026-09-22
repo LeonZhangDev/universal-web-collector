@@ -28,6 +28,8 @@ from core.manifest import read_manifest  # noqa: E402
 from collectors import COLLECTORS, register  # noqa: E402
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 512 + b"\xff\xd9"
+#: 假装是一段 mp4: 下载层只做流式落盘 + Content-Type 校验, 不解析容器
+MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 512 + b"mdat" + b"\x00" * 64
 PAGES = 3
 
 FAILURES = []
@@ -41,6 +43,15 @@ def check(cond, label):
     else:
         print(f"  FAIL {label}")
         FAILURES.append(label)
+
+
+def meta_dir(out_root, task_id):
+    """清单目录 `下载根/_meta/<任务ID>/`。
+
+    刻意手写而不调用被测的 `core.layout.meta_dir`: 否则"清单落在哪儿"这条断言
+    就成了同义反复(实现改错时两边一起错)。
+    """
+    return out_root / "_meta" / str(task_id)
 
 
 def check_eq(got, want, label):
@@ -62,9 +73,14 @@ def check_eq(got, want, label):
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         name = self.path.rsplit("/", 1)[-1]
-        body = JPEG + f"<!--{name}-->".encode()
+        if name.endswith(".mp4"):
+            body = MP4 + f"<!--{name}-->".encode()
+            ctype = "video/mp4"
+        else:
+            body = JPEG + f"<!--{name}-->".encode()
+            ctype = "image/jpeg"
         self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if "/slow/" in self.path:
@@ -138,19 +154,23 @@ def main():
     task = db.get_task(task_id)
     check(task["status"] == "success", f"任务成功完成 (实际 {task['status']})")
 
-    out_dir = out_root / str(task_id)
-    expected = [out_dir / "gid01" / f"{i:04d}.jpg" for i in range(1, PAGES + 1)]
-    check(all(p.is_file() for p in expected), "文件按 {album}/{seq4} 落在子目录里")
-    check(not (out_dir / "00001.jpg").exists(), "根目录不再有平铺的同名文件")
+    # 媒体落在 `下载根/相册名/`(视频平铺在下载根目录), 清单落在
+    # `下载根/_meta/<任务ID>/` —— 规则见 core/layout.py
+    out_dir = out_root / "gid01"
+    expected = [out_dir / f"{i:04d}.jpg" for i in range(1, PAGES + 1)]
+    check(all(p.is_file() for p in expected), "文件按 {album}/{seq4} 落在相册文件夹里")
+    check(not (out_root / "00001.jpg").exists(), "下载根目录没有平铺的同名文件")
 
     print("[2] manifest.json 溯源字段")
-    data = read_manifest(out_dir)
+    data = read_manifest(meta_dir(out_root, task_id))
     CHECKS[0] += 1
     if data is None:
         print("  FAIL manifest.json 存在")
         FAILURES.append("manifest exists")
     else:
         print("  ok   manifest.json 存在")
+        check(not (out_dir / "manifest.json").exists(),
+              "清单与媒体分开放(视频平铺时同一个 manifest.json 会互相覆盖)")
         items = data["resources"]
         first = items[0]
         check_eq(first["file"], "gid01/0001.jpg", "file 是相对路径")
@@ -164,7 +184,7 @@ def main():
     print("[3] 打包导出")
     rows = [r for r in db.get_resources(task_id) if r["status"] == "done"]
     items = [(r, Path(r["local_path"])) for r in rows]
-    blob = b"".join(_zip_stream(out_dir, items))
+    blob = b"".join(_zip_stream(out_root, items))
     zf = zipfile.ZipFile(io.BytesIO(blob))
     check(zf.testzip() is None, "zip 结构完整(可解压)")
     check(sorted(zf.namelist()) == sorted(["gid01/%04d.jpg" % i for i in range(1, PAGES + 1)]),
@@ -227,7 +247,7 @@ def main():
         ):
             break
         time.sleep(0.05)
-    mid_target = out_root / str(tid) / "gid02"
+    mid_target = out_root / "gid02"
     check(any(r["status"] == "downloading" for r in db.get_resources(tid)),
           "取消前已有一个资源正在传输")
 
@@ -261,9 +281,38 @@ def main():
           "没有资源卡在 downloading")
     leftovers = sorted(p.name for p in mid_target.glob("*.jpg")) if mid_target.exists() else []
     check(not leftovers, f"半成品已清理 ({leftovers or '无残留'})")
-    check(read_manifest(out_root / str(tid)) is not None,
+    check(read_manifest(meta_dir(out_root, tid)) is not None,
           "取消后仍产出 manifest(告诉用户哪几个已下好)")
     mgr2.shutdown()
+
+    print("[7] 视频平铺在下载根目录, 文件名取站点原名")
+    video_url = f"{base}/videos/6aaa517d3f106.mp4"
+
+    @register("verify_video")
+    class VideoSpider:
+        def crawl(self, url, options=None, log=None):
+            return [{"type": "video", "url": video_url, "mirrors": [],
+                     "filename": "6aaa517d3f106.mp4", "album": "某视频标题"}]
+
+    vtid = db.create_task(base + "/video/gid03", "verify_video", None, {})
+    mgr.submit(vtid)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if db.get_task(vtid)["status"] in ("success", "partial", "failed", "cancelled"):
+            break
+        time.sleep(0.2)
+    check(db.get_task(vtid)["status"] == "success",
+          f"视频任务成功完成 (实际 {db.get_task(vtid)['status']})")
+    flat = out_root / "6aaa517d3f106.mp4"
+    check(flat.is_file(), "视频直接落在下载根目录")
+    check(not (out_root / "某视频标题").exists(), "视频没有建相册文件夹")
+    vrow = db.get_resources(vtid)[0]
+    check_eq(vrow["filename"], "6aaa517d3f106.mp4", "入库的相对路径就是平铺名")
+    vdata = read_manifest(meta_dir(out_root, vtid))
+    check(vdata is not None, "视频任务也有自己的清单")
+    if vdata:
+        check_eq(vdata["resources"][0]["file"], "6aaa517d3f106.mp4",
+                 "manifest 的 file 相对**下载根**(不是清单所在的 _meta 目录)")
 
     mgr.shutdown()
     srv.shutdown()
@@ -276,7 +325,8 @@ def main():
             print(f"   - {f}")
         return 1
     print(f"✓ 全部 {total} 项断言通过")
-    print(f"  产出目录: {out_dir}")
+    print(f"  媒体目录: {out_root}")
+    print(f"  清单目录: {meta_dir(out_root, task_id)}")
     return 0
 
 

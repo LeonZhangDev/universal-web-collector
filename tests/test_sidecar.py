@@ -165,7 +165,16 @@ def _run_task_with(monkeypatch, tmp_path, tmp_db, resources):
         assert db.get_task(tid)["status"] == tm.TaskStatus.SUCCESS
     finally:
         mgr.shutdown(wait=True)
-    return tid, tmp_path / "dl" / str(tid)
+    return tid, _meta_dir(tmp_path, tid)
+
+
+def _meta_dir(tmp_path, tid):
+    """清单目录 `下载根/_meta/<任务ID>/`。
+
+    刻意手写而不调用被测的 `layout.meta_dir` —— 否则"落在哪儿"这条断言就成了
+    同义反复: 实现改错时两边一起错, 用例照样绿。
+    """
+    return tmp_path / "dl" / "_meta" / str(tid)
 
 
 def test_task_manager_writes_album_json(tmp_db, tmp_path, monkeypatch):
@@ -206,7 +215,7 @@ def test_sidecar_is_written_before_download_finishes(tmp_db, tmp_path, monkeypat
 
     def failing_download_all(self, task_id, referer):
         seen["exists_during_download"] = (
-            (tmp_path / "dl" / str(task_id) / SIDECAR_NAME).is_file()
+            (_meta_dir(tmp_path, task_id) / SIDECAR_NAME).is_file()
         )
         for r in db.get_resources(task_id):
             db.update_resource(r["id"], status="failed", note="boom")
@@ -235,13 +244,13 @@ def test_sidecar_is_written_before_download_finishes(tmp_db, tmp_path, monkeypat
     assert seen.get("exists_during_download") is True, (
         "sidecar 必须在下载阶段之前落盘, 否则任务全失败时就没有资源根线索了"
     )
-    assert (tmp_path / "dl" / str(tid) / SIDECAR_NAME).is_file()
+    assert (_meta_dir(tmp_path, tid) / SIDECAR_NAME).is_file()
 
 
 # ---------------------------------------------------- 产物 / 终态次序(竞态)
 
-def _spy_terminal_writes(monkeypatch, records):
-    """拦住"写终态"这个动作, 记录那一刻输出目录里有没有 manifest。
+def _spy_terminal_writes(monkeypatch, tmp_path, records):
+    """拦住"写终态"这个动作, 记录那一刻清单目录里有没有 manifest。
 
     为什么这么测: 次序 bug 的本质是**两个动作的先后**, 而先后靠 sleep 去撞是
     碰运气(3 次挂 1 次)。这里改成确定性判据 —— 在终态真正落库的瞬间查文件
@@ -252,7 +261,7 @@ def _spy_terminal_writes(monkeypatch, records):
 
     def spy(task_id, status):
         if status in terminal:
-            out = tm.task_base_dir(db.get_task(task_id)) / str(task_id)
+            out = _meta_dir(tmp_path, task_id)
             records.append((status, (out / MANIFEST_NAME).is_file()))
         return real_update(task_id, status)
 
@@ -267,7 +276,7 @@ def test_manifest_lands_before_task_is_marked_done(tmp_db, tmp_path, monkeypatch
     偶发"任务成功但 manifest 不存在"(verify_output 3 次会挂 1 次)。
     """
     seen = []
-    _spy_terminal_writes(monkeypatch, seen)
+    _spy_terminal_writes(monkeypatch, tmp_path, seen)
 
     resources = [{"type": "image", "url": "https://x/0001.jpg", "headers": None,
                   "mirrors": [], "size": 1, "filename": "相册/0001.jpg"}]
@@ -281,7 +290,7 @@ def test_manifest_lands_before_task_is_marked_done(tmp_db, tmp_path, monkeypatch
 def test_manifest_lands_before_task_is_marked_failed(tmp_db, tmp_path, monkeypatch):
     """失败路径同理: 用户看到 failed 时, 也要能立刻读到 manifest 知道败在哪。"""
     seen = []
-    _spy_terminal_writes(monkeypatch, seen)
+    _spy_terminal_writes(monkeypatch, tmp_path, seen)
 
     monkeypatch.setattr(tm, "DOWNLOADS_DIR", tmp_path / "dl")
     resources = [{"type": "image", "url": "https://x/1.jpg", "headers": None,
@@ -353,7 +362,7 @@ def test_stop_in_finish_window_keeps_manifest_consistent(tmp_db, tmp_path, monke
         mgr.shutdown(wait=True)
 
     assert db.get_task(tid)["status"] == tm.TaskStatus.CANCELLED
-    data = read_manifest(tmp_path / "dl" / str(tid))
+    data = read_manifest(_meta_dir(tmp_path, tid))
     assert data is not None, "停止也要留下 manifest"
     assert data["status"] == "cancelled", (
         f"manifest 状态必须与任务一致(实际 {data['status']})"

@@ -279,7 +279,7 @@ def test_aggregate_options_reach_task_options(client):
 
 
 def test_watch_shares_the_same_option_builder(client, monkeypatch):
-    """订阅原先手抄了一份校验, 于是 album_tags_dir 这类新选项会被静默丢掉。
+    """订阅原先手抄了一份校验, 于是新选项会被静默丢掉。
 
     订阅是长期反复跑的, 悄悄少一个选项比直接报错难查得多 —— 现在三处
     共用 `_gallery_options`。
@@ -293,7 +293,8 @@ def test_watch_shares_the_same_option_builder(client, monkeypatch):
             "interval_minutes": 60,
             "aggregate_depth": 3,
             "max_items": 7,
-            "album_tags_dir": True,
+            "album_title": "h1",
+            "quality": "800",
             "run_now": False,
         },
     )
@@ -304,7 +305,9 @@ def test_watch_shares_the_same_option_builder(client, monkeypatch):
     opts = _json.loads(row["options"] or "{}")
     assert opts["aggregate_depth"] == 3
     assert opts["max_items"] == 7
-    assert opts["album_tags_dir"] is True
+    # 走的是同一个构造器: 采集器侧的选项一个都不能少
+    assert opts["album_title"] == "h1"
+    assert opts["quality"] == "800"
 
 
 def test_watch_rejects_bad_aggregate_depth(client):

@@ -66,16 +66,27 @@ def which(name):
     return p
 
 
+def _is_executable_file(candidate):
+    """判断 candidate 是否真的是一个可执行的 uv 本体。
+
+    POSIX 上用 X_OK 位即可; Windows 没有可执行位, `os.access(..., X_OK)`
+    对**任何存在的普通文件都返回 True**(拿一个 .txt 试也是 True), 所以那里
+    必须改用扩展名判断 —— 否则 `UWC_START_UV` 指向一个非可执行文件时会被
+    照单全收, 与"不把不可信环境变量当命令"的承诺相悖。
+    """
+    if not candidate.is_file():
+        return False
+    if os.name == "nt":
+        return candidate.suffix.lower() in (".exe", ".cmd", ".bat", ".com")
+    return os.access(candidate, os.X_OK)
+
+
 def resolve_uv_command():
     """Resolve uv without treating an untrusted env value as a command."""
     internal = os.environ.get(START_UV_ENV)
     if internal:
         candidate = Path(internal)
-        if (
-            candidate.is_absolute()
-            and candidate.is_file()
-            and os.access(candidate, os.X_OK)
-        ):
+        if candidate.is_absolute() and _is_executable_file(candidate):
             return str(candidate)
     path_uv = shutil.which("uv")
     if path_uv:

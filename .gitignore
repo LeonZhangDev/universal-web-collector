@@ -42,6 +42,7 @@ logs/
 *.key
 secrets/
 cookies*.json
+# Pexels 关键词采集需要 PEXELS_API_KEY, 按 .env 方式配置(不要硬编码进代码)
 
 # ---- Git 工作区 ----
 .worktrees/

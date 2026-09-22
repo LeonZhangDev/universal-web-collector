@@ -1850,3 +1850,247 @@ finally:
 | P2 | 代理健康检查与自动降级 | 轮换现在按序号，可加"失败换线 + 熔断" |
 | P2 | 骨架屏分区块 / 主题 accent | 视觉打磨，改动小、感知强 |
 | 按需求 | 新站点插件 | 复用现有下载与清单机制，配样本测试 |
+
+> 上表 4 条已在 **V32 全部实施**，见下节。骨架屏与 accent 在 V31 已落地。
+
+---
+
+## 11. V32 — 资源库 / 字节速率 / 代理熔断 / 第二个站点插件
+
+本轮把 10.5 的四条建议全部做完，并在做第四条时**抓出两个真实静默缺陷**。这两个
+缺陷的价值远大于功能本身，先讲。
+
+### 11.1 ⚠️ 静默陷阱一：新站点的 `match_score` 不能自写宽松解析
+
+给 Pexels 写 `match_score` 时，我一开始自己写了个 `_extract_pid()`，内部调
+`parse_gid(strict=False)`。看起来没问题，因为 Pexels 的 ID 是纯数字 `\d+`。
+
+但它**把 xchina 的 URL 认领走了**：
+
+```
+https://xchina.co/photo/id-6aa5136f606fe.html
+  → parse_gid(strict=False) 的"路径末段退路"
+  → 末段 "id-6aa5136f606fe.html" 剥掉扩展名 → "id-6aa5136f606fe"
+  → 符合 \w+ 形状 → 认领成功 (分数 50)
+```
+
+后果：用户粘 xchina 相册页 URL，任务却由 Pexels 采集器执行 —— **不改任何报错，
+就是采不到东西**。这正是第 7 条铁律说的"多传一个词就静默返回 0 条"的同型缺陷，
+只是发生在 URL 认领层。
+
+**修法**：新采集器**必须复用 `gallery_base._match_score(site, raw)`**，它内部已经
+做了 strict 解析 + 候选基址/相册页域名比对。只有"列表页/聚合页"这类确实不在
+`gid` 体系里的分支，才允许自写 `host.endswith(...)` 判断。
+
+**通用规则**：*认领逻辑是全局共享的稀缺资源，任何站点都不该有一份自己的宽松版本。*
+
+### 11.2 ⚠️ 静默陷阱二：纯 ID 样本的跨站歧义
+
+修完上面那条，`_match_score` 走通了，但又有既有测试红了：
+
+```
+assert 'pexels' == 'xchina_gallery'   # 输入 "6aa5136f606fe"
+```
+
+原因：`_match_score` 对"纯 ID 输入"（无 `://` 无 `/`）的信赖判据是通用的
+`_ID_CHARS = [0-9A-Za-z_-]{6,}` —— **什么字符串都能装**。xchina 的 `6aa5136f606fe`
+和 Pexels 的 `1234567` **同时满足**，两站返回同样的 `SCORE_BARE_ID`。
+同分时按采集器名字字典序决胜：`pexels` < `xchina_gallery`，于是 xchina 的 ID 被送去 Pexels。
+
+**修法**：每个站点在 `match_score` 里对自己的纯 ID 形态**再关一次门**：
+
+```python
+_BARE_ID = re.compile(PEXELS.gid_shape)          # r"\d{4,10}"
+
+@classmethod
+def match_score(cls, url):
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if _SEARCH_RE.search(raw) or _QUERY_RE.search(raw):
+        host = urlparse(raw).netloc.lower()
+        return SCORE_AGGREGATE_PAGE if host.endswith("pexels.com") else None
+    if "://" not in raw and "/" not in raw:      # 纯 ID：用自己的形状把关
+        if not _BARE_ID.fullmatch(raw):
+            return None
+    return _match_score(PEXELS, raw)
+```
+
+验证：`6aa5136f606fe` → `xchina_gallery`，`1234567` → `pexels`，两个完整 URL 各归其主。
+
+**通用规则**：*通用正则只负责"排除明显不像的"，不负责"认定是的"。凡是可能被多站
+共享的输入形态，每站都要按自己的 `gid_shape` 复判一次 —— 否则胜负由字典序决定，
+而字典序和正确性毫无关系。*
+
+### 11.3 顺手修掉的 `check_site` 两个缺陷
+
+新增站点时 `check_site(PEXELS)` 直接报 `base_candidate_digits=0 必须 >= 1`。
+
+1. **下界应为 0 不是 1**：`base_candidate_digits` 字段默认值就是 0，语义是"不要数字
+   后缀"（合法）。校验 `< 1` 把默认值判成错误。只有**负数**才是错误。
+2. **校验位置**：原检查写在 per-media 循环里，声明里没有 media 时就漏检。移到循环外。
+
+另外补了 `gid_shape` 对**纯 ID 样本**的 fullmatch 校验 —— 防止"正则按整条 URL 写，
+导致纯 ID 永远匹配不上"这类真实缺陷漏过自检。
+
+### 11.4 代理熔断（`downloaders/base.py::ProxyPool`）
+
+```python
+FAIL_THRESHOLD = 3      # 连续失败 3 次
+COOLDOWN = 300.0        # 冷却 300 秒
+```
+
+- `note_failure(proxy)` 累加计数，达阈值写 `_blocked_until[proxy] = time.time() + COOLDOWN`。
+- `note_success(proxy)` 清计数与熔断标记。
+- `pick(n)` 从轮换起点向后找第一个**未熔断**的代理。
+- `_is_blocked()` 顺带做过期清理：到期即 pop 出 `_blocked_until`（半开放出，
+  **保留失败计数** —— 再失败一次立刻重新熔断）。
+
+**两个刻意的设计决定**：
+
+1. **全池熔断时退化为按序号返回，而非返回 `None`。** 返回 `None` 会让任务彻底停摆；
+   而"所有线路都连不上"极可能说明**问题不在代理上**（本地断网、目标站挂了）。
+   此时继续直连比罢工更有用。
+2. **只放内存不落库。** 重启即重算，符合直觉；也避免把易变状态写进 SQLite
+   撞上单写者瓶颈。
+
+**不需要健康检查线程**：冷却到期自动放行，下一次真实请求本身就是探针。
+`task_manager.proxy_snapshot(task_id)` 从活动条目取池，供 `GET /tasks/{id}/proxy`。
+
+> ⚠️ 记账时机：`note_failure` **只在真走完重试链仍失败**时调（异常分支末尾），
+> 不能在每次请求失败时调 —— 否则一次抖动就熔断一条好线路。
+
+### 11.5 字节级速率（后端）
+
+下载层 `progress_cb(nbytes)` 传**本 chunk 字节数**。兼容老回调（测试替身写的是
+`def cb(): ...`）：
+
+```python
+if progress_cb:
+    try:
+        progress_cb(len(chunk))
+    except TypeError:
+        progress_cb()
+```
+
+`video.py` 里 ffmpeg 分支拿不到 chunk，改用 `_notify_bytes(progress_cb, data)`：
+支持 `bytes/bytearray`（`len`）、路径（`stat().st_size`）、`None`（0）。
+**合并分片后传 `None`** —— 文件大小已在写入过程计过，再传路径会重复计数。
+
+`task_manager` 侧：
+
+```python
+PROGRESS_PUSH_INTERVAL = 0.4   # 秒
+
+def tick(nbytes=0):
+    _heartbeat(); _check_cancel()
+    with byte_lock:
+        byte_count[0] += nbytes
+        now = time.monotonic()
+        if now - last_push[0] >= PROGRESS_PUSH_INTERVAL:
+            last_push[0] = now
+            _publish_bytes(task_id, byte_count[0])
+```
+
+**为什么节流**：每个 256KB chunk 都广播会把 SSE 淹掉。
+
+**为什么不落库**：`task.bytes` 是纯增量事件，高频写 SQLite 会撞单写者瓶颈。
+所以 `_publish_bytes` **只发事件不 update**，整体包 try（遥测失败不影响下载）。
+
+### 11.6 字节级速率（前端 `src/byterate.js`）
+
+用**差分**而非"后端直接给速率"：`(本次累计 − 上次累计) / dt`。
+
+两个关键细节：
+
+1. `dt < 0.05s` 的样本**忽略但不丢弃累计值** —— 必须仍更新 `total`，否则下一次
+   差分会把两段量算到一起，出现尖峰。
+2. 曲线按**相对峰值**归一化：图片 2MB 与视频 200MB 差两个数量级，按绝对字节画
+   图片曲线永远贴地。所以 SVG 的 y 轴是 `value / seriesMax`。
+3. `MAX_POINTS = 120` / `STALE_MS = 3000`：超过 3 秒没有新样本，尾部补 0 点，
+   曲线自然回落到基线，而不是停在最后一个高度假装还在传。
+
+纯内存 `Map`，注释里写清为什么**不放进响应式 store**（每秒多次触发 Vue 重渲染）。
+
+### 11.7 跨任务资源库
+
+任务列表回答"我下过什么"，资源库回答"**我现在手上有什么**"。
+
+`database.py` 新增五个函数，其中关键设计：
+
+```python
+def library_filters(q, kind, task_id, album, status="done") -> (where, args)
+def library_count(...)   # 与 library_list 共用 library_filters
+def library_list(...)
+def library_albums(limit=200)
+def library_stats()
+def resource_refs(local_path)
+```
+
+- **`library_filters` 单独抽出**，让 count 与 list 用**完全相同**的条件。
+  分页错位最常见的来源就是两条查询条件写得不一致。
+- **默认 `status="done"`**：资源库是"手上有什么"，不是"所有见过的 URL"。
+- **相册名精确匹配**（不是 `LIKE`）：找 `ABP-123` 不该命中 `ABP-1234`。
+- `q` 搜索用 `_like_pattern` 转义 `%` `_`，配 `ESCAPE '\'`。
+- 每条资源带 `refs`（被多少任务指向），前端显示「共用 ×N」。
+
+**删除语义无需改动**：`task_manager._purge_files` 早已通过
+`db.count_place_refs(rel, local, exclude_task=...)` 做引用计数 —— 删任务连文件删时，
+只要还有别的任务指向该文件就跳过。这是 V28 就做对的事，资源库只是把它显示出来。
+
+前端 `LibraryPanel.vue`：类型 tabs + 搜索 + 相册下拉 + 卡片网格（缩略图走
+`/files/raw?path=`）+ 分页。`App.vue` 加 `view` 切换，记忆在 localStorage。
+
+### 11.8 Pexels 采集器（第二个站点插件，契约验证）
+
+放在 `collectors/stockphotos/`，作为"声明式契约能否撑住第二个站点"的验证。
+
+```
+collectors/stockphotos/
+  __init__.py
+  pexels.py     # GallerySite 声明
+  spider.py     # @register("pexels") PexelsSpider
+```
+
+结论：**契约够用**。`GallerySite` + `@register` + `_match_score` 三件套没有需要
+为第二个站点开口子的地方。差异点（无水印图存在于 `images.pexels.com/photos/<id>/`、
+画质靠 query 参数 `?auto=compress&w=`、无视频变体）全在声明里表达：
+`variants=[...]` 四档、`quality_map={...}`、`video_variants=[]`。
+
+关键词搜索走 `GET api.pexels.com/v1/search`，需 `PEXELS_API_KEY`；缺 key 时**明确
+报错并说清怎么配**，不静默返回空。集合页明确报"暂不支持"（比假装成功好）。
+
+> 注意：`check_site` / `selfcheck_all()` 会把新站点纳入断言。新加站点后
+> `python scripts/selfcheck.py` 必须仍然输出 `ok` —— 这也是它抓到 11.3 两个缺陷的原因。
+
+### 11.9 验证（2026-09-22）
+
+| 项目 | 结果 |
+| --- | --- |
+| `tests/test_features_v32.py` | 30 项全绿 |
+| 全量 `pytest` | **587 passed**（557 → 587） |
+| `verify_output.py` | 40/40 |
+| `verify_hls.py` | 18/18 |
+| `selfcheck.py` | ok（含 xchina CDN 画像未受影响） |
+| `vite build` | 89 modules / 200.07 kB（此前 86 / 191.60 kB） |
+
+测试抓出的 4 个真实缺陷：① Pexels 抢 xchina URL（11.1）；② Pexels 抢 xchina 纯 ID
+（11.2）；③ `check_site` 对 `base_candidate_digits=0` 误判；④ `gid_shape` 缺纯 ID 校验。
+**前两个都是"跑通但结果错"的静默类缺陷，只有靠既有回归测试才暴露。**
+
+### 11.10 新增/改动文件
+
+| 文件 | 性质 |
+| --- | --- |
+| `backend/downloaders/base.py` | 改：ProxyPool 熔断 + 条件回调 |
+| `backend/downloaders/video.py` | 改：`_notify_bytes` |
+| `backend/downloaders/text.py` | 改：字节回调 |
+| `backend/core/task_manager.py` | 改：字节节流 / `_publish_bytes` / `proxy_snapshot` / 记账 |
+| `backend/core/database.py` | 改：`library_*` 五函数 + `resource_refs` |
+| `backend/api/tasks.py` | 改：`/library`、`/library/albums`、`/tasks/{id}/proxy`、`_mask_proxy` |
+| `backend/collectors/gallery_base.py` | 改：`check_site` 两处修正 |
+| `backend/collectors/stockphotos/*` | 新增：Pexels 采集器 |
+| `frontend/src/byterate.js` | 新增：速率差分模块 |
+| `frontend/src/components/LibraryPanel.vue` | 新增：资源库视图 |
+| `frontend/src/{App.vue,api.js,components/TaskDetail.vue,style.css}` | 改：视图切换 / 接口 / 速率曲线 / 代理面板 |
+| `tests/test_features_v32.py` | 新增：30 项 |

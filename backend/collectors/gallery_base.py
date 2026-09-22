@@ -409,13 +409,33 @@ def check_site(site):
             problems.append(
                 f"{name}.seq_format={mtype.seq_format!r} 渲染成 {rendered!r}, 不含序号本身"
             )
-        digits = getattr(site, "base_candidate_digits", None)
-        if digits is not None:
-            try:
-                if int(digits) < 1:
-                    problems.append(f"base_candidate_digits={digits!r} 必须 >= 1")
-            except (TypeError, ValueError):
-                problems.append(f"base_candidate_digits={digits!r} 不是整数")
+
+    # ⚠️ `base_candidate_digits` 的合法下界是 **0**(= 不展开数字后缀), 不是 1。
+    # 字段默认值就是 0, 校验写 <1 会把"我就是不要数字后缀"的站点一律判错 ——
+    # 而那个站点用 `base_candidates` / `base_host_templates` 表达候选也完全合理。
+    # 负数才是真错误(生成 range(1, -1) 这种无意义区间)。
+    digits = getattr(site, "base_candidate_digits", None)
+    if digits is not None:
+        try:
+            if int(digits) < 0:
+                problems.append(f"base_candidate_digits={digits!r} 不能为负")
+        except (TypeError, ValueError):
+            problems.append(f"base_candidate_digits={digits!r} 不是整数")
+
+    # ⚠️ `gid_shape` 必须能被放到**纯 ID 输入**上做 fullmatch —— 那是它最主要的
+    # 用武之地。曾经这里出过一个真实缺陷: 正则按"整条 URL"写(带 ^$ 或含 https),
+    # 于是纯 ID 输入永远匹配不上, 自动识别时站点被误判为"处理不了", 用户粘一串
+    # ID 就落到通用采集器去猜图集(静默 0 资源)。这里拿样本里的纯 ID 形态反查。
+    shape = site.gid_shape
+    if shape:
+        bare = [s[1] for s in samples
+                if isinstance(s, (list, tuple)) and len(s) == 2
+                and isinstance(s[0], str) and "://" not in s[0] and "/" not in s[0]]
+        if bare and not any(re.fullmatch(shape, b or "") for b in bare):
+            problems.append(
+                f"gid_shape={shape!r} 无法匹配纯 ID 样本 {bare!r}; "
+                f"该正则会用 fullmatch 直接作用于纯 ID 输入"
+            )
     return problems
 
 

@@ -68,6 +68,31 @@ def _short(err, limit=180):
     return f"{type(err).__name__}: {err}".replace("\n", " ")[:limit]
 
 
+def _notify_bytes(progress_cb, data):
+    """把"这一笔写了多少字节"报给调用方, 并兼容无参回调。
+
+    data 可以是 bytes(长度直接取), 或文件路径(取文件大小, 用于分片合并、
+    ffmpeg 拉流这类"一次性产出整个文件"的场景)。
+
+    ⚠️ 兼容无参回调是必须的: 测试与第三方下载器常写成 `def cb(): ...`,
+    直接传参会 TypeError, 而它发生在下载循环里 —— 会被当成"下载失败"。
+    """
+    n = None
+    try:
+        if data is None:
+            n = 0
+        elif isinstance(data, (bytes, bytearray)):
+            n = len(data)
+        else:
+            n = Path(data).stat().st_size
+    except OSError:
+        n = 0
+    try:
+        progress_cb(n)
+    except TypeError:
+        progress_cb()
+
+
 def _path_only(url):
     return url.lower().split("?")[0]
 
@@ -190,7 +215,7 @@ class VideoDownloader:
             try:
                 self._ffmpeg_pull(leaf, headers, path, ff)
                 if progress_cb:
-                    progress_cb()
+                    _notify_bytes(progress_cb, path)
                 if log:
                     log(f"ffmpeg 拉流完成: {path.name}")
                 fill_info(info, leaf, "video/mp4")
@@ -260,7 +285,7 @@ class VideoDownloader:
                         shutil.copyfileobj(src, dst, CHUNK)
                     # 长视频几百片, 合并阶段也要能响应"停止"
                     if progress_cb:
-                        progress_cb()
+                        _notify_bytes(progress_cb, p)
         except TaskCancelled:
             merged.unlink(missing_ok=True)
             raise
@@ -353,7 +378,7 @@ class VideoDownloader:
                                 # 每块都回调: 单片可能很大, 只按分片回调的话
                                 # "停止"要等整片下完才生效
                                 if progress_cb:
-                                    progress_cb()
+                                    _notify_bytes(progress_cb, chunk)
                     tmp.replace(part)
                     return
                 except TaskCancelled:
@@ -383,7 +408,9 @@ class VideoDownloader:
                 with clock:
                     counter[0] += 1
                     if progress_cb:
-                        progress_cb()
+                        # 字节数已在每个 chunk 回调时上报过, 这里只做"完成一片"
+                        # 的心跳(顺带响应停止); 传 0 避免同一批字节被计两次
+                        _notify_bytes(progress_cb, None)
 
         if errors:
             # 已下好的分片保留在 parts_dir, 重跑时可续传

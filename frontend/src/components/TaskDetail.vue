@@ -6,6 +6,7 @@ import {
   getLogs,
   getManifest,
   getTask,
+  getTaskProxy,
   pauseTask,
   resumeTask,
   retryFailed,
@@ -14,6 +15,7 @@ import {
 } from "../api";
 import { statusLabel } from "../status";
 import { toast } from "../toast";
+import { clearSeries, currentRate, fmtRate, getSeries, subscribe } from "../byterate";
 import Lightbox from "./Lightbox.vue";
 
 const props = defineProps({ taskId: { type: Number, required: true } });
@@ -52,11 +54,31 @@ const STATUS_TABS = [
 const view = ref("all");
 const viewMode = ref("grid"); // grid | list —— 资源区列表/网格切换
 
-// 速率指示: 详情每 2 秒刷新一次, 用"已下载资源数"的差值估算采集速率(张/分)。
-// 不是真实字节速率(后端进度是百分比, 不回传字节), 但足够让人看出"还在动、快不快"。
+// 速率指示(两种口径, 各管一件事):
+//   * ratePerMin —— 采集**数量**速率(张/分), 用两次刷新的"已下载资源数"差值估算。
+//     它告诉你"还剩多少要下完", 与文件大小无关。
+//   * 字节速率曲线 —— 见下方 byteSeries / byteRate, 由后端 task.bytes 事件驱动,
+//     反映**真实带宽占用**。图集里单张图很小、视频单片很大, 两者差别只有它能体现。
 const ratePerMin = ref(0);
 let lastDone = null;
 let lastTs = 0;
+
+// ---- 字节级实时速率(后端节流推送累计字节, 前端换算成瞬时速率) ----
+const byteSeries = ref([]);
+const byteRate = ref(0);
+const proxyInfo = ref(null);
+let unsubBytes = null;
+function refreshBytes() {
+  byteSeries.value = getSeries(props.taskId);
+  byteRate.value = currentRate(props.taskId);
+}
+function startByteWatch() {
+  if (unsubBytes) return;
+  unsubBytes = subscribe((id) => {
+    if (id === props.taskId) refreshBytes();
+  });
+  refreshBytes();
+}
 const visible = computed(() => {
   const rs = task.value?.resources || [];
   if (view.value === "all") return rs;
@@ -104,6 +126,31 @@ function badgeClass(s) {
   if (s === "filtered") return "filtered";
   return "pending";
 }
+
+// 速率曲线的 SVG 几何: 把速率序列归一化到 300x44 的画布。
+// 用**相对峰值**而不是绝对字节来定高: 一张图 2MB 与一段视频 200MB 量级差两个
+// 数量级, 按绝对值画的话图片任务的曲线会永远贴地。相对值至少能看出"快慢变化"。
+const SPARK_W = 300;
+const SPARK_H = 44;
+const spark = computed(() => {
+  const pts = byteSeries.value;
+  if (pts.length < 2) return { line: "", area: "", peak: 0 };
+  const peak = Math.max(...pts.map((p) => p.rate), 1);
+  const step = SPARK_W / (pts.length - 1);
+  const coords = pts.map((p, i) => {
+    const x = i * step;
+    // 留 4px 内边距, 否则峰值会贴着上边缘被裁
+    const y = SPARK_H - 4 - (p.rate / peak) * (SPARK_H - 8);
+    return [x, y];
+  });
+  const line = coords
+    .map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`)
+    .join(" ");
+  const area =
+    `${line} L${SPARK_W},${SPARK_H} L0,${SPARK_H} Z`;
+  return { line, area, peak };
+});
+
 const dupCount = computed(
   () => (task.value?.resources || []).filter((r) => r.duplicate_of).length
 );
@@ -151,6 +198,12 @@ async function load() {
   try {
     task.value = await getTask(props.taskId);
     logs.value = await getLogs(props.taskId);
+    // 代理健康只在任务运行时才有内容, 顺手拉一下(失败不影响主流程)
+    try {
+      proxyInfo.value = await getTaskProxy(props.taskId);
+    } catch (e) {
+      proxyInfo.value = null;
+    }
     // 估算采集速率: 用两次刷新间"已下载资源数"的增量
     const done = (task.value?.resources || []).filter((r) => r.status === "done").length;
     const now = Date.now();
@@ -260,10 +313,18 @@ watch(
     clearInterval(timer);
     load();
     timer = setInterval(load, 2000);
+    // 换任务时速率序列也换一套(采样表按 taskId 分开存, 直接读新的即可)
+    startByteWatch();
   },
   { immediate: true }
 );
-onUnmounted(() => clearInterval(timer));
+onUnmounted(() => {
+  clearInterval(timer);
+  if (unsubBytes) unsubBytes();
+  // 抽屉关闭: 这份曲线没人看了, 清掉避免长会话里内存持续增长。
+  // (任务还在跑的话, 重新打开抽屉会从头累积 —— 可接受)
+  clearSeries(props.taskId);
+});
 </script>
 
 <template>
@@ -311,6 +372,19 @@ onUnmounted(() => clearInterval(timer));
           <div class="stat-line" v-if="Object.keys(stat).length">
             <span v-for="(v, k) in stat" :key="k" class="stat-item" :class="k">{{ k }} {{ v }}</span>
             <span v-if="ratePerMin > 0 && active()" class="stat-item rate">≈ {{ ratePerMin }} 张/分</span>
+          </div>
+          <!-- 字节级实时速率: 由后端 task.bytes 事件驱动, 反映真实带宽 -->
+          <div class="spark-box" v-if="active() && byteSeries.length > 1">
+            <div class="spark-head">
+              <span class="sp-lb">实时速率</span>
+              <b class="sp-now">{{ fmtRate(byteRate) }}</b>
+              <span class="grow"></span>
+              <span class="sp-peak">峰值 {{ fmtRate(spark.peak) }}</span>
+            </div>
+            <svg class="spark" :viewBox="`0 0 ${SPARK_W} ${SPARK_H}`" preserveAspectRatio="none">
+              <path class="sp-area" :d="spark.area" />
+              <path class="sp-line" :d="spark.line" />
+            </svg>
           </div>
           <div class="dup-report" v-if="dupCount">
             <span class="di">⚠️</span>
@@ -418,6 +492,25 @@ onUnmounted(() => clearInterval(timer));
             <div class="k" v-if="task.download_dir">下载目录</div><div class="v mono" v-if="task.download_dir">{{ task.download_dir }}</div>
             <div class="k">重试次数</div><div class="v">{{ task.retry_count }}</div>
           </div>
+          <!-- 代理健康: 只对运行中的任务有意义(任务结束后条目回收) -->
+          <div class="proxy-box" v-if="proxyInfo && proxyInfo.configured">
+            <div class="pb-head">
+              代理池 <em>{{ proxyInfo.configured }} 条</em>
+              <span class="grow"></span>
+              <span class="pb-spec mono">{{ proxyInfo.masked_spec }}</span>
+            </div>
+            <div class="pb-row" v-for="(l, i) in proxyInfo.lines" :key="i">
+              <span class="pb-dot" :class="l.blocked ? 'bad' : 'ok'"></span>
+              <span class="pb-url mono">{{ l.proxy }}</span>
+              <span class="grow"></span>
+              <span class="pb-state">
+                {{ l.blocked ? `冷却中 ${l.blocked_for}s` : (l.fails ? `失败 ${l.fails} 次` : "正常") }}
+              </span>
+            </div>
+            <div class="pb-note" v-if="!proxyInfo.lines.length">
+              任务未在运行, 无法显示实时状态（熔断信息只存在于运行期）。
+            </div>
+          </div>
           <div class="progress-track" style="width:100%; margin:10px 0;">
             <span class="progress-fill" :style="{ width: (task.progress || 0) + '%' }"></span>
           </div>
@@ -501,4 +594,33 @@ onUnmounted(() => clearInterval(timer));
 .fr-bar { height: 7px; border-radius: 4px; background: var(--panel); overflow: hidden; }
 .fr-fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #e0654f, #c94a35); transition: width .3s ease; }
 .fr-n { text-align: right; color: var(--text); }
+/* 字节级实时速率曲线 */
+.spark-box {
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+  margin-bottom: 10px; background: var(--panel-2);
+}
+.spark-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.spark-head .grow { flex: 1; }
+.sp-now { color: var(--accent); font-size: 13px; font-variant-numeric: tabular-nums; }
+.sp-peak { font-variant-numeric: tabular-nums; }
+.spark { display: block; width: 100%; height: 44px; overflow: visible; }
+.sp-line { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.sp-area { fill: color-mix(in srgb, var(--accent) 18%, transparent); stroke: none; }
+/* 代理池健康 */
+.proxy-box {
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+  margin-top: 10px; background: var(--panel-2);
+}
+.pb-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.pb-head em { font-style: normal; color: var(--text); }
+.pb-head .grow { flex: 1; }
+.pb-spec { font-size: 11px; opacity: .8; word-break: break-all; }
+.pb-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin: 4px 0; }
+.pb-row .grow { flex: 1; }
+.pb-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.pb-dot.ok { background: var(--ok); }
+.pb-dot.bad { background: var(--err); }
+.pb-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.pb-state { color: var(--muted); flex: none; }
+.pb-note { font-size: 12px; color: var(--muted); }
 </style>

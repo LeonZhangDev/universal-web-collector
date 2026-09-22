@@ -5,7 +5,7 @@ import queue
 import zipfile
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -599,6 +599,20 @@ def env_diagnose():
         "hint": None if writable else "检查目录是否存在、当前用户是否有写权限",
     })
 
+    # ---- 代理 ----
+    # 只报"配了什么、有几条", 不做主动连通性探测 —— 诊断端点会被前端频繁调用,
+    # 每次真去连一遍代理既慢又会在代理慢时把面板拖住。真正的健康信息由下载
+    # 过程中的熔断状态提供(见 runtime/proxy 端点)。
+    proxy_env = getattr(settings, "proxy", None) or ""
+    items.append({
+        "key": "proxy", "label": "代理",
+        "level": "ok",
+        "value": f"环境变量已设置" if proxy_env else "未设置(直连)",
+        "detail": _mask_proxy(proxy_env),
+        "hint": None if proxy_env else
+                "需要走代理时设环境变量 UWC_PROXY, 或在创建任务时填写任务级代理",
+    })
+
     return {
         "items": items,
         "all_ok": all(i["level"] == "ok" for i in items),
@@ -606,6 +620,30 @@ def env_diagnose():
         "usable": not any(i["level"] == "fail" for i in items),
         "checked_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def _mask_proxy(spec):
+    """代理串脱敏: 只留协议与主机端口, 抹掉 user:pass。
+
+    诊断面板会展示这段文本, 代理凭据(常是付费账号)不该出现在屏幕上,
+    更不该被截图外传。
+    """
+    if not spec:
+        return ""
+    out = []
+    for p in str(spec).split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            u = urlparse(p)
+            if u.hostname:
+                out.append(f"{u.scheme}://{u.hostname}:{u.port or ''}")
+            else:
+                out.append("***")
+        except Exception:
+            out.append("***")
+    return ", ".join(out)
 
 
 @router.get("/tasks", response_model=TaskListOut)
@@ -646,6 +684,49 @@ def list_tasks(
 
 # ⚠️ 必须声明在 /tasks/{task_id} **之前**: FastAPI 按注册顺序匹配, 否则
 # "storage" 会被当成 task_id 去解析成 int 而返回 422。
+@router.get("/library")
+def resource_library(
+    q: Optional[str] = Query(None, description="按本地路径或来源 URL 模糊搜索"),
+    kind: Optional[str] = Query(None, description="按类型筛选: image / video / text"),
+    album: Optional[str] = Query(None, description="按相册名精确筛选"),
+    task_id: Optional[int] = Query(None, description="只看某个任务的产出"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """跨任务资源库: 按相册 / 类型 / 关键词浏览**已落盘**的产物。
+
+    与 `/tasks/{id}/resources` 的区别: 那个是"这个任务采到了什么", 这个是
+    "我手上有什么"。同一张图片被 sha256 去重复用过时会同时出现在两个任务下,
+    资源库会**各列一条**并给出 `refs`(被几个任务引用) —— 这是有意的: 用户
+    想删的是"某个任务的那条记录", 而真删文件与否由 refs 决定(见 DELETE 端点)。
+    """
+    total = db.library_count(q=q, kind=kind, task_id=task_id, album=album)
+    offset = (page - 1) * page_size
+    rows = db.library_list(
+        q=q, kind=kind, task_id=task_id, album=album,
+        limit=page_size, offset=offset,
+    )
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["refs"] = db.resource_refs(d.get("local_path"))
+        items.append(d)
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+        "stats": db.library_stats(),
+    }
+
+
+@router.get("/library/albums")
+def library_albums(limit: int = Query(200, ge=1, le=1000)):
+    """有产物的相册名单(供资源库筛选下拉)。"""
+    return {"items": [dict(r) for r in db.library_albums(limit)]}
+
+
 @router.get("/tasks/storage")
 def storage_overview():
     """任务与产出的整体占用概览, 供"一键清理"界面预检。"""
@@ -927,6 +1008,37 @@ def retry_failed(task_id: int):
         if ok:
             retried.append(r["id"])
     return RetryFailedOut(task_id=task_id, retried=retried, count=len(retried))
+
+
+@router.get("/tasks/{task_id}/proxy")
+def task_proxy(task_id: int):
+    """任务级代理池的实时健康(轮换顺序 + 熔断状态)。
+
+    只对**运行中**的任务有意义: 任务结束后条目回收, 返回空 lines 且
+    running=False —— 前端据此不显示这一块, 而不是显示一堆"正常"骗人。
+    """
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    lines = task_manager.proxy_snapshot(task_id)
+    # 从 options 里把配置读回来, 好让前端在没有活动 worker 时也能告诉用户
+    # "这个任务配了几条线"(否则一块空白让人以为没配)。
+    spec = ""
+    try:
+        task = db.get_task(task_id)
+        raw = task["options"] if task else None
+        if raw:
+            opts = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            spec = (opts or {}).get("proxy") or ""
+    except Exception:
+        spec = ""
+    return {
+        "task_id": task_id,
+        "running": bool(lines),
+        "configured": len([p for p in str(spec).split(",") if p.strip()]),
+        "masked_spec": _mask_proxy(spec),
+        "lines": lines,
+    }
 
 
 # ---- 目录选择 ----

@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import CreatePanel from "./components/CreatePanel.vue";
 import TaskTable from "./components/TaskTable.vue";
 import TaskDetail from "./components/TaskDetail.vue";
 import EnvDiagnose from "./components/EnvDiagnose.vue";
 import StatsPanel from "./components/StatsPanel.vue";
+import LibraryPanel from "./components/LibraryPanel.vue";
 import NotificationCenter from "./components/NotificationCenter.vue";
 import ToastHost from "./components/ToastHost.vue";
 import {
@@ -29,6 +30,7 @@ import {
 } from "./api";
 import { groupToStatuses } from "./status";
 import { toast } from "./toast";
+import { pushByteSample } from "./byterate";
 
 // ---- 任务列表(分页 / 搜索 / 筛选) ----
 const query = ref({ q: "", status: "", page: 1, page_size: 20, collector: "" });
@@ -42,6 +44,24 @@ const activeId = ref(0);
 
 const collectors = ref(["auto"]);
 const config = ref({});
+// 主视图切换: 任务列表 / 资源库。记忆选择, 高频用户不用每次点回来。
+const view = ref("tasks");
+const VIEW_KEY = "uwc.view.v1";
+try {
+  const savedView = localStorage.getItem(VIEW_KEY);
+  if (savedView === "tasks" || savedView === "library") view.value = savedView;
+} catch (e) {
+  /* ignore */
+}
+watch(view, (v) => {
+  try {
+    localStorage.setItem(VIEW_KEY, v);
+  } catch (e) {
+    /* ignore */
+  }
+  // 切走任务列表时把抽屉关掉: 资源库是独立视图, 留一个浮在别处的抽屉很怪
+  if (v !== "tasks") selectedId.value = null;
+});
 
 let es = null;
 let reloadTimer = null;
@@ -161,6 +181,14 @@ function connectSSE() {
       // 新任务不在当前页: 仅在第一页无筛选时自动刷新, 避免打断用户翻页
       scheduleReload();
     }
+  });
+  // 字节级吞吐: 后端按 ~0.4s 节流推累计字节数, 这里换算成瞬时速率并保留
+  // 一段时间序列, 供详情页画真实速率曲线。纯内存、不落库。
+  es.addEventListener("task.bytes", (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      pushByteSample(d.task_id, d.bytes, d.ts);
+    } catch (_) {}
   });
 }
 
@@ -361,7 +389,20 @@ onUnmounted(() => {
 
   <StatsPanel />
 
-  <div class="card">
+  <div class="view-switch">
+    <button
+      class="vtab"
+      :class="{ on: view === 'tasks' }"
+      @click="view = 'tasks'"
+    >任务列表</button>
+    <button
+      class="vtab"
+      :class="{ on: view === 'library' }"
+      @click="view = 'library'"
+    >资源库</button>
+  </div>
+
+  <div class="card" v-show="view === 'tasks'">
     <div class="list-bar">
       <span class="lbl">任务列表</span>
       <span class="summary muted" v-if="storage">
@@ -401,6 +442,8 @@ onUnmounted(() => {
     />
     <p class="kbd-hint">快捷键: <b>/</b> 搜索 · <b>j/k</b> 上下选 · <b>Enter</b> 打开 · <b>Space</b> 暂停/继续 · <b>Esc</b> 关闭</p>
   </div>
+
+  <LibraryPanel v-if="view === 'library'" />
 
   <TaskDetail
     v-if="selectedId"

@@ -143,6 +143,7 @@ def resolve_collector(url, fallback="generic"):
 
 # 注册内置采集器(导入 spider 模块触发 @register)
 from .generic.spider import GenericSpider  # noqa: E402,F401
+from .stockphotos.spider import PexelsSpider  # noqa: E402,F401
 from .xchina.spider import XChinaSpider  # noqa: E402,F401
 from .xchina.gallery import XChinaGallerySpider  # noqa: E402,F401
 from .xchina.spider_video import XChinaVideoSpider  # noqa: E402,F401

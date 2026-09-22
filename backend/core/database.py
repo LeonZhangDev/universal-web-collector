@@ -658,6 +658,128 @@ def get_resources(task_id):
     return query("SELECT * FROM resources WHERE task_id=? ORDER BY id", (task_id,))
 
 
+def library_filters(q=None, kind=None, task_id=None, album=None, status="done"):
+    """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
+
+    单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
+    是分页错位最常见的来源(总数与页内容口径不一致, 表现为"翻到最后一页
+    数量对不上", 很难察觉)。
+
+    status 默认 "done": 资源库只该显示真正落盘的产物。把 failed/pending 也列
+    出来会让"库"变成"所有见过的 URL", 那不是浏览而是调试。
+    """
+    where = ["1=1"]
+    args = []
+
+    if status:
+        where.append("r.status=?")
+        args.append(status)
+    else:
+        # 显式传 None/"" 表示"不限状态"(供调用方需要时使用)
+        pass
+
+    if task_id:
+        where.append("r.task_id=?")
+        args.append(task_id)
+
+    if kind and kind not in ("all", ""):
+        where.append("r.type=?")
+        args.append(kind)
+
+    if album:
+        # 按相册名匹配: 相册名落在 tasks.name, 用精确匹配 —— 模糊匹配会让
+        # "ABP-123" 同时命中 "ABP-1234", 用户看到一堆不相干的东西。
+        where.append("t.name=?")
+        args.append(album)
+
+    if q:
+        # 同时搜本地路径与来源 URL: 用户有时记得文件名, 有时只记得站点。
+        # ⚠️ `%` `_` 必须转义, 否则搜 "100%" 会变成"匹配任意串"。
+        pat = _like_pattern(q)
+        where.append("(r.local_path LIKE ? ESCAPE '\\' OR r.url LIKE ? ESCAPE '\\')")
+        args.extend([pat, pat])
+
+    return " AND ".join(where), args
+
+
+def library_count(q=None, kind=None, task_id=None, album=None, status="done"):
+    """资源库总数(与 library_list 同一口径)。"""
+    where, args = library_filters(q, kind, task_id, album, status)
+    row = query_one(
+        f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
+        f"WHERE {where}",
+        tuple(args),
+    )
+    return row["n"] if row else 0
+
+
+def library_list(q=None, kind=None, task_id=None, album=None, status="done",
+                 limit=50, offset=0):
+    """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。"""
+    where, args = library_filters(q, kind, task_id, album, status)
+    rows = query(
+        f"""SELECT r.*, t.name AS task_name, t.collector AS collector,
+                   t.created_time AS task_time
+            FROM resources r JOIN tasks t ON t.id = r.task_id
+            WHERE {where}
+            ORDER BY r.id DESC LIMIT ? OFFSET ?""",
+        tuple(args) + (int(limit), int(offset)),
+    )
+    return rows
+
+
+def library_albums(limit=200):
+    """有产物的相册名单(供资源库的相册筛选下拉)。
+
+    只列出**真的有 done 资源**的任务, 否则下拉里会出现一堆点进去空的条目。
+    """
+    return query(
+        """SELECT t.name AS album, COUNT(r.id) AS n,
+                  COALESCE(SUM(r.size), 0) AS bytes
+           FROM tasks t JOIN resources r ON r.task_id = t.id
+           WHERE r.status='done' AND t.name IS NOT NULL AND t.name <> ''
+           GROUP BY t.name
+           ORDER BY MAX(r.id) DESC LIMIT ?""",
+        (int(limit),),
+    )
+
+
+def library_stats():
+    """资源库概览: 资源数 / 体积 / 相册数 / 类型分布。"""
+    row = query_one(
+        """SELECT COUNT(*) AS n, COALESCE(SUM(r.size), 0) AS bytes,
+                  COUNT(DISTINCT t.name) AS albums
+           FROM resources r JOIN tasks t ON t.id = r.task_id
+           WHERE r.status='done'"""
+    )
+    by_kind = query(
+        """SELECT r.type AS type, COUNT(*) AS n, COALESCE(SUM(r.size),0) AS bytes
+           FROM resources r WHERE r.status='done' GROUP BY r.type ORDER BY n DESC"""
+    )
+    return {
+        "resources": row["n"] if row else 0,
+        "bytes": row["bytes"] if row else 0,
+        "albums": row["albums"] if row else 0,
+        "by_kind": [dict(r) for r in by_kind],
+    }
+
+
+def resource_refs(local_path):
+    """同一个物理文件被几个资源记录引用(跨任务去重后会 >1)。
+
+    ⚠️ 这是**删除语义**的关键: sha256 去重时后到的任务只是复用路径、不复制
+    文件, 所以删任务时不能无脑删文件 —— 一删就把先到的那个任务也掏空了。
+    调用方按这个计数决定"删到最后一份才真删文件"。
+    """
+    if not local_path:
+        return 0
+    row = query_one(
+        "SELECT COUNT(*) AS n FROM resources WHERE local_path=? AND status='done'",
+        (local_path,),
+    )
+    return row["n"] if row else 0
+
+
 def get_resource(resource_id):
     return query_one("SELECT * FROM resources WHERE id=?", (resource_id,))
 

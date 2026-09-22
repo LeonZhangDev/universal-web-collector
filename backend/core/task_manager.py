@@ -114,6 +114,11 @@ def _eta(count, url):
 # 退出; 但 HTTP 请求不能因为一个卡死的 worker 一直挂着, 所以给个上限。
 DELETE_SETTLE_SECONDS = 5.0
 
+# 字节级进度推送的最小间隔(秒)。下载层每个 256KB chunk 都回调一次 tick,
+# 一个 100MB 文件就是 400 次; 前端一秒顶多画一帧, 全推出去只是把 SSE 通道
+# 撑满(还会挤掉日志事件)。0.4s ≈ 每秒 2.5 个采样点, 画曲线足够。
+PROGRESS_PUSH_INTERVAL = 0.4
+
 
 class TaskStatus:
     PENDING = "pending"
@@ -800,6 +805,24 @@ class TaskManager:
         with self._active_lock:
             return task_id in self._active
 
+    def proxy_snapshot(self, task_id):
+        """该任务的代理池健康快照; 没配代理或任务已结束返回空列表。
+
+        任务跑完后条目会被回收, 此时返回空 —— 代理健康是运行期信息,
+        没有活动 worker 就没有"当下哪条线在冷却"可说。
+        """
+        entry = self._entry(task_id)
+        if not entry:
+            return []
+        pool = entry.get("proxy_pool")
+        if pool is None or pool.empty:
+            return []
+        try:
+            return pool.snapshot()
+        except Exception:
+            # 诊断信息收集失败不该影响任何流程
+            return []
+
     def _cancelled(self, task_id):
         e = self._entry(task_id)
         return bool(e and e["cancel"].is_set())
@@ -1057,6 +1080,12 @@ class TaskManager:
         # 下游 session=None, 下载器继续用全局 SESSION —— 不能在这里就把全局
         # 代理清掉, 否则"没配代理的任务"会失去环境变量里的代理。
         proxy_pool = ProxyPool((self._options(task_id) or {}).get("proxy"))
+        # 存进活动条目, 供 /tasks/{id}/proxy 展示熔断状态(哪条线在冷却、失败几次)。
+        # 只放内存: 代理健康是**本次运行**的状态, 重启后重算更符合直觉 ——
+        # 把冷却时间持久化会让"重启一下"变成无效操作。
+        entry = self._entry(task_id)
+        if entry is not None:
+            entry["proxy_pool"] = proxy_pool
         counter = [0]
         counter_lock = threading.Lock()
 
@@ -1145,15 +1174,38 @@ class TaskManager:
             self._safe_log(task_id, f"skip [{r['type']}] no downloader: {r['url']}")
             return
 
-        def tick():
+        # 字节级进度: 每个资源下载时把"已写字节"累加到一个共享计数, 供前端画
+        # 真实速率曲线。⚠️ 必须是**本次任务下载期间**的增量, 不能拿 resources.size
+        # 求和 —— 那里面混着去重复用的老文件, 会让曲线在复用瞬间跳一个假峰。
+        byte_lock = threading.Lock()
+        byte_count = [0]
+        # 推送节流: 见 tick() 内说明
+        last_push = [0.0]
+
+        def tick(nbytes=0):
             """下载过程中的心跳: 顺带检查取消, 让停止操作立刻生效。
 
             只检查资源边界是不够的 —— 一个 500MB 的视频会一路下完才退出,
             用户点了"停止"却要等几分钟。借 progress_cb 在每个数据块后判断,
             代价是每个 chunk 一次 Event.is_set()(纳秒级)。
+
+            nbytes: 本 chunk 的字节数(下载层传入), 用于累计真实吞吐。
             """
             self._heartbeat(task_id)
             self._check_cancel(task_id)
+            if not nbytes:
+                return
+            with byte_lock:
+                byte_count[0] += nbytes
+                total = byte_count[0]
+            # ⚠️ 每个 chunk 都推一次事件会淹掉 SSE 通道(256KB 一个 chunk, 一个
+            # 100MB 文件就是 400 次广播, 而前端 1 秒最多画一次)。按时间节流,
+            # 保证曲线采样密度足够又不会把事件队列撑爆。
+            now = time.monotonic()
+            if now - last_push[0] < PROGRESS_PUSH_INTERVAL:
+                return
+            last_push[0] = now
+            self._publish_bytes(task_id, total)
 
         try:
             headers = json.loads(r["headers"] or "{}")
@@ -1193,8 +1245,10 @@ class TaskManager:
             # 所以只在真有代理时才传 —— 无代理是常态路径, 不该因为多传一个
             # 关键字参数把注入式测试/第三方下载器打挂。
             dl_kwargs = {}
+            picked = None
             if proxy_pool is not None and not proxy_pool.empty:
-                dl_kwargs["session"] = make_proxy_session(proxy_pool.pick(rid))
+                picked = proxy_pool.pick(rid)
+                dl_kwargs["session"] = make_proxy_session(picked)
             path, sha = downloader.download(
                 r["url"],
                 referer=referer,
@@ -1210,6 +1264,11 @@ class TaskManager:
             meta = {"resolved_url": info.get("resolved_url"),
                     "content_type": info.get("content_type")}
             meta = {k: v for k, v in meta.items() if v}
+            # 代理健康: 这个资源下成功了, 说明这条线是通的 —— 清零它的失败计数
+            # (半开状态下即"恢复")。放这里而不是 try 之后, 是因为要区分
+            # "下载失败" 与 "写库失败"。
+            if proxy_pool is not None and picked:
+                proxy_pool.note_success(picked)
             existing = db.find_by_hash(sha)
             owned = True
             # 感知比对只在**任务内**进行, 所以字节级命中别的任务时, 下面那次解码
@@ -1294,6 +1353,10 @@ class TaskManager:
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"{r['url']}: {e}", "error")
         except Exception as e:
+            # 代理健康: 连续失败达阈值就把这条线熔断一段时间, 后续资源自动换线。
+            # 只在**真的走完重试链仍失败**时记账 —— 中间某次重试失败不代表线不好。
+            if proxy_pool is not None and picked:
+                proxy_pool.note_failure(picked)
             db.update_resource(rid, status="failed")
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"fail {r['url']}: {describe(e)}", "error")
@@ -1425,6 +1488,23 @@ class TaskManager:
         events.publish(
             "resource.updated", {"task_id": task_id, "id": rid, "status": status}
         )
+
+    def _publish_bytes(self, task_id, total_bytes):
+        """广播任务的累计已下载字节数, 供前端画实时速率曲线。
+
+        ⚠️ 这是一条**纯增量**事件, 不落库: 它每秒来好几条, 写进 SQLite 会把
+        写-写单写者那条瓶颈撑爆(见 database 的 _retry_write 说明)。前端在
+        内存里滚动累积, 断线重连后从头再来即可 —— 曲线丢几个点无所谓,
+        而为了它去写库会影响所有任务的进度。
+        """
+        try:
+            events.publish(
+                "task.bytes",
+                {"task_id": task_id, "bytes": int(total_bytes),
+                 "ts": time.time()},
+            )
+        except Exception:
+            pass  # 遥测失败不能影响下载
 
     def _safe_log(self, task_id, message, level="info"):
         try:

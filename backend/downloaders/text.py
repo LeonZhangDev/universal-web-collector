@@ -80,5 +80,10 @@ class TextDownloader:
         data = content.encode("utf-8")
         path.write_bytes(data)
         if progress_cb:
-            progress_cb()
+            # 传字节数, 与流式下载保持同一种回调契约(否则文本资源的下载
+            # 字节数永远不计入速率曲线, 曲线会比实际进度矮一截)
+            try:
+                progress_cb(len(data))
+            except TypeError:
+                progress_cb()
         return path, hashlib.sha256(data).hexdigest()

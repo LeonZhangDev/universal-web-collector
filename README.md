@@ -44,6 +44,9 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | GET | /collectors/resolve | **URL -> 采集器**(纯字符串判定, 不打网络请求), 用于"已识别为 X"回显 |
 | GET | /tasks | 任务列表, 支持 `q`(搜索) / `status`(可重复, 兼容组代号) / `collector` / `page` / `page_size`, 返回 `{items,total,page,page_size,pages}` |
 | GET | /tasks/stats | 采集统计: 总量 / 按状态 / 按采集器 / 近 30 天日期序列 / 失败原因聚合 / 去重报表 |
+| GET | /library | **跨任务资源库**: `q`(搜索) / `kind`(image,text) / `album`(相册名精确匹配) / `task_id` / `page` / `page_size`; 默认只列 `done` 资源, 每条带 `refs`(被多少任务共用) |
+| GET | /library/albums | 资源库内出现过的相册名(仅含有已完成资源的相册) |
+| GET | /tasks/{id}/proxy | 该任务代理池状态: 脱敏 spec + 每线路 `{proxy,fails,blocked,blocked_for}` |
 | GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
 | GET | /env/diagnose | 环境诊断: Python / 浏览器 / ffmpeg / 磁盘 / 下载目录 五项 ok/warn/fail + 修复提示 |
 | GET | /tasks/{id} | 任务详情 + 资源 |
@@ -68,7 +71,7 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | GET | /sessions/login/{id} | 查询登录进度 |
 | POST | /sessions/login/{id}/stop | 收尾并保存 storage_state |
 | DELETE | /sessions/{domain} | 删除该站登录态 |
-| GET | /events | SSE 实时推送(task.updated/task.log/resource.updated) |
+| GET | /events | SSE 实时推送(task.updated/task.log/resource.updated/task.bytes) |
 | GET | /files/{task_id}/{file} | 下载文件(限定在该任务输出目录内) |
 | GET | /config | 默认下载目录 + 可选资源类型 |
 | GET | /fs/browse | 浏览本机目录, 供前端目录选择器使用 |
@@ -107,6 +110,13 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 每个任务独占一个会话(不共享全局连接池), 所以任务之间不会互相污染代理设置。
 不填时下载器继续用全局 `SESSION`(含 `UWC_PROXY`) —— 不会把环境变量里的代理清掉。
 
+线路不是平均轮换就算完: 同一条线路**连续失败 3 次即熔断**, 冷却 300 秒, 期间 `pick()`
+会跳过它选下一条; 冷却到期自动半开放出(保留失败计数, 再失败一次立刻重新熔断)。
+成功的下载会清零该线路的失败计数。冷却中**不再需要健康检查线程** —— 到期即放行,
+下一次真实请求本身就是探针。全池都在冷却时退化为按序号返回(故障多半不在代理上,
+直接返回 `None` 会让任务彻底停摆)。熔断状态只放内存不落库: 进程重启即重算, 更符合直觉。
+运行时可用 `GET /tasks/{id}/proxy` 看到每条线路的 `fails` / `blocked` / `blocked_for`。
+
 ### 采集器自动识别
 
 `collector` 缺省就是 `"auto"`: 后端按 URL 形态挑一个采集器, **不需要用户
@@ -123,6 +133,9 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | `https://xchina.co/model/id-601190f157fe7.html` | `xchina_aggregate` (分数 100, 模特/演员落地页) |
 | `https://xchina.co/models.html` / `/models/type-7.html` | `xchina_aggregate` (分数 100, 索引页) |
 | `https://xchina.co/videos/model-601190f157fe7.html` | `xchina_aggregate` (分数 100, 全量列表页) |
+| `https://images.pexels.com/photos/1234567/pexels-photo-1234567.jpeg` | `pexels` (分数 50, 资源直链) |
+| `https://www.pexels.com/photo/xxx-1234567/` | `pexels` (分数 100, 单图页) |
+| `1234567`(纯数字 ID) | `pexels` (分数 10) |
 | `https://example.com/a/b` | `generic`(没有专用采集器认领) |
 | `随便打几个字` | 无法识别 -> 400 "请手动选择采集器" |
 
@@ -136,6 +149,13 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
    可能指向不同采集器, 任务行为不再可复现。
 3. **结论必须回显且可覆盖** —— 界面在输入框失焦时调 `/collectors/resolve`
    显示"已识别为 X"; 认不出来或结果不唯一会明确提示。手选永远优先。
+
+> ⚠️ **多个采集器抢同一个输入时, `match_score` 必须各退一步。** 纯 ID 样本是歧义重灾区:
+> 通用判据 `[0-9A-Za-z_-]{6,}` 什么都能装, xchina 的 `6aa5136f606fe` 和 Pexels 的
+> `1234567` 都满足。如果两站同分, 最终按采集器名字字典序决胜 —— `pexels` 排在
+> `xchina_gallery` 前面, 用户粘一个 xchina 图集 ID 会被静默送去 Pexels。
+> 所以新采集器在 `match_score` 里必须用自己的 `gid_shape` 再对纯 ID 把关一次
+> (`if not _BARE_ID.fullmatch(raw): return None`), 而不是只依赖通用正则。
 
 `name_template` 可用占位符: `{site}` `{host}` `{album}` `{seq}` `{seq4}`
 `{ext}` `{type}` `{id}`, 支持 `/` 分层; 含 `..` 或绝对路径分隔符的模板
@@ -350,10 +370,48 @@ python scripts/selfcheck.py --reset-profile
 对称: 手选是用户已表过的态, 站点可能刚换 ID 格式而我们比用户知道得晚。提示会
 出现在创建响应与预告面板里, **任务照常创建**。
 
+## 跨任务资源库 / 实时速率 / 代理熔断(V32)
+
+### 跨任务资源库
+
+任务列表回答"我下过什么", 资源库回答"**我现在手上有什么**" —— 同一个文件可能被多个
+任务引用(增量续采、同一图集重复创建), 资源库按**内容**聚合, 不按任务。
+
+- 入口: 顶部「任务列表 / 资源库」切换(`App.vue` 的 `view`, 记忆在 `localStorage`)。
+- 筛选: `q` 搜索(文件名/路径)、`kind`(图片/文本)、`album`(相册名)、`task_id`。
+  **默认只列 `status="done"`** —— 资源库是"手上有什么", 不是"所有见过的 URL"。
+- 相册名是**精确匹配**而非 `LIKE`: 找 `ABP-123` 不该命中 `ABP-1234`。
+- 每条资源带 `refs`(被多少个任务指向), 卡片上以「共用 ×N」角标显示。
+- `library_filters()` 把筛选条件抽成单一函数, `library_count` 与 `library_list`
+  共用同一份 WHERE —— 分页错位几乎都源于两条查询条件不一致。
+- 删除语义**未变**: `task_manager._purge_files` 早已用
+  `db.count_place_refs(rel, local, exclude_task=...)` 做引用计数 —— 删任务连文件删时,
+  只要还有别的任务指向该文件就跳过。所以资源库不需要新的删除规则。
+
+### 字节级实时速率曲线
+
+后端 `GET /events` 新增 `task.bytes` 事件, 前端据此画真实 sparkline。
+
+- 下载层 `progress_cb(nbytes)` 传**本 chunk 字节数**, 用 `try/except TypeError`
+  兼容无参回调(老测试替身写的是 `def cb(): ...`)。
+- **推送按 0.4 秒节流**(`PROGRESS_PUSH_INTERVAL`), 否则每个 256KB chunk 都广播一次
+  会把 SSE 淹掉。
+- `task.bytes` 事件**只走内存不长库** —— 高频写 SQLite 会撞上单写者瓶颈。
+- 前端 `byterate.js` 用**差分**(本次累计 − 上次累计)/dt 得瞬时速率;
+  `dt < 0.05s` 的样本忽略但**仍然更新累计值**, 否则下一次差分会把两段量算到一起。
+- 曲线按**相对峰值**归一化: 图片 2MB 与视频 200MB 差两个数量级, 按绝对值画
+  图片曲线永远贴地。
+
+### 代理熔断
+
+见上文「任务级代理」段。核心是: 连续失败 3 次熔断 300 秒, 到期半开放出,
+全池熔断时退化为按序号返回(而非返回 `None` 让任务停摆)。
+`GET /tasks/{id}/proxy` 可实时查看池状态。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (557 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池 / 统计增强)
+make test           # pytest (587 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -362,7 +420,8 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 ```
 
 配置: `config.yaml`, 环境变量 `UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` /
-`UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_CDN_PROFILE` / `UWC_FFMPEG` 优先。
+`UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_CDN_PROFILE` / `UWC_FFMPEG` /
+`PEXELS_API_KEY`(仅 Pexels 关键词/集合采集需要) 优先。
 站点解析探针: `uv run python scripts/probe.py <url>`。
 感知去重依赖 ffmpeg(与视频 remux 共用同一套探测, 见 `core/ffmpeg.py`) ——
 探测不到时自动降级为"不算指纹", 不影响任何下载。

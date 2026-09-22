@@ -215,26 +215,66 @@ if settings.proxy:
 
 
 class ProxyPool:
-    """任务级代理池: 支持单代理或逗号分隔的多代理轮换。
+    """任务级代理池: 支持单代理或逗号分隔的多代理轮换 + 健康熔断。
 
     一个任务的多个资源分散到不同代理(round-robin), 降低单代理被封风险,
     同时避免同一会话频繁切 IP 触发风控 —— 这里按"任务内资源序号"轮换, 粒度适中。
+
+    ⚠️ 只按序号轮换有个硬伤: 某个代理已经挂了(过期/被封/连不上), 仍然会被
+    分到它 1/len 的资源, 那些资源全部失败。所以这里加一层熔断 —— 连续失败
+    达到阈值就把该代理**冷却**一段时间, 期间不再被 pick 到; 冷却结束后自动
+    放出来再试一次(半开)。这是"失败换线"的最小实现, 不需要健康检查线程。
     """
 
-    def __init__(self, spec):
+    #: 连续失败多少次后熔断该代理
+    FAIL_THRESHOLD = 3
+    #: 熔断后的冷却秒数(冷却结束自动半开放出)
+    COOLDOWN = 300.0
+
+    def __init__(self, spec, fail_threshold=None, cooldown=None):
         self.spec = spec
         self.proxies = [p.strip() for p in str(spec or "").split(",") if p.strip()]
         self._i = 0
+        if fail_threshold is not None:
+            self.FAIL_THRESHOLD = fail_threshold
+        if cooldown is not None:
+            self.COOLDOWN = cooldown
+        #: proxy -> 连续失败次数
+        self._fails = {}
+        #: proxy -> 熔断到期时间戳(0 = 未熔断)
+        self._blocked_until = {}
 
     @property
     def empty(self):
         return not self.proxies
 
+    def _is_blocked(self, proxy, now=None):
+        """该代理是否处于熔断冷却期。"""
+        until = self._blocked_until.get(proxy, 0)
+        if not until:
+            return False
+        now = time.time() if now is None else now
+        if now >= until:
+            # 冷却结束: 半开放出(清掉到期时间, 失败计数保留, 再失败会立刻再次熔断)
+            self._blocked_until.pop(proxy, None)
+            return False
+        return True
+
     def pick(self, n=0):
-        """返回第 n 个(按资源序号)应使用的代理 URL; 无代理返回 None。"""
+        """返回第 n 个(按资源序号)应使用的代理 URL; 无可用代理返回 None。
+
+        从轮换起点开始向后找**第一个未熔断**的代理, 全都熔断则退化为按序号返回
+        (总比不下强 —— 这时故障多半不在代理上)。
+        """
         if not self.proxies:
             return None
-        return self.proxies[n % len(self.proxies)]
+        size = len(self.proxies)
+        start = n % size
+        for off in range(size):
+            p = self.proxies[(start + off) % size]
+            if not self._is_blocked(p):
+                return p
+        return self.proxies[start]
 
     def apply(self, session, n=0):
         """把轮换到的代理设到 session 上。"""
@@ -244,6 +284,33 @@ class ProxyPool:
         else:
             session.proxies.clear()
         return session
+
+    def note_success(self, proxy):
+        """该代理成功传完一个资源: 清零失败计数(半开状态下即"恢复")。"""
+        if proxy:
+            self._fails.pop(proxy, None)
+            self._blocked_until.pop(proxy, None)
+
+    def note_failure(self, proxy):
+        """该代理失败一次: 累计达阈值则熔断 COOLDOWN 秒。"""
+        if not proxy:
+            return
+        c = self._fails.get(proxy, 0) + 1
+        self._fails[proxy] = c
+        if c >= self.FAIL_THRESHOLD:
+            self._blocked_until[proxy] = time.time() + self.COOLDOWN
+
+    def snapshot(self):
+        """当前池状态(供诊断/前端展示)。"""
+        return [
+            {
+                "proxy": p,
+                "fails": self._fails.get(p, 0),
+                "blocked": self._is_blocked(p),
+                "blocked_for": max(0, int(self._blocked_until.get(p, 0) - time.time())),
+            }
+            for p in self.proxies
+        ]
 
     def session_for(self, n=0):
         """返回一个带本池第 n 个代理的独立 session(每资源独占, 避免并发竞态)。"""
@@ -362,7 +429,13 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                             _write_chunk(handle, chunk)
                             h.update(chunk)
                             if progress_cb:
-                                progress_cb()
+                                # 传本 chunk 的字节数: 调用方靠它累计真实吞吐。
+                                # 老实现是无参回调, 用 try 兼容签名简单的调用方
+                                # (测试替身常写成 `def cb(): ...`)。
+                                try:
+                                    progress_cb(len(chunk))
+                                except TypeError:
+                                    progress_cb()
                 # ⚠️ 长度不符就丢弃重来: 否则这个坏文件会以"成功"的身份落盘,
                 # 之后去重/manifest/预览全都建立在错误的字节上, 且毫无报错。
                 got = part.stat().st_size

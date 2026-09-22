@@ -60,6 +60,26 @@ export function bulkDeleteTasks(statuses, withFiles = false) {
 export function getStorageOverview() {
   return api.get("/tasks/storage").then((r) => r.data);
 }
+
+// ---- 跨任务资源库 ----
+// 浏览"手上已经有什么": 支持关键词 / 类型 / 相册 / 单任务 四种筛选。
+export function listLibrary(opts = {}) {
+  const params = {};
+  if (opts.q) params.q = opts.q;
+  if (opts.kind && opts.kind !== "all") params.kind = opts.kind;
+  if (opts.album) params.album = opts.album;
+  if (opts.task_id) params.task_id = opts.task_id;
+  if (opts.page) params.page = opts.page;
+  if (opts.page_size) params.page_size = opts.page_size;
+  return api.get("/library", { params }).then((r) => r.data);
+}
+export function listLibraryAlbums() {
+  return api.get("/library/albums").then((r) => r.data);
+}
+// 任务级代理池的实时健康(熔断/失败次数)。任务结束后 running=false。
+export function getTaskProxy(id) {
+  return api.get(`/tasks/${id}/proxy`).then((r) => r.data);
+}
 // 批量操作: 对一组 task_id 执行同一动作(pause/resume/cancel/retry/delete)
 export function bulkAction(action, taskIds, withFiles = false) {
   return api

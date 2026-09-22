@@ -53,3 +53,11 @@ python scripts/selfcheck.py                # 站点声明自检 + CDN 画像快�
 
 ## Git
 项目内独立建仓（toplevel 即项目目录），分支 `main`。**上级 `C:\Users\admin` 那个仓库绝不能碰**。
+
+⚠️ **本机 Bash 环境限制（2026-09-21 实测）**：`cat`/heredoc 不可用，`git -C <绝对路径>` 解析失败（报 not a git repository）。
+git 命令直接用 Bash 工具的默认 cwd（已是项目根 `C:/Users/admin/Desktop/universal_web_collector_v9`），提交用多个 `-m` 而非 heredoc。
+`uwc-verify` 虚拟环境已不存在，全量 pytest 重跑需先 `uv sync` 或重建 env。
+
+## 最近大版本
+- V28（c14d6c3/d2573cb）：落盘目录重构 — 相册单层 + 视频平铺 + 清单与媒体分离。
+- V29（c300198）：批量创建 / 搜索筛选分页 / 环境诊断三接口 + 前端全面改版（创建区/表格/详情抽屉/诊断面板/样式统一+大图预览）。

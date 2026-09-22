@@ -14,7 +14,8 @@ ffmpeg 路径由 `core/ffmpeg.py` 探测(显式配置 -> PATH -> 常见安装位
 在本进程里仍返回 None)。
 
 ⚠️ 走 ffmpeg 拉流时请求由 ffmpeg 自己发出: 本项目的 DomainLimiter 不参与,
-   mirrors 也不会被轮换, 分片进度也只在整个文件完成时上报一次。
+   mirrors 也不会被轮换。ffmpeg 子进程运行期间会周期性调用 progress_cb，
+   让任务心跳与取消信号保持活跃；资源完成进度仍只在整个文件完成时上报一次。
    对限速/镜像敏感的站点请用 `builtin`。
 
 内置分片下载器 (builtin)
@@ -39,21 +40,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
-
 from core.cancel import TaskCancelled
 from core.config import settings
 from core.ffmpeg import find_ffmpeg
 from collectors.hls import inspect_playlist
 from .base import (
     CHUNK,
+    TASK_IO_TIMEOUT,
     build_headers,
     download_with_mirrors,
     fill_info,
     resolve_target,
     safe_filename,
     sha256_file,
+    task_session,
 )
+from .browser_session import browser_session_for
 from .ratelimit import DomainLimiter
 
 # 视频 CDN 常返回 application/octet-stream, 像图片那样用白名单会误杀真实视频;
@@ -61,6 +63,8 @@ from .ratelimit import DomainLimiter
 REJECT_CT = "text/html"
 
 ENGINES = ("auto", "ffmpeg", "builtin")
+MIN_HLS_DURATION_RATIO = 0.99
+SHUTDOWN_IO_TIMEOUT = TASK_IO_TIMEOUT
 
 
 def _short(err, limit=180):
@@ -105,16 +109,91 @@ def _is_dash(url):
     return _path_only(url).endswith(".mpd")
 
 
+def _probe_media_duration(path, ff, progress_cb=None):
+    """用 ffprobe 读取最终容器时长；本机没有探测器时返回 None。"""
+    sibling = Path(ff).with_name("ffprobe.exe" if Path(ff).suffix.lower() == ".exe" else "ffprobe")
+    probe = str(sibling) if sibling.is_file() else shutil.which("ffprobe")
+    if not probe:
+        return None
+    cmd = [
+        probe, "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ]
+    try:
+        if progress_cb is None:
+            result = subprocess.run(
+                cmd, check=True, capture_output=True, text=True, timeout=30
+            )
+            stdout = result.stdout
+        else:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            stdout, _ = VideoDownloader._communicate_process(
+                proc, cmd, timeout=30, progress_cb=progress_cb
+            )
+            if proc.returncode:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return float(stdout.strip())
+    except TaskCancelled:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _validate_hls_duration(path, info, ff, progress_cb=None):
+    """拒绝 ffmpeg 退出码为 0、但只封装了播放列表前一小段的假成功。"""
+    expected = float((info or {}).get("duration") or 0)
+    actual = (
+        _probe_media_duration(path, ff, progress_cb=progress_cb)
+        if progress_cb is not None
+        else _probe_media_duration(path, ff)
+    )
+    if expected <= 0:
+        return actual
+    if actual is None:
+        raise RuntimeError(
+            "ffmpeg 产物无法验证时长: ffprobe 缺失、超时或返回无效结果"
+        )
+    # For normal/long videos this is exactly the 99% gate. Very short
+    # containers can differ by a few hundred milliseconds due to timestamp
+    # rounding, so allow at most 0.5s there rather than rejecting valid clips.
+    tolerance = max(expected * (1.0 - MIN_HLS_DURATION_RATIO), 0.5)
+    if expected - actual > tolerance:
+        raise RuntimeError(
+            "ffmpeg 产物疑似截断: "
+            f"实际 {actual:.1f}s / 播放列表 {expected:.1f}s "
+            f"(允许误差 {tolerance:.1f}s)"
+        )
+    return actual
+
+
 class VideoDownloader:
     """视频下载: mp4 直链 + m3u8。
 
     download() 返回 (实际路径, sha256)。走降级路径时实际路径可能是 .ts。
     """
+    # 合并要点：
+    #   HEAD 侧（V30）给了 download(session=...) 任务级代理入口 + 基于全局
+    #   settings.proxy 的实例默认会话；分支侧给了 browser_session_for() 的
+    #   Chromium TLS 指纹（绕 Cloudflare 媒体 host 的前提）+ 会话所有权/关闭语义。
+    #   三者可共存，优先级：caller session > 全局 settings.proxy > TLS 指纹。
 
     def __init__(self):
-        self.session = requests.Session()
+        # 由 download() 自建的会话归该次调用所有，成功/失败都要关掉；
+        # 测试与采集器可以注入自己的会话，注入的不由我们关。
+        self.session = None
+        self._owns_session = False
         if settings.proxy:
+            self.session = requests.Session()
             self.session.proxies.update({"http": settings.proxy, "https": settings.proxy})
+            self._owns_session = True
+
+    def close(self):
+        session, self.session = self.session, None
+        self._owns_session = False
+        if session is not None:
+            session.close()
 
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None,
@@ -123,15 +202,25 @@ class VideoDownloader:
         # 每个资源下载前 task_manager 都新建实例(见 DOWNLOADERS[type]()),
         # 故这里覆盖 self.session 不会与并发任务互相污染。
         if session is not None:
+            # 调用方注入：用它的，且不归我们关
             self.session = session
-        h = build_headers(referer, headers)
-        if _is_dash(url):
-            raise RuntimeError("暂不支持 DASH(.mpd), 请改用 ffmpeg 手工下载")
-        if _is_hls(url):
-            return self._download_m3u8(url, h, save_dir, progress_cb, log, mirrors,
+            self._owns_session = False
+        elif self.session is None:
+            # 既没注入、也没有全局 proxy 会话 → 自建 TLS 指纹会话（XChina 媒体必需）
+            self.session = task_session(browser_session_for(url))
+            self._owns_session = True
+        try:
+            h = build_headers(referer, headers)
+            if _is_dash(url):
+                raise RuntimeError("暂不支持 DASH(.mpd), 请改用 ffmpeg 手工下载")
+            if _is_hls(url):
+                return self._download_m3u8(url, h, save_dir, progress_cb, log, mirrors,
+                                           filename, info)
+            return self._download_file(url, h, save_dir, mirrors, progress_cb, log,
                                        filename, info)
-        return self._download_file(url, h, save_dir, mirrors, progress_cb, log,
-                                   filename, info)
+        finally:
+            if self._owns_session:
+                self.close()
 
     # ---- mp4 直链 ----
 
@@ -149,6 +238,7 @@ class VideoDownloader:
             log=log,
             reject_ct=REJECT_CT,
             info=info,
+            request_timeout=SHUTDOWN_IO_TIMEOUT,
         )
         return real, sha
 
@@ -198,7 +288,9 @@ class VideoDownloader:
         leaf, info, last_err = murl, None, None
         for cand in [murl] + [m for m in (mirrors or []) if m and m != murl]:
             try:
-                leaf, info = self._preflight_hls(cand, headers, log)
+                leaf, info = self._preflight_hls(
+                    cand, headers, log, progress_cb=progress_cb
+                )
                 break
             except Exception as e:
                 last_err = e
@@ -213,13 +305,18 @@ class VideoDownloader:
         if pull_with_ffmpeg:
             path = out / f"{stem}.mp4"
             try:
-                self._ffmpeg_pull(leaf, headers, path, ff)
+                # 两侧都要：_ffmpeg_pull 传 progress_cb（分支：让 ffmpeg 拉流期间
+                # 也能刷新进度）+ 时长校验（分支：拒绝"退出码 0 但只封了前一小段"的
+                # 假成功）；而进度上报用 _notify_bytes（HEAD/V32：报**字节数**，
+                # 前端据此画速率曲线，兼容无参回调）。
+                self._ffmpeg_pull(leaf, headers, path, ff, progress_cb=progress_cb)
+                _validate_hls_duration(path, info, ff, progress_cb=progress_cb)
                 if progress_cb:
                     _notify_bytes(progress_cb, path)
                 if log:
                     log(f"ffmpeg 拉流完成: {path.name}")
                 fill_info(info, leaf, "video/mp4")
-                return path, sha256_file(path)
+                return path, sha256_file(path, progress_cb=progress_cb)
             except TaskCancelled:
                 # ⚠️ 用户点了停止。这不是"ffmpeg 拉流失败" —— 落到下面的
                 # `except Exception` 里会被当成一次普通失败, 于是在 engine=auto
@@ -282,7 +379,13 @@ class VideoDownloader:
             with open(merged, "wb") as dst:
                 for p in parts:
                     with open(p, "rb") as src:
-                        shutil.copyfileobj(src, dst, CHUNK)
+                        while True:
+                            chunk = src.read(CHUNK)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            if progress_cb:
+                                progress_cb()
                     # 长视频几百片, 合并阶段也要能响应"停止"
                     if progress_cb:
                         _notify_bytes(progress_cb, p)
@@ -299,20 +402,22 @@ class VideoDownloader:
         if ff:
             mp4 = out / f"{stem}.mp4"
             try:
-                self._ffmpeg_remux(merged, mp4, ff)
+                self._ffmpeg_remux(
+                    merged, mp4, ff, progress_cb=progress_cb
+                )
                 merged.unlink(missing_ok=True)
                 if log:
                     log(f"已 remux 为 {mp4.name}")
                 fill_info(info, base, "video/mp4")
-                return mp4, sha256_file(mp4)
+                return mp4, sha256_file(mp4, progress_cb=progress_cb)
             except Exception as e:
                 if log:
                     log(f"remux 失败, 保留 .ts 容器: {_short(e)}")
 
         fill_info(info, base, "video/mp2t")
-        return merged, sha256_file(merged)
+        return merged, sha256_file(merged, progress_cb=progress_cb)
 
-    def _preflight_hls(self, murl, headers, log):
+    def _preflight_hls(self, murl, headers, log, progress_cb=None):
         """下载前预检播放列表, 返回 (leaf_url, info)。
 
         info.ok 为 False 时本方法**抛异常**(带人话原因), 调用方不该继续下载。
@@ -322,9 +427,17 @@ class VideoDownloader:
         seen = set()
         url = murl
         for _ in range(4):
+            if progress_cb:
+                progress_cb()
             info = inspect_playlist(
-                url, headers=headers, session=self.session, log=log
+                url,
+                headers=headers,
+                session=self.session,
+                log=log,
+                timeout=SHUTDOWN_IO_TIMEOUT,
             )
+            if progress_cb:
+                progress_cb()
             if not info["ok"]:
                 raise RuntimeError(f"播放列表校验未通过: {info['reason']}")
             # master: 没有分片、只有变体 -> 选最高码率继续下钻
@@ -368,7 +481,7 @@ class VideoDownloader:
                     with limiter.slot():
                         resp = self.session.get(
                             segments[i], headers=headers, stream=True,
-                            timeout=settings.request_timeout,
+                            timeout=SHUTDOWN_IO_TIMEOUT,
                         )
                     resp.raise_for_status()
                     with open(tmp, "wb") as f:
@@ -388,7 +501,9 @@ class VideoDownloader:
                     last = e
                     tmp.unlink(missing_ok=True)
                     if attempt < settings.segment_retries:
-                        time.sleep(min(2 ** attempt, 5))
+                        self._interruptible_sleep(
+                            min(2 ** attempt, 5), progress_cb
+                        )
             raise RuntimeError(f"分片 {i + 1}/{total} 失败: {_short(last)}")
 
         errors = []
@@ -419,9 +534,20 @@ class VideoDownloader:
             )
         return paths
 
+    @staticmethod
+    def _interruptible_sleep(seconds, progress_cb=None):
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.5, remaining))
+            if progress_cb:
+                progress_cb()
+
     # ---- ffmpeg ----
 
-    def _ffmpeg_pull(self, url, headers, path, ff):
+    def _ffmpeg_pull(self, url, headers, path, ff, progress_cb=None):
         """让 ffmpeg 直接拉 m3u8 并输出到 path(`-c copy` 不重编码)。
 
         请求头经 `-headers` 传给 http 协议, 必须放在 `-i` 之前。
@@ -444,25 +570,50 @@ class VideoDownloader:
         # 但有些 CDN 用 .jpg/.php 之类的伪装分片 URL, 默认值会直接拒绝拉取。
         # 放在 -i 之前(它是 demuxer 选项)。
         self._run_ffmpeg([
-            ff, "-y", "-nostats", *args, *net,
+            ff, "-y", "-nostats", "-xerror", *args, *net,
             "-allowed_extensions", "ALL",
             "-i", url, "-c", "copy", str(path),
-        ])
+        ], progress_cb=progress_cb)
 
-    def _ffmpeg_remux(self, src, dst, ff):
+    def _ffmpeg_remux(self, src, dst, ff, progress_cb=None):
         self._run_ffmpeg(
-            [ff, "-y", "-nostats", "-i", str(src), "-c", "copy", str(dst)]
+            [ff, "-y", "-nostats", "-i", str(src), "-c", "copy", str(dst)],
+            progress_cb=progress_cb,
         )
 
     @staticmethod
-    def _run_ffmpeg(cmd):
+    def _run_ffmpeg(cmd, progress_cb=None):
         """执行 ffmpeg; 失败时把 stderr 尾行带出来。
 
         旧实现是 `except Exception: pass`, 真实原因(协议不支持/编码不兼容)
         全部丢失, 排查时只能看到降级后那条误导性的报错。
         """
+        proc = None
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = VideoDownloader._communicate_process(
+                proc, cmd, timeout=3600, progress_cb=progress_cb
+            )
+            if proc.returncode:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, cmd, output=stdout, stderr=stderr
+                )
+        except TaskCancelled:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+            raise
+        except subprocess.TimeoutExpired:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            raise
         except FileNotFoundError as e:
             # 路径来自 core.ffmpeg 探测, 到这里说明探测后又被动过(卸载/移动)
             raise RuntimeError(f"ffmpeg 不可执行: {cmd[0]}") from e
@@ -471,3 +622,27 @@ class VideoDownloader:
             raise RuntimeError(
                 f"ffmpeg 退出码 {e.returncode}: {tail[-1] if tail else '无 stderr'}"
             ) from e
+
+    @staticmethod
+    def _communicate_process(proc, cmd, timeout, progress_cb=None):
+        """Poll a child so cancellation can terminate it within the Host gate."""
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    return proc.communicate(timeout=min(0.5, remaining))
+                except subprocess.TimeoutExpired:
+                    if progress_cb:
+                        progress_cb()
+        except (TaskCancelled, subprocess.TimeoutExpired):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+            raise

@@ -134,6 +134,7 @@ def parse_playlist(text, base_url=""):
     out = {
         "media": [], "count": 0, "duration": 0.0, "encrypted": False,
         "key_url": "", "iv": "", "variants": [], "target_duration": 0.0,
+        "endlist": False, "playlist_type": "",
         # 一次播放列表里可以出现**多把** #EXT-X-KEY(VOD 按分片换钥是合法写法)。
         # 只记最后一把会让校验放过"拿不到的那把" —— 下到一半才炸, 而且那一段
         # 已经落盘了, 排查成本极高。所以这里全部收下来, 由校验层逐把确认。
@@ -163,6 +164,12 @@ def parse_playlist(text, base_url=""):
                 out["target_duration"] = float(line.split(":", 1)[1])
             except ValueError:
                 pass
+            continue
+        if line.upper() == "#EXT-X-ENDLIST":
+            out["endlist"] = True
+            continue
+        if line.startswith("#EXT-X-PLAYLIST-TYPE:"):
+            out["playlist_type"] = line.split(":", 1)[1].strip().upper()
             continue
         if line.startswith("#EXT-X-KEY:"):
             attrs = _attrs(line)
@@ -249,6 +256,7 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
         "key_url": "", "iv": "", "duration": 0.0, "count": 0,
         "variants": [], "segments": [], "key_bytes": 0,
         "keys": [], "key_count": 0, "keys_checked": 0,
+        "endlist": False, "playlist_type": "",
     }
 
     # 1) 凭证过期: 放在最前面 —— 过期 URL 通常还能返回 200(占位列表),
@@ -292,6 +300,7 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
         "count": info["count"], "variants": info["variants"],
         "segments": info["media"], "keys": info["keys"],
         "key_count": len(info["keys"]),
+        "endlist": info["endlist"], "playlist_type": info["playlist_type"],
     })
 
     # 3) master playlist 不在这一层判伪: 它本来就不含分片, 由调用方下钻
@@ -304,6 +313,24 @@ def inspect_playlist(url, headers=None, session=None, hints=None,
     if not info["media"]:
         result["kind"] = "empty"
         result["reason"] = "播放列表里没有任何分片"
+        return result
+
+    # A finite download must be a complete media playlist. A missing ENDLIST
+    # means either a live/sliding window or a truncated VOD/EVENT response;
+    # both are unsafe to persist as a terminal-success file.
+    if not info["endlist"]:
+        declared = info["playlist_type"]
+        result["kind"] = "unfinished" if declared in {"VOD", "EVENT"} else "live"
+        label = f"{declared} " if declared else "live/sliding "
+        result["reason"] = (
+            f"{label}播放列表缺少 #EXT-X-ENDLIST，无法确认已经完整终止；"
+            "当前仅支持可完整下载的已结束播放列表"
+        )
+        return result
+
+    if info["duration"] <= 0:
+        result["kind"] = "invalid-duration"
+        result["reason"] = "播放列表已结束但分片总时长无效，无法验证完整性"
         return result
 
     # 4) 占位清单: 状态码、Content-Type、语法全都合法, 只有内容在撒谎

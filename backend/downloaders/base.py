@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -17,6 +18,7 @@ from .ratelimit import describe, domain_slot, note_failure, note_rate_limited, n
 
 #: 流式写入的分块。64KB 在大文件上要跑几千次 Python 层循环, 256KB 是纯收益。
 CHUNK = 256 * 1024
+TASK_IO_TIMEOUT = (4.0, 4.0)
 
 
 # ---- 原子落盘: 先写 .part, 成功后原子改名 ----
@@ -206,12 +208,89 @@ def _build_session():
     )
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
+    if settings.proxy:
+        sess.proxies.update({"http": settings.proxy, "https": settings.proxy})
     return sess
 
 
 SESSION = _build_session()
-if settings.proxy:
-    SESSION.proxies.update({"http": settings.proxy, "https": settings.proxy})
+
+
+class TaskSession:
+    """Own one task's session and close its active streaming responses."""
+
+    def __init__(self, session=None):
+        self._session = session or _build_session()
+        self._lock = threading.Lock()
+        self._responses = set()
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def _track(self, response):
+        original_close = response.close
+        closed = threading.Event()
+
+        def close():
+            if closed.is_set():
+                return
+            closed.set()
+            with self._lock:
+                self._responses.discard(response)
+            original_close()
+
+        response.close = close
+        with self._lock:
+            if self._closed:
+                close_now = True
+            else:
+                self._responses.add(response)
+                close_now = False
+        if close_now:
+            close()
+            raise requests.RequestException("task session closed during request")
+        return response
+
+    def get(self, *args, **kwargs):
+        return self._track(self._session.get(*args, **kwargs))
+
+    def head(self, *args, **kwargs):
+        return self._track(self._session.head(*args, **kwargs))
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            responses = list(self._responses)
+            self._responses.clear()
+        for response in responses:
+            try:
+                response.close()
+            except Exception:
+                pass
+        self._session.close()
+
+
+def task_session(session=None):
+    return TaskSession(session)
+
+
+def _check_progress(progress_cb):
+    if progress_cb:
+        progress_cb()
+
+
+def _interruptible_wait(seconds, progress_cb):
+    deadline = time.monotonic() + max(0.0, seconds)
+    waiter = threading.Event()
+    while True:
+        _check_progress(progress_cb)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        waiter.wait(min(0.1, remaining))
 
 
 class ProxyPool:
@@ -350,7 +429,8 @@ def safe_filename(url, default_ext=".bin"):
 
 
 def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
-                require_image=False, reject_ct=None, info=None):
+                require_image=False, reject_ct=None, info=None,
+                request_timeout=None):
     """对单个 URL 做带重试的流式下载, 返回 (sha256, Content-Type)。
 
     Content-Type 校验提供互补的两种用法:
@@ -373,9 +453,14 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             if offset:
                 req_headers["Range"] = f"bytes={offset}-"
 
-            with domain_slot(url):
+            slot = (
+                domain_slot(url, progress_cb=progress_cb)
+                if progress_cb is not None
+                else domain_slot(url)
+            )
+            with slot:
                 resp = sess.get(url, headers=req_headers, stream=True,
-                                timeout=_timeout())
+                                timeout=request_timeout or _timeout())
             # ⚠️ 必须保证关闭: 416/429/内容校验这几条**提前退出**的路径都没读过响应体,
             # 连接不会被自动归还。配合 pool_block=True 就是"泄漏到池满 → 永久阻塞",
             # 症状是任务卡死而非报错。读完的路径 close() 是幂等的。
@@ -454,6 +539,7 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             raise
         except RateLimited as e:
             last_err = e
+            _check_progress(progress_cb)
             # ⚠️ 只让"撞墙的这一个线程"退避是不够的: 同一批里其他线程还在按原节奏
             # 猛冲, 站点看到的整体压力没变, 它的判断就不会变 —— 只会更快把整站封掉。
             # 所以把这次 429 记成**站点级冷却**, 下一轮 domain_slot 会让全站一起等,
@@ -463,6 +549,7 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                 raise
         except Exception as e:
             last_err = e
+            _check_progress(progress_cb)
             if attempt == retries:
                 raise
             # ⚠️ 只有"传输层/服务端"失败才算站点吃不消。内容校验失败
@@ -473,7 +560,9 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             # 指数退避 + 抖动: 纯指数会让一批并发失败的请求在同一时刻集体重试
             # (重试风暴, 把站点/WAF 瞬间打爆)。乘一个 0.6~1.4 的随机因子错开它们。
             backoff = min(2 ** attempt, 8)
-            time.sleep(backoff * random.uniform(0.6, 1.4))
+            _interruptible_wait(
+                backoff * random.uniform(0.6, 1.4), progress_cb
+            )
     raise last_err
 
 
@@ -522,7 +611,7 @@ def _swap_ext(path, url):
 
 def download_with_mirrors(url, path, headers, retries=None, resume=True, session=None,
                           progress_cb=None, mirrors=None, log=None, require_image=False,
-                          reject_ct=None, info=None):
+                          reject_ct=None, info=None, request_timeout=None):
     """主 URL 失败时依次尝试备用下载点(mirrors), 返回 (sha256, 实际路径)。
 
     mirrors 由采集器给出(如同一张图的多个尺寸/CDN 变体), 下载层只负责
@@ -555,7 +644,7 @@ def download_with_mirrors(url, path, headers, retries=None, resume=True, session
             # 只有主 URL 用断点续传; 切换后是全新 URL, 必须从头下
             sha, ctype = _stream_one(cand, cur, headers, retries, resume and i == 0,
                                      sess, progress_cb, require_image, reject_ct,
-                                     info)
+                                     info, request_timeout)
             fill_info(info, cand, ctype)
             return sha, cur
         except TaskCancelled:
@@ -579,9 +668,11 @@ def resolve_target(save_dir, url, filename=None, default_ext=".bin"):
     return target
 
 
-def sha256_file(path):
+def sha256_file(path, progress_cb=None):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(CHUNK), b""):
             h.update(chunk)
+            if progress_cb:
+                progress_cb()
     return h.hexdigest()

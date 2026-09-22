@@ -323,6 +323,34 @@ def find_tasks_by_urls(urls):
     return {r["url"]: r["id"] for r in rows}
 
 
+def find_tasks_by_content_key(content_key):
+    """Return all exact matches newest-first, lazily keying historical rows."""
+    from core.content_identity import canonical_content_key
+
+    matches = []
+    for task in query("SELECT * FROM tasks ORDER BY id DESC"):
+        try:
+            options = json.loads(task["options"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(options, dict):
+            continue
+        stored_key = options.get("content_key")
+        computed_key = canonical_content_key(task["url"], task["collector"])
+        if stored_key != computed_key:
+            if computed_key is None:
+                options.pop("content_key", None)
+            else:
+                options["content_key"] = computed_key
+            execute(
+                "UPDATE tasks SET options=? WHERE id=?",
+                (json.dumps(options, ensure_ascii=False), task["id"]),
+            )
+        if computed_key == content_key:
+            matches.append(task)
+    return matches
+
+
 def update_task(task_id, **fields):
     if not fields:
         return
@@ -491,6 +519,17 @@ def count_resources(task_id):
         (task_id,),
     )
     return {r["status"]: r["n"] for r in rows}
+
+
+def summarize_resources(task_id):
+    """返回任务资源总数与面向任务摘要的终态计数。"""
+    by_status = count_resources(task_id)
+    return {
+        "total": sum(by_status.values()),
+        "done": by_status.get("done", 0),
+        "failed": by_status.get("failed", 0),
+        "filtered": by_status.get("filtered", 0),
+    }
 
 
 def count_tasks_by_status():

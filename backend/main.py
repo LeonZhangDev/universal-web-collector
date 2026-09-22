@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from api.sessions import router as sessions_router
 from api.tasks import router
 from core.config import settings
-from core.task_manager import recover_orphans
+from core.task_manager import recover_orphans, task_manager
 
 logger = logging.getLogger("uwc")
 
@@ -24,7 +24,16 @@ async def lifespan(app):
     被导入方当时的 DB_PATH。挂到 lifespan 上, 只有真正起服务才执行。
     """
     recover_orphans()
-    yield
+    try:
+        yield
+    finally:
+        # Native 模式的安装/重启会向后端发送 SIGTERM。必须把取消信号传给
+        # 下载 worker；否则监听已关闭但 Python 仍被 executor 线程阻塞。
+        # Executor workers are non-daemon.  Merely broadcasting cancellation
+        # leaves Python's executor exit hook waiting on those threads after
+        # uvicorn has already closed its socket, which makes the native-host
+        # installer observe a stopped API but a still-live backend PID.
+        task_manager.shutdown(wait=True)
 
 
 app = FastAPI(title="Universal Web Collector v10", lifespan=lifespan)
@@ -79,7 +88,19 @@ if _dist.is_dir():
     app.mount("/", StaticFiles(directory=_dist, html=True), name="frontend")
 
 
-if __name__ == "__main__":
+def run_server():
     import uvicorn
 
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    # Browser service workers keep the SSE endpoint open.  Bound graceful
+    # connection draining below the native installer shutdown gate so a
+    # verified SIGTERM cannot leave the API closed but the PID still alive.
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        timeout_graceful_shutdown=5,
+    )
+
+
+if __name__ == "__main__":
+    run_server()

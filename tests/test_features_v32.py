@@ -163,8 +163,11 @@ def test_progress_cb_receives_byte_count(monkeypatch, tmp_path):
     monkeypatch.setattr(B, "_timeout", lambda: 5)
     import contextlib
 
+    # 替身签名必须跟真实 domain_slot(url, log=None, progress_cb=None) 对齐：
+    # 合并后下载层会传 progress_cb（让限速等待期间也能刷新进度/响应取消），
+    # 替身少一个参数会直接 TypeError，而它发生在下载循环里会被当成下载失败。
     @contextlib.contextmanager
-    def _slot(url):
+    def _slot(url, log=None, progress_cb=None):
         yield
 
     monkeypatch.setattr(B, "domain_slot", _slot)
@@ -200,8 +203,10 @@ def test_progress_cb_noarg_still_works(monkeypatch, tmp_path):
         def get(self, *a, **k):
             return FakeResp()
 
+    # 同 test_progress_cb_receives_byte_count：替身要对齐真实签名
+    # domain_slot(url, log=None, progress_cb=None)。
     @contextlib.contextmanager
-    def _slot(url):
+    def _slot(url, log=None, progress_cb=None):
         yield
 
     monkeypatch.setattr(B, "domain_slot", _slot)

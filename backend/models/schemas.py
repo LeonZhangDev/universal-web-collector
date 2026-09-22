@@ -38,8 +38,16 @@ class ResourceOut(BaseModel):
     duplicate_of: Optional[int] = None
 
 
+class ResourceCounts(BaseModel):
+    total: int
+    done: int
+    failed: int
+    filtered: int
+
+
 class TaskDetail(TaskOut):
     resources: List[ResourceOut]
+    resource_counts: ResourceCounts
 
 
 class TaskListOut(BaseModel):
@@ -116,6 +124,12 @@ class TaskCreateIn(BaseModel):
     # 任务级代理(可选)。优先于全局 UWC_PROXY。存入 options, 由下载层读取;
     # 留空则沿用全局/环境变量配置。前端"高级设置"里可填。
     proxy: Optional[str] = None
+    # Opt-in: existing callers retain the historical always-create behavior.
+    deduplicate: bool = False
+    # Explicit confirmation path for creating after a duplicate disposition.
+    force_new: bool = False
+    # Re-downloads may reuse successful resources from earlier tasks.
+    incremental: Optional[bool] = None
 
 
 class TaskCreateOut(BaseModel):
@@ -127,6 +141,8 @@ class TaskCreateOut(BaseModel):
     # **软**提示: 任务已创建, 只是提醒用户多半粘错了输入(见 api.tasks._manual_warning)。
     # 不要当错误显示 —— 界面一旦用红色报错的样子呈现它, 用户会以为创建失败了。
     warning: Optional[str] = None
+    disposition: Optional[str] = None
+    content_key: Optional[str] = None
 
 
 # ---- 批量创建 ----

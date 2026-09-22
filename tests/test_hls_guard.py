@@ -90,6 +90,36 @@ def test_valid_encrypted_playlist_passes_and_checks_key():
     assert r["key_bytes"] == 16
     assert r["count"] == 1
     assert r["segments"][0].endswith("00001.ts")
+    assert r["endlist"] is True
+
+
+@pytest.mark.parametrize("playlist_type", ["", "VOD", "EVENT"])
+def test_leaf_playlist_without_endlist_is_rejected(playlist_type):
+    kind = f"#EXT-X-PLAYLIST-TYPE:{playlist_type}\n" if playlist_type else ""
+    body = f"#EXTM3U\n{kind}#EXTINF:5.0,\nhttps://h/ts/00001.ts\n"
+    r = inspect_playlist(
+        "https://h/720.m3u8?expires=9999999999&md5=x",
+        session=FakeSession({"720.m3u8": body}),
+    )
+
+    assert r["ok"] is False
+    assert r["kind"] in {"live", "unfinished"}
+    assert "ENDLIST" in r["reason"]
+
+
+def test_endlisted_playlist_with_zero_total_duration_is_rejected():
+    body = (
+        "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        "#EXTINF:0,\nhttps://h/ts/00001.ts\n#EXT-X-ENDLIST\n"
+    )
+    r = inspect_playlist(
+        "https://h/720.m3u8?expires=9999999999&md5=x",
+        session=FakeSession({"720.m3u8": body}),
+    )
+
+    assert r["ok"] is False
+    assert r["kind"] == "invalid-duration"
+    assert "时长" in r["reason"]
 
 
 def test_encrypted_but_key_unreachable_is_rejected():

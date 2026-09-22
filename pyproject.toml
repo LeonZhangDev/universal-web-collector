@@ -7,9 +7,13 @@ dependencies=[
 "uvicorn",
 "playwright",
 "requests",
+"curl-cffi",
 "pydantic",
 "pyyaml"
 ]
 
 [dependency-groups]
-dev=["pytest"]
+dev=[
+    "httpx2>=2.13.0",
+    "pytest",
+]

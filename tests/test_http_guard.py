@@ -9,6 +9,7 @@
 """
 
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from downloaders import base as B  # noqa: E402
 from downloaders import ratelimit as RL  # noqa: E402
+from core.cancel import TaskCancelled  # noqa: E402
 
 
 class FakeResp:
@@ -134,6 +136,32 @@ def test_domain_slot_waits_out_cooldown():
 
     assert elapsed >= 0.1, f"应该在冷却里等待, 实际只花了 {elapsed:.3f}s"
     assert RL.cooldown_left(url) == 0, "等完就该解封, 否则后续请求永远被压着"
+
+
+def test_domain_slot_semaphore_wait_is_cancellable():
+    limiter = RL.DomainLimiter(1, 0.0)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_slot():
+        with limiter.slot():
+            entered.set()
+            release.wait(2)
+
+    worker = threading.Thread(target=hold_slot)
+    worker.start()
+    assert entered.wait(1)
+
+    def cancel():
+        raise TaskCancelled()
+
+    try:
+        with pytest.raises(TaskCancelled):
+            with limiter.slot(progress_cb=cancel):
+                pass
+    finally:
+        release.set()
+        worker.join(2)
 
 
 def test_cooldown_cap_keeps_absurd_retry_after_sane():

@@ -185,6 +185,10 @@ class GallerySite:
     # 留空则只按 base + 数字后缀生成 —— 那种情形下"站点换域名"只能靠用户报障
     # 才会被发现, 所以有已知迁移迹象就填上。
     base_host_templates: list = None
+    # Cloudflare-backed media can reject Python/OpenSSL's TLS fingerprint even
+    # when the HTTP headers are browser-like. Non-empty values opt this site in
+    # to curl-cffi's browser-compatible transport.
+    browser_impersonation: str = ""
     # 自检样本 URL: 每条都必须能被本站的 id_patterns 解析出**同一个** gid。
     # `check_site()` 用它做启动期断言, 防的是一类很难查的回归 —— 新加的
     # pattern 与旧 pattern 对同一条 URL 各配出一个不同的 ID, 而 `parse_gid`
@@ -512,8 +516,14 @@ def _shape_sample(site):
     return "站点文档中给出的形态"
 
 
-def _session(proxy=None):
-    s = requests.Session()
+def _session(proxy=None, impersonate=None):
+    """Create the default transport, optionally with a browser TLS fingerprint."""
+    if impersonate:
+        from curl_cffi import requests as curl_requests
+
+        s = curl_requests.Session(impersonate=impersonate)
+    else:
+        s = requests.Session()
     p = proxy if proxy is not None else settings.proxy
     if p:
         s.proxies.update({"http": p, "https": p})
@@ -950,7 +960,7 @@ def discover(site, gid, quality=None, start=DEFAULT_START, max_count=DEFAULT_MAX
     group = safe_relative(album) or clean_segment(album) or gid
     default_variant = mtype.variant_of(quality)
     top_variant = mtype.variants[0]
-    sess = session or _session(proxy)
+    sess = session or _session(proxy, site.browser_impersonation)
     own = session is None
     # CDN 基址与序号宽度(photos/photos2/photos3..., 00001/0001)**惰性探测**:
     # 写死 base 会让"相册在另一个 CDN 子路径"整体判空 -> 0 资源 -> failed,
@@ -1185,7 +1195,7 @@ def _video_at_first_seq(site, gid, session=None, proxy=None):
     mtype = site.media("video")
     if mtype is None:
         return False
-    sess = session or _session(proxy)
+    sess = session or _session(proxy, site.browser_impersonation)
     own = session is None
     try:
         resolved_base, fmt = _resolve_base(site, gid, sess, "video")

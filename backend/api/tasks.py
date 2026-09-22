@@ -24,8 +24,10 @@ from core import database as db
 from core import events
 from core import layout
 from core.config import settings
+from core.content_identity import canonical_content_key
 from core.filters import parse_size
 from core.manifest import read_manifest
+from core.task_dedup import create_or_dispose
 from core.task_manager import (
     ACTIVE_STATES,
     DOWNLOADERS,
@@ -229,15 +231,42 @@ def create(payload: TaskCreateIn):
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
     )
+    # 两侧都是往 options 里塞独立字段，互不覆盖，合并保留：
     if payload.proxy:
         options["proxy"] = payload.proxy
+    if payload.incremental is not None:
+        options["incremental"] = payload.incremental
 
-    task_id = db.create_task(payload.url, collector, download_dir, options)
-    task_manager.submit(task_id)
+    content_key = canonical_content_key(payload.url, collector=collector)
+    result = create_or_dispose(
+        payload.url,
+        collector,
+        download_dir,
+        options,
+        content_key=content_key,
+        deduplicate=payload.deduplicate,
+        force_new=payload.force_new,
+    )
+    if result.created:
+        try:
+            task_manager.submit(result.task_id)
+        except Exception as exc:
+            db.update_task(
+                result.task_id,
+                status=TaskStatus.FAILED,
+                error=f"task submission failed: {exc}"[:500],
+            )
+            raise
     # resolved 非 None 时把识别结论一并回显, 界面可以显示"已识别为 X";
     # warning 是**软**提示(任务已创建, 只是提醒多半粘错了链接), 界面不要当错误显示。
-    return TaskCreateOut(task_id=task_id, status="pending", resolved=resolved,
-                         warning=warning)
+    return TaskCreateOut(
+        task_id=result.task_id,
+        status=result.status,
+        resolved=resolved,
+        warning=warning,
+        disposition=result.disposition,
+        content_key=content_key,
+    )
 
 
 # ---- 批量创建 ----
@@ -851,7 +880,11 @@ def get_task(task_id: int):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     resources = [_resource_out(r, task) for r in db.get_resources(task_id)]
-    return TaskDetail(**dict(task), resources=resources)
+    return TaskDetail(
+        **dict(task),
+        resources=resources,
+        resource_counts=db.summarize_resources(task_id),
+    )
 
 
 @router.get("/tasks/{task_id}/logs")

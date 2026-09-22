@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import CreatePanel from "./components/CreatePanel.vue";
 import TaskTable from "./components/TaskTable.vue";
+import { selectTaskFromSearch } from "./task-query.mjs";
 import TaskDetail from "./components/TaskDetail.vue";
 import EnvDiagnose from "./components/EnvDiagnose.vue";
 import StatsPanel from "./components/StatsPanel.vue";
@@ -354,6 +355,7 @@ async function removeSession(domain) {
 
 onMounted(async () => {
   await load();
+  selectedId.value = selectTaskFromSearch(window.location.search, tasks.value);
   connectSSE();
   try {
     const list = await getCollectors();

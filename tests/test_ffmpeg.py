@@ -11,8 +11,17 @@ import pytest
 
 import core.ffmpeg as ffm
 from core import config as cfgmod
+from core.cancel import TaskCancelled
 from core.config import settings
-from downloaders.video import ENGINES, VideoDownloader, _is_dash, _is_hls, _short
+import downloaders.video as video_mod
+from downloaders.video import (
+    ENGINES,
+    VideoDownloader,
+    _is_dash,
+    _is_hls,
+    _short,
+    _validate_hls_duration,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -168,6 +177,202 @@ def test_engine_builtin_never_calls_ffmpeg_pull(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         VideoDownloader().download("http://127.0.0.1:1/x.m3u8", save_dir=tmp_path)
     assert pulled == [], "engine=builtin 时不应调用 ffmpeg 拉流"
+
+
+def test_ffmpeg_pull_heartbeats_and_terminates_on_cancel(monkeypatch):
+    """长 HLS 拉流必须持续心跳；取消回调抛出后要收掉精确子进程。"""
+    calls = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if len([c for c in calls if c[0] == "communicate"]) == 1:
+                raise video_mod.subprocess.TimeoutExpired(["ffmpeg"], timeout)
+            self.returncode = -15
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append(("terminate", None))
+
+        def kill(self):
+            calls.append(("kill", None))
+
+    monkeypatch.setattr(video_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+
+    def cancel_tick():
+        calls.append(("tick", None))
+        raise TaskCancelled()
+
+    with pytest.raises(TaskCancelled):
+        VideoDownloader._run_ffmpeg(["ffmpeg"], progress_cb=cancel_tick)
+
+    assert ("tick", None) in calls
+    assert ("terminate", None) in calls
+    assert ("kill", None) not in calls
+
+
+def test_ffmpeg_remux_is_cancellation_aware(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if self.returncode is None:
+                raise video_mod.subprocess.TimeoutExpired(["ffmpeg"], timeout)
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append(("terminate", None))
+            self.returncode = -15
+
+        def kill(self):
+            calls.append(("kill", None))
+            self.returncode = -9
+
+    monkeypatch.setattr(video_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+
+    with pytest.raises(TaskCancelled):
+        VideoDownloader()._ffmpeg_remux(
+            tmp_path / "in.ts",
+            tmp_path / "out.mp4",
+            "ffmpeg",
+            progress_cb=lambda: (_ for _ in ()).throw(TaskCancelled()),
+        )
+
+    assert ("terminate", None) in calls
+
+
+def test_ffprobe_is_cancellation_aware(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if self.returncode is None:
+                raise video_mod.subprocess.TimeoutExpired(["ffprobe"], timeout)
+            return b"", b""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            calls.append(("terminate", None))
+            self.returncode = -15
+
+        def kill(self):
+            calls.append(("kill", None))
+            self.returncode = -9
+
+    monkeypatch.setattr(video_mod.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(video_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+
+    with pytest.raises(TaskCancelled):
+        video_mod._probe_media_duration(
+            tmp_path / "out.mp4",
+            "/usr/bin/ffmpeg",
+            progress_cb=lambda: (_ for _ in ()).throw(TaskCancelled()),
+        )
+
+    assert ("terminate", None) in calls
+
+
+def test_hls_duration_validation_rejects_successful_but_truncated_output(
+    monkeypatch, tmp_path
+):
+    """ffmpeg exit 0 也可能只产出前几分钟，必须与预检总时长交叉校验。"""
+    path = tmp_path / "truncated.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: 270.0)
+
+    with pytest.raises(RuntimeError, match="截断"):
+        _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
+
+
+def test_hls_duration_validation_fails_closed_without_probe(monkeypatch, tmp_path):
+    path = tmp_path / "unverified.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: None)
+
+    with pytest.raises(RuntimeError, match="无法验证"):
+        _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
+
+
+def test_hls_duration_probe_timeout_fails_closed(monkeypatch, tmp_path):
+    path = tmp_path / "timeout.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(
+        video_mod.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            video_mod.subprocess.TimeoutExpired(a[0], k.get("timeout"))
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="无法验证"):
+        _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
+
+
+@pytest.mark.parametrize(
+    ("actual", "accepted"),
+    [(99.0, True), (98.999, False), (9.6, True), (9.4, False)],
+)
+def test_hls_duration_boundary_and_short_container_tolerance(
+    monkeypatch, tmp_path, actual, accepted
+):
+    expected = 100.0 if actual > 20 else 10.0
+    path = tmp_path / "boundary.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: actual)
+
+    if accepted:
+        assert _validate_hls_duration(
+            path, {"duration": expected}, "/usr/bin/ffmpeg"
+        ) == actual
+    else:
+        with pytest.raises(RuntimeError, match="截断"):
+            _validate_hls_duration(path, {"duration": expected}, "/usr/bin/ffmpeg")
+
+
+def test_direct_video_does_not_require_hls_duration_probe(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        video_mod,
+        "_validate_hls_duration",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("HLS-only guard")),
+    )
+    monkeypatch.setattr(
+        video_mod,
+        "download_with_mirrors",
+        lambda url, path, headers, **kw: ("a" * 64, path),
+    )
+
+    path, digest = VideoDownloader().download(
+        "https://example.com/video.mp4", save_dir=tmp_path
+    )
+    assert path.suffix == ".mp4"
+    assert digest == "a" * 64
+
+
+def test_hls_duration_validation_accepts_small_container_variance(monkeypatch, tmp_path):
+    path = tmp_path / "complete.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: 5400.0)
+
+    assert _validate_hls_duration(
+        path, {"duration": 5442.0}, "/usr/bin/ffmpeg"
+    ) == 5400.0
 
 
 # ---- URL 形态判定 ----

@@ -115,9 +115,9 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | POST | `/tasks/create` | 单条创建，可带 `proxy` 等选项 |
 | POST | `/tasks/batch-create` | 多行粘贴批量创建，逐行预检重复与无效输入 |
 | POST | `/tasks/bulk-action` | 对 `task_ids` 批量执行 `pause/resume/cancel/retry/delete`，逐任务归类 ok/skipped/not_found |
-| POST | `/tasks/{id}/retry-failed` | 只重下 `failed`/`skipped` 资源，保留已成功部分 |
+| POST | `/tasks/{id}/retry-failed` | 只重下 `failed`/`skipped`/`gone` 资源，保留已成功部分 |
 | POST | `/tasks/{id}/resources/{rid}/retry` | 单个资源重试或强制下载 |
-| GET | `/tasks/stats` | 总量、按状态、按采集器、按日期序列、失败原因聚合与去重报表 |
+| GET | `/tasks/stats` | 总量、按状态、按采集器、按日期序列、失败原因聚合（按 note 全文 **与** 按 `error_kind` 两种口径）、去重报表 |
 | GET | `/library` | 跨任务资源库：`q` / `kind` / `album`（精确匹配）/ `task_id` / 分页，每条带 `refs` |
 | GET | `/library/albums` | 资源库内出现过的相册名（仅含有已完成资源的相册） |
 | GET | `/tasks/{id}/proxy` | 该任务代理池状态：脱敏 spec + 每线路失败数与熔断截止时刻 |
@@ -141,19 +141,30 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | 统计可视化 | 已实现：SVG 折线 + 饼图 + 失败原因 + 去重报表 |
 | 跨任务资源库 | 已实现：按内容聚合的全局视图，支持搜索/类型/相册/任务筛选与分页 |
 | 新站点插件 | 已实现：Pexels 采集器（复用 `GallerySite` 声明式契约与既有下载/清单机制） |
+| 失败分类（4xx 不再拖慢全站） | 已实现：`PERMANENT_STATUS` 分流 + 资源状态 `gone` + `error_kind` 落库与聚合 |
+| 内容完整性终检 | 已实现：`core/mediacheck.py` 算术判据（RIFF/BMP 长度、ISOBMFF box 链、JPEG/PNG/GIF 尾标记）+ 直链 ffprobe 时长校验 |
+| 坏文件信号可见 | 已实现：`phash.decode_gray_ex` 区分「无解码器」与「解码失败」，后者标记 `error_kind='corrupt'`（保留文件） |
+| CDN 画像并发写 | 已实现：`cdn_profile` 读者/写者共用 `RLock`，`tmp.replace` 加 5 次退避重试 —— 修掉并发采集时命中记录静默丢一半 |
 
 ## 后续可做
 
-截至 V32，前面几轮列出的建议已**全部实施**，无遗留项。V32 落地的四条：
-跨任务资源库、字节级实时速率曲线、代理健康检查与自动降级、新站点插件（Pexels）。
+截至 V33，前面几轮列出的建议已**全部实施**，无遗留项。V33 是四条**缺陷修复**
+（不是新功能）：失败分类（4xx 不再拖慢全站、资源新增 `gone` 状态与 `error_kind`）、
+直链内容终检（`core/mediacheck.py` + ffprobe）、坏文件信号落库（`DECODE_FAILED`），
+以及附带收掉的 CDN 画像并发丢更新（它同时是本仓库测试套件偶发变红的原因）。
 
 若之后继续扩展，优先级较高且方向明确的有：
 
 | 优先级 | 建议 | 价值与范围 |
 | --- | --- | --- |
+| P1 | 资源级遥测 | `resources` 加 `started_at`/`finished_at`/`attempts`，是"这个任务为什么慢"的**前提**；没有它只能看到聚合后的总时长 |
+| P1 | 缩略图 | 资源库与详情页网格当前用 `/files/raw` 铺**原图**，几十 MB 的图列表会卡；加 `_meta/thumb/` + `/files/thumb` |
+| P2 | 条件请求（ETag/Last-Modified） | 增量现在只按 URL 判断"下过就复用"，同一 URL 的内容被源站替换了发现不了；记 ETag 还能让重试走 304 省字节 |
+| P2 | 全局字节速率上限 | 现在只有"请求数/秒"，没有"字节/秒"，想边下边看视频就没法控 |
 | P2 | 集合/关键词批量采集 | Pexels 集合页与关键词搜索已识别但未实现（关键词需 `PEXELS_API_KEY`），可补分页爬取 |
 | P2 | 资源库批量操作 | 资源库目前只读浏览，可加框选下载/删除（需复用 `count_place_refs` 引用计数） |
 | P3 | 熔断状态持久化 | 熔断计数当前只在内存，重启即重算；如需跨会话记忆可落 `options` |
+| P3 | 落盘后完整性巡检 | 库里的 `local_path` 可能已被外部删除或截断；`mediacheck` 已能判，缺一个批量巡检入口 |
 | 按需求 | 更多站点插件 | 契约已稳定（`GallerySite` + `@register`），新增站点只需声明 + `match_score` 把关 |
 
 > ⚠️ 新增站点时注意：纯 ID 样本存在跨站歧义，`match_score` 必须用自己的 `gid_shape`

@@ -13,12 +13,24 @@ import requests
 
 from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
-from core.errors import DiskFullError
+from core.errors import DiskFullError, GoneError
 from .ratelimit import describe, domain_slot, note_failure, note_rate_limited, note_success
 
 #: 流式写入的分块。64KB 在大文件上要跑几千次 Python 层循环, 256KB 是纯收益。
 CHUNK = 256 * 1024
 TASK_IO_TIMEOUT = (4.0, 4.0)
+
+#: 重试一定没用的状态码 —— 单独分流, 不进退避重试链, 也不计站点级失败。
+#:
+#: ⚠️ 为什么必须单独分流(修的是一个静默拖慢全站的缺陷):
+#: `raise_for_status()` 抛的 `HTTPError` 是 `RequestException` 的子类, 而下面
+#: 的重试循环对 `RequestException` 会 `note_failure(url)` —— 那是"这个站点吃不消
+#: 了"的信号, 会让该域名后续**所有**请求的间隔翻倍。于是"相册里有几张已被删除的
+#: 图(404)"会被读成"站点在限流", 全站一起变慢。而且 404 是永久失败, 却要走满
+#: 3 次指数退避(每张约 20 秒空转)。
+#:
+#: 界限: 408(请求超时)与 429(限速)不在此列 —— 它们恰恰是**该重试**的。
+PERMANENT_STATUS = frozenset({400, 401, 402, 403, 404, 405, 406, 410, 451})
 
 
 # ---- 原子落盘: 先写 .part, 成功后原子改名 ----
@@ -473,6 +485,13 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                 if resp.status_code == 429:
                     # 站点明确要求减速: 按它说的等, 而不是套普通退避
                     raise RateLimited(_retry_after(resp, float(settings.image_retries) * 5))
+                if resp.status_code in PERMANENT_STATUS:
+                    # ⚠️ 放在 raise_for_status() **之前**: 一旦让它抛出 HTTPError,
+                    # 就会落进下面的通用 except, 于是既白重试三轮、又把这份
+                    # "这一个 URL 的问题"记成站点级失败。见 PERMANENT_STATUS 的注释。
+                    raise GoneError(
+                        resp.status_code, url, (resp.headers.get("Content-Type") or "")
+                    )
                 resp.raise_for_status()
 
                 ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -536,6 +555,12 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
         except TaskCancelled:
             # 用户点了"停止": 这不是一次失败。按普通失败处理会退避重睡一轮,
             # 再从头续传一个注定被放弃的文件 —— 用户体感是点了没反应。
+            raise
+        except GoneError:
+            # 4xx(除 408/429): 重试改变不了结果 —— 立即上抛, 不进退避。
+            # ⚠️ 尤其**不要**落到下面的 note_failure(url): 那是给"站点吃不消"用的
+            # 全站级惩罚, 而这是单个 URL 的问题。混淆两者会让"相册里几张失效图"
+            # 变成"整个域名被降速"。
             raise
         except RateLimited as e:
             last_err = e
@@ -650,6 +675,13 @@ def download_with_mirrors(url, path, headers, retries=None, resume=True, session
         except TaskCancelled:
             # 叫停时不要再去试下一个下载点 —— 用户没有"换个源继续下"的意思
             raise
+        except GoneError as e:
+            # ⚠️ 这里**要**继续试下一个下载点: 4xx 是"这一份副本没有", 而 mirrors
+            # 存在的意义正是"同一张图换一个 CDN 变体"。只有当所有候选都 4xx 时,
+            # 才说明这个资源整体不可得(上抛给 task_manager 判成 gone)。
+            last_err = e
+            if log:
+                log(f"下载点不可用 {cand.split('/')[-1]}: {e}")
         except Exception as e:
             last_err = e
             if log:

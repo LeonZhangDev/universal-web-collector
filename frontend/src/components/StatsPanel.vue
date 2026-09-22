@@ -74,6 +74,24 @@ const pieData = computed(() => {
   });
 });
 
+// ---- 失败分类的中文名 ----
+// 权威来源是后端下发的 error_kind_labels(见 core/errors.py 的 KIND_LABELS)。
+// 本地这份只是兜底: 后端版本较旧 / 字段缺失时, 别把 "gone" 这种代号直接给用户看。
+const KIND_FALLBACK = {
+  gone: "源站已无此资源",
+  forbidden: "被拒绝访问",
+  corrupt: "文件内容损坏",
+  disk: "磁盘空间不足",
+  ratelimit: "被站点限速",
+  server: "源站服务端错误",
+  network: "网络中断或超时",
+  unknown: "未知原因",
+};
+function kindLabel(kind) {
+  const labels = (stats.value && stats.value.error_kind_labels) || {};
+  return labels[kind] || KIND_FALLBACK[kind] || kind;
+}
+
 onMounted(() => {
   load();
   timer = setInterval(load, 5000);
@@ -151,6 +169,17 @@ onUnmounted(() => clearInterval(timer));
             <div v-if="!pieData.length" class="chart-empty">暂无数据</div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- 失败**分类**聚合: 与下面那个"失败原因 TOP"的分工是 ——
+         这个回答"哪一类问题最多"(固定的机器取值, 聚得起来), 下面那个回答
+         "具体报了什么"(按 note 全文分组, 每条 note 都带各自的 URL)。 -->
+    <div v-if="stats && stats.error_kinds && stats.error_kinds.length" class="mini-box">
+      <div class="chart-title">失败分类</div>
+      <div v-for="k in stats.error_kinds" :key="k.kind" class="reason-row">
+        <span class="rct">{{ k.count }}</span>
+        <span class="rtxt" :title="k.kind">{{ kindLabel(k.kind) }}</span>
       </div>
     </div>
 

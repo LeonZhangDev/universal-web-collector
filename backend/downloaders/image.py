@@ -1,5 +1,7 @@
 from pathlib import Path
+from core import mediacheck
 from core.config import IMAGE_ACCEPT
+from core.errors import CorruptMediaError
 from .base import (
     TASK_IO_TIMEOUT,
     build_headers,
@@ -52,6 +54,19 @@ class ImageDownloader:
                 mirrors=mirrors, log=log, require_image=True, info=info,
                 request_timeout=TASK_IO_TIMEOUT,
             )
+            # ⚠️ 长度对得上 ≠ 内容可用。`_stream_one` 只比字节数, 挡不住"长度正确、
+            # 内容被中间设备截断/是 CDN 占位图"的响应 —— 那种文件会以"下载成功"落盘,
+            # 之后 sha256 去重、manifest、dHash 全都建在坏字节上, 且毫无报错。
+            #
+            # 这里用的是**算术级**判据(容器自述长度 / 尾部结束标记, 见
+            # core/mediacheck.py): 只读头尾各 32 字节, 不 spawn 任何子进程, 所以
+            # 可以对每一张图都跑。结论是确定的, 不存在"解码器觉得很怪"的模糊地带。
+            reason = mediacheck.truncation_reason(real)
+            if reason:
+                # 删掉: 这份字节是**我们刚写下的**。留在最终位置会被后续 sha256
+                # 去重当成"已有这张图"复用, 坏文件就这样传下去了。
+                Path(real).unlink(missing_ok=True)
+                raise CorruptMediaError(reason, real)
         finally:
             # 只关自己建的会话；调用方的会话归调用方，擅自关掉会踩坏它的连接池
             if self._owns_session:

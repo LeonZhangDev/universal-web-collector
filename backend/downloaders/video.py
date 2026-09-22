@@ -40,8 +40,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from core import mediacheck
 from core.cancel import TaskCancelled
 from core.config import settings
+from core.errors import CorruptMediaError
 from core.ffmpeg import find_ffmpeg
 from collectors.hls import inspect_playlist
 from .base import (
@@ -109,10 +111,32 @@ def _is_dash(url):
     return _path_only(url).endswith(".mpd")
 
 
+def _resolve_ffprobe(ff):
+    """找 ffprobe: 优先取 ffmpeg **同目录**下的那个, 再退回 PATH; 找不到返回 None。
+
+    ⚠️ 必须把"有没有探测器"和"探测结果是什么"分开表示。本模块原来让
+    `_probe_media_duration` 在**两种**情况下都返回 None —— 机器上没装 ffprobe,
+    以及 ffprobe 说这个文件读不出来。调用方无法区分, 于是要么在没装 ffprobe 的
+    机器上把每个文件都判成坏的, 要么在文件真坏了时以为"只是没有探测器"。做成
+    两个函数之后, 前者决定**放行**, 后者决定**报错**, 语义不再重叠。
+    """
+    if not ff:
+        return None
+    suffix = ".exe" if Path(ff).suffix.lower() == ".exe" else ""
+    sibling = Path(ff).with_name(f"ffprobe{suffix}")
+    if sibling.is_file():
+        return str(sibling)
+    return shutil.which("ffprobe")
+
+
 def _probe_media_duration(path, ff, progress_cb=None):
-    """用 ffprobe 读取最终容器时长；本机没有探测器时返回 None。"""
-    sibling = Path(ff).with_name("ffprobe.exe" if Path(ff).suffix.lower() == ".exe" else "ffprobe")
-    probe = str(sibling) if sibling.is_file() else shutil.which("ffprobe")
+    """用 ffprobe 读取最终容器时长。
+
+    返回秒数; 无法得到有效结果(没有 ffprobe / 超时 / 输出不可解析)时返回 None。
+    调用方**不要**把 None 当成"文件坏了" —— 先用 `_resolve_ffprobe` 确认本机
+    有没有探测能力。
+    """
+    probe = _resolve_ffprobe(ff)
     if not probe:
         return None
     cmd = [
@@ -134,7 +158,8 @@ def _probe_media_duration(path, ff, progress_cb=None):
             )
             if proc.returncode:
                 raise subprocess.CalledProcessError(proc.returncode, cmd)
-        return float(stdout.strip())
+        value = float(stdout.strip())
+        return value if value > 0 else None
     except TaskCancelled:
         raise
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -165,6 +190,50 @@ def _validate_hls_duration(path, info, ff, progress_cb=None):
             f"实际 {actual:.1f}s / 播放列表 {expected:.1f}s "
             f"(允许误差 {tolerance:.1f}s)"
         )
+    return actual
+
+
+def _validate_direct_media(path, info, ff, progress_cb=None):
+    """直链容器(非 HLS)的内容终检, 返回实测时长或 None。
+
+    ⚠️ 修的是一个静默缺陷: `_download_file` 此前**只有 Content-Length 校验**。
+    长度校验只能证明"字节数没少", 证明不了内容可用 —— 被中间设备截断却保留正确
+    Content-Length 的 mp4 会以"下载成功"落盘。而 HLS 路径早就用 ffprobe 验时长了
+    (`_validate_hls_duration`), 偏偏直链这条**绕过 ffmpeg 自己写字节**的路没有。
+
+    判据与 HLS 相同(容器时长), 但直链没有播放列表给的 expected, 所以多一条:
+    "ffprobe 在、却读不出任何时长"**本身就是结论** —— mp4 的 moov 通常在文件尾部,
+    被截断的文件连元数据都读不到, ffprobe 会直接失败。
+
+    ffprobe 不在时返回 None(放行): 与 `core/phash.py` 同一条约束 —— 辅助能力缺失
+    不该让下载失败。容器级的截断仍会被 `core/mediacheck.py` 的算术判据抓到, 那条
+    路径不依赖任何外部程序, 所以放在探测器检查**之前**。
+    """
+    # 先做零依赖的算术判据(mp4 的 box 链走不通 = 被截断)。这一步不需要 ffprobe,
+    # 所以哪怕本机没装 ffmpeg 也有一层保护。
+    reason = mediacheck.truncation_reason(path)
+    if reason:
+        raise CorruptMediaError(reason, path)
+    if not _resolve_ffprobe(ff):
+        return None
+    actual = (
+        _probe_media_duration(path, ff, progress_cb=progress_cb)
+        if progress_cb is not None
+        else _probe_media_duration(path, ff)
+    )
+    if actual is None:
+        raise CorruptMediaError(
+            "容器无法解析 —— ffprobe 读不出时长, 疑似被截断或不是有效媒体", path
+        )
+    expected = float((info or {}).get("duration") or 0)
+    if expected > 0:
+        tolerance = max(expected * (1.0 - MIN_HLS_DURATION_RATIO), 0.5)
+        if expected - actual > tolerance:
+            raise CorruptMediaError(
+                f"疑似截断: 实测 {actual:.1f}s / 声明 {expected:.1f}s"
+                f"(允许误差 {tolerance:.1f}s)",
+                path,
+            )
     return actual
 
 
@@ -240,6 +309,16 @@ class VideoDownloader:
             info=info,
             request_timeout=SHUTDOWN_IO_TIMEOUT,
         )
+        # ⚠️ 落盘后再校验内容。放在这里(而不是下载前)是因为只有此时手上才是完整
+        # 文件: 零额外请求、零误判。校验不过就删掉 —— 一份坏字节留在最终位置上会
+        # 一路冒充"已完成", 比明确失败糟糕得多。
+        try:
+            _validate_direct_media(real, info, find_ffmpeg(), progress_cb=progress_cb)
+        except TaskCancelled:
+            raise
+        except Exception:
+            Path(real).unlink(missing_ok=True)
+            raise
         return real, sha
 
     # ---- m3u8 ----

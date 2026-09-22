@@ -36,6 +36,12 @@ class ResourceOut(BaseModel):
     # 或删除任何东西。
     phash: Optional[str] = None
     duplicate_of: Optional[int] = None
+    # 失败的机器可读分类(gone/forbidden/corrupt/disk/ratelimit/server/network/
+    # unknown, 见 core/errors.py)。前端用它归类失败原因、画分布图 —— 不再靠正则
+    # 解析 note 文案(那是拿人看的字当数据用, 文案一改就静默失效)。
+    # ⚠️ 注意它也出现在**成功**资源上: error_kind='corrupt' + status='done' 表示
+    # "文件保留了, 但解码器说它可能坏了"(见 core/phash.py 的约束 1/4)。
+    error_kind: Optional[str] = None
 
 
 class ResourceCounts(BaseModel):
@@ -43,11 +49,19 @@ class ResourceCounts(BaseModel):
     done: int
     failed: int
     filtered: int
+    # "源站已无此资源"的条数。⚠️ 它**已经包含在 failed 里**(见
+    # database.summarize_resources 的口径说明), 这里只是让界面能单独说一句
+    # "其中 N 张是源站已经删了" —— 那一类不用重试。
+    gone: int = 0
 
 
 class TaskDetail(TaskOut):
     resources: List[ResourceOut]
     resource_counts: ResourceCounts
+    # 失败分类的中文标签(kind -> 文字)。随详情一起下发而不是让前端硬编码:
+    # 前端只用它做展示, 而"gone 该显示成什么"是后端词汇表的一部分 —— 两处各写
+    # 一套迟早对不上, 而失败措辞正是用户判断"要不要重试"的依据。
+    error_kind_labels: dict = {}
 
 
 class TaskListOut(BaseModel):
@@ -227,7 +241,15 @@ class TaskStatsOut(BaseModel):
     warning: Optional[str] = None
     by_date: dict = {}            # 资源按日期新增数(近 30 天, 供折线图)
     download_series: dict = {}     # 已下载资源体积按日期(字节)
-    failure_reasons: List[dict] = []  # [{reason, count}] 失败原因聚合
+    failure_reasons: List[dict] = []  # [{reason, count}] 失败原因聚合(按 note 全文)
+    # [{kind, count}] 按**固定的失败分类**聚合。与 failure_reasons 的分工: 那个说
+    # "具体报了什么"(每条 note 带各自的 URL, 几乎每组只有 1 条), 这个说"哪一类问题
+    # 最多", 是"该换代理还是该改采集器"的可靠依据。kind 的取值见 core/errors.py。
+    error_kinds: List[dict] = []
+    # kind -> 中文标签。由后端提供而不是前端硬编码: 否则"接口里叫 gone、界面写
+    # '源站已无'"这种两处维护的措辞迟早会对不上(改一处忘一处), 而失败的措辞正是
+    # 用户判断"要不要重试"的依据。
+    error_kind_labels: dict = {}
     duplicates: dict = {}          # {marked, bytes_saved} 感知去重报表
 
 

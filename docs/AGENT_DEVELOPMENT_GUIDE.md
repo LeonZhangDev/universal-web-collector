@@ -2093,4 +2093,257 @@ collectors/stockphotos/
 | `frontend/src/byterate.js` | 新增：速率差分模块 |
 | `frontend/src/components/LibraryPanel.vue` | 新增：资源库视图 |
 | `frontend/src/{App.vue,api.js,components/TaskDetail.vue,style.css}` | 改：视图切换 / 接口 / 速率曲线 / 代理面板 |
+
+---
+
+## 12. V33 — 下载层深度：三个"跑通了但结果是错的"缺陷
+
+本轮不是加功能。四条 P0/P1 级建议里挑出的三项，共同特征是**不报错、只是结果不对** ——
+这类问题在真实使用中会活很久，因为没有任何信号提示你去看。
+
+### 12.1 ⚠️ 缺陷一：4xx 被当成"站点在限流"（影响面最大）
+
+`downloaders/base.py` 的重试循环里原本只有一句判断：
+
+```python
+if isinstance(e, requests.RequestException):
+    note_failure(url)      # -> 该域名后续**所有**请求的间隔翻倍
+```
+
+而 `raise_for_status()` 抛的 `HTTPError` **正是** `RequestException` 的子类。于是：
+
+- **一张已被删除的图（404）会拖慢整个站点。** `note_failure` 是驱动 AIMD 的
+  "站点吃不消了"信号，而 404 是**这一个 URL** 的问题。症状是"相册里加了几张失效图
+  之后全站都变慢"，没有报错、没有日志。
+- **404 是永久失败，却要走满 `image_retries` 轮指数退避** —— 每张约 20 秒空转，
+  200 张就是十几分钟。
+
+**修法：在 `raise_for_status()` 之前按状态码分流。**
+
+```python
+PERMANENT_STATUS = frozenset({400, 401, 402, 403, 404, 405, 406, 410, 451})
+
+if resp.status_code in PERMANENT_STATUS:
+    raise GoneError(resp.status_code, url, ...)
+resp.raise_for_status()
+```
+
+然后在重试循环里 `except GoneError: raise`（在 `except Exception` **之前**）。
+
+**界限（改这里最容易搞错的地方）**：
+
+| 状态 | 处理 | 为什么 |
+| --- | --- | --- |
+| 408 / 429 | 照旧重试 | 它们恰恰**是**该重试的；429 走站点级冷却 |
+| 5xx | 照旧重试 + `note_failure` | 站点自己出错，那个惩罚是**对的** |
+| 4xx（除上） | 不重试 / 不退避 / 不记站点失败 | 单个 URL 的问题，重试无意义 |
+
+⚠️ `download_with_mirrors` 里对 `GoneError` **要**继续试下一个下载点：4xx 是"这一份
+副本没有"，而 mirrors 存在的意义正是换一个 CDN 变体。只有所有候选都 4xx，才说明这个
+资源整体不可得。这一条如果写成"直接上抛"，一个 CDN 上的 404 会让整张图判死。
+
+**新增资源状态 `gone`**（与 `failed` 分开）：
+
+- `submit_resource` / `/tasks/{id}/retry-failed` **仍允许**手动重试 `gone`：
+  自动流程克制（重试是空转），用户手动点则放行（403 可能换了代理就好了）。
+- `_final_status` 把 `gone` **计入失败**：要 56 张拿到 0 张，不该显示成绿灯。
+- 前端用**灰**而不是红：红会让人以为"再点一次也许就好了"。
+
+### 12.2 ⚠️ 缺陷二：直链媒体只校验字节数
+
+`_stream_one` 的 `Content-Length` 校验只能证明**字节数**没少。三种真实形态能通过它却
+仍是坏文件：中间设备截断响应体但保留正确长度、CDN 回了长度正确的错误页、源站上的文件
+本身就是转码失败的半成品。它们都会以"下载成功"落盘，之后 sha256 去重 / manifest /
+缩略图全建立在坏字节上。
+
+**修法分两层，判据强度不同：**
+
+**① 算术级（`core/mediacheck.py`，新增）—— 只读头尾各 32 字节，零子进程。**
+
+| 格式 | 判据 | 强度 |
+| --- | --- | --- |
+| WebP (RIFF) | 头部长度字段 + 8 **恰好等于**文件大小 | 精确 |
+| BMP | 头部长度字段**恰好等于**文件大小 | 精确 |
+| MP4/MOV/AVIF | ISOBMFF box 链必须能走通且不越出文件末尾 | 精确 |
+| JPEG | 尾部必须有 EOI `FF D9` | 强 |
+| PNG | 尾部必须有 IEND | 强 |
+| GIF | 末尾必须是 `0x3B` | 强 |
+| 其它 | **不下结论**（返回 `None`） | — |
+
+**为什么不做"解码一遍"**：慢（5000×5000 的 JPEG 完整解码上百毫秒 × 每张图），
+而且**方向不明** —— 解码器对损坏文件很宽容（截断的 JPEG 仍能解出上半张、退出码 0），
+反过来 ffmpeg 不认识的冷门封装会被误判成坏文件，那时删掉的是用户真正想要的东西。
+而"文件完不完整"是**算术题**，结论是确定的，没有"解码器觉得很怪"的模糊地带。
+
+**四条"宁可漏报不可误报"的约束**（误报的代价是删掉好文件）：
+1. 认不出的格式返回 `None` 放行；
+2. BMP 长度字段为 0 视作"未填写"而非"截断"；
+3. JPEG 的 EOI 是在尾部 64 字节**里找**，不要求正好在最后两位（有的编码器会补几个字节）；
+4. ISOBMFF 只在**发现越界**时下结论；走到一半没字节了（尾填充）算通过。
+
+`size == 0` 是"这个 box 一直到文件结尾"，是合法写法；`size == 1` 表示后 8 字节才是
+64 位长度。两者都不是损坏。
+
+**② 探测器级（`downloaders/video.py::_validate_direct_media`）—— ffprobe 读时长。**
+
+HLS 路径早就有 `_validate_hls_duration`，偏偏直链这条**绕过 ffmpeg 自己写字节**的路没有。
+mp4 的 `moov` 通常在文件尾部，被截断的文件连元数据都读不到 → ffprobe 直接失败。
+
+⚠️ **必须把"有没有探测器"与"探测结果是什么"分开表示。** 原来 `_probe_media_duration`
+在两种情况下都返回 `None`：本机没装 ffprobe、以及 ffprobe 说这文件读不出来。调用方
+无法区分，于是要么在缺 ffprobe 的机器上把每个文件都判成坏的，要么在文件真坏时以为
+"只是没有探测器"。现在拆成 `_resolve_ffprobe()`（决定**放行**）与探测结果（决定**报错**）。
+
+图片侧同理：`downloaders/image.py` 在下载后调 `truncation_reason`，不过就**删掉刚写的
+那份字节**并抛 `CorruptMediaError` —— 留在最终位置会被后续 sha256 去重当成"已有这张图"
+复用，坏文件就这样传下去。
+
+### 12.3 ⚠️ 缺陷三：坏文件的最强证据被静默丢掉
+
+`core/phash.py::decode_gray` 用 ffmpeg 解码算指纹，失败返回 `None`。调用方只知道
+"没算出指纹"。但 **ffmpeg 在、却解不开这个文件** 是整个系统里最可靠的一条坏文件证据
+（比长度校验强：长度对得上也可能是坏字节），原实现里它唯一的后果是"这次没算指纹"。
+
+**修法：把原因分成两个码。**
+
+```python
+NO_DECODER = "no_decoder"        # 本机没有 ffmpeg（或环境异常）: 与文件无关, 放行
+DECODE_FAILED = "decode_failed"  # ffmpeg 在, 但解不开 —— 文件可疑
+```
+
+⚠️ **合并这两者就是原实现的根本问题。** 一条有用的中间信号：`returncode == 0`
+但吐不满一帧（`len(raw) < want`）也是 `DECODE_FAILED` —— 那是"文件头合法、后半截没了"，
+正是长度校验抓不到的那一类。
+
+另一条边界：`except Exception` 兜底时返回 `NO_DECODER`，**不能**返回 `DECODE_FAILED`。
+`OSError("文件被占用")` 是我们的环境问题，拿它去指认"文件已损坏"就是冤枉。
+
+`DECODE_FAILED` → 写 `resources.error_kind = 'corrupt'` + note，**仍只标记不删除**
+（与 dHash 同一条约束：解码器也会认错冷门格式，删文件不可逆）。
+
+### 12.4 `error_kind`：拿数据当数据用
+
+界面此前靠**正则解析 note 文案**归类失败原因（`TaskDetail.vue` 里的
+`/\b403\b|forbidden/`、`/timeout/`）。那是拿人看的字当数据用：措辞一改归类就静默失效，
+换个语言全落进"其他"，也没法支持"按原因筛选/批量重试"。
+
+`resources` 新增 `error_kind` 列（记得同时加进 `_ADD_COLUMNS` 与 `SCHEMA`），
+取值由 `core/errors.classify(exc)` 统一给出：
+
+| kind | 触发 | 该做什么 |
+| --- | --- | --- |
+| `gone` | 404/410 | 不用重试 |
+| `forbidden` | 401/403/451 | 换代理 / 改 Referer |
+| `corrupt` | `CorruptMediaError` / `DECODE_FAILED` | 人工确认（文件已保留） |
+| `disk` | `DiskFullError` / `ENOSPC` | 清理空间 |
+| `ratelimit` | 429 | 降速或换线 |
+| `server` | 5xx | 稍后重试 |
+| `network` | 连接/超时/TLS | 换代理 |
+| `unknown` | 分类之外 | 多半是我们自己的 bug |
+
+**三个容易写错的点：**
+
+1. `classify` 用**名字**而不是 import 来识别 `RateLimited` / `HTTPError` —— 它们定义在
+   `downloaders/base.py`，而 base 反过来 import `core/errors`，在这里 import 会形成循环。
+   按名字判断是本项目已有的做法（见 `errors.is_retryable`）。
+2. `db.error_kinds()` **不按 status 过滤**。`corrupt` 会落在 `done` 上（文件保留只标记），
+   按 status 过滤恰好会漏掉最该被看见的那一类。
+3. 中文标签由后端下发（`error_kind_labels` ← `errors.KIND_LABELS`）。前端只用不另写一套
+   —— 两处各写一套的措辞迟早对不上，而失败措辞正是用户判断"要不要重试"的依据。前端
+   保留一份兜底映射只是为了兼容没有该字段的旧后端，不是权威。
+
+**口径一致性**（本项目的铁律，本轮又碰了两次）：`gone` 一旦引入，就有三处必须同口径 ——
+`task_manager._final_status`、`database.summarize_resources`、前端 `failedSkippedCount`。
+`summarize_resources` 的 `failed` **包含** `gone`，另外单给一个 `gone` 字段，两者
+语义在 docstring 里写明。不一致的症状是"摘要说 0 失败、任务状态却是 failed"。
+
+### 12.5 ⚠️ 缺陷四：CDN 画像的命中被静默丢弃（附带收掉的）
+
+不属于下载层，但同一类"静默失败"，而且它正是本仓库测试套件**偶发变红**的原因 —— 留着会
+让每一轮验证都不可信，所以一并收掉。
+
+`core/cdn_profile.py` 的**读者**（`preferred_bases` / `preferred_seq_format` /
+`summarize`）原本不走锁，而**写者**靠 `tmp.replace(p)` 换文件。Windows 上只要目标文件
+还有别的句柄开着（哪怕只是只读），`os.replace` 就会以 `PermissionError` 失败 —— 而旧
+代码把它吞进 `except OSError: pass`。实测「一个只读线程 + 一个写线程」并发：
+
+```
+写入 300 次, 画像记到 150 次  ->  丢 150 次
+```
+
+并发采集时命中记录**丢一半**，表象只是"画像学得很慢 / 看起来像站点在迁 CDN"，与真实
+原因隔了两层。
+
+**修法两层**（缺一不可）：
+
+1. 锁换成 `RLock`，**读者也进临界区** —— 进程内的占用彻底消除。必须可重入：
+   `record_hit` 要在同一次"读-改-写"里依次调 `_read` 与 `_write`，两者各自也要加锁。
+2. `tmp.replace` 加**重试**（5 次线性退避）—— 编辑器 / 杀毒软件这类**外部**占用是锁挡不住
+   的，而窗口是微秒级。
+
+契约未变：画像只是线索，写不进去仍不该让采集失败（`_write` 重试遍后仍然静默返回）。
+区别是"写不进去"从常态变回了罕见。
+
+**教训（与第 9 条静默坑同源）**：`except OSError: pass` 这种"宽恕"写在一个**本来就会
+失败**的写入上时，等于把数据丢失改装成静默。判据是两问 —— "失败会发生吗"、"失败之后
+有人知道吗"，两个都答"否"的地方，至少要加一次重试，或者留一条可观测的痕迹。
+
+**验证方式**：回归测试 `test_profile_records_every_hit_while_readers_run`（读者线程 +
+200 次写，断言精确等于 200）。**反向确认过** —— 把它跑在修复前的 `cdn_profile.py` 上
+稳定失败（实测 `assert 103 == 200`）。没有反向确认的回归测试，只是装饰。
+
+### 12.6 验证（2026-09-22）
+
+| 项目 | 结果 |
+| --- | --- |
+| 新增 `tests/test_features_v33.py` | 50 项 |
+| 全量 pytest（CI 等价环境：`uv sync --group dev`，含 `curl-cffi`） | **813 passed / 6 skipped**，连跑两次一致 |
+| `verify_output.py` / `verify_hls.py` | 40 项 / 18 项断言 |
+| `selfcheck.py` | 站点声明自洽 |
+| 前端 `vite build` | 90 modules |
+
+⚠️ **本机 `uwc-verify` 虚拟环境缺 `curl-cffi`（主依赖）**，会让
+`tests/test_downloaders.py` 的 3 项与 `test_gallery_preview.py` 的 1 项变红。
+那是**环境问题不是回归**：`curl_cffi` 在 `pyproject.toml` 的 `dependencies` 里（TLS 指纹
+必需），CI 会装。要在本机拿到有意义的全量结果，用
+`UV_PROJECT_ENVIRONMENT=<临时目录> uv sync --group dev` 另建一个环境。
+
+⚠️ **`verify_output.py` 里的 mp4 fixture 必须是真容器**。V33 给直链加了内容终检之后，
+原来那段"假 mp4"会被**正确地**判成坏文件删掉，红的却是"视频任务应当成功"这条断言 ——
+根因在 fixture 说谎。现在内嵌一段 base64 的真实 mp4（64x64 / 10fps / 1s）。
+`verify_hls.py` 同理：它现场用 ffmpeg 生成素材并往 mp4 后追加注释，正好是 `mediacheck`
+最容易被骗到的输入，所以两处 fixture 都在钉这一类边界。
+
+⚠️ **`verify_hls.py` 的素材生成要显式 `-hls_playlist_type vod`**。不写这个参数时 ffmpeg
+靠"hls_list_size==0 就当 VOD"的隐式收敛决定要不要收尾，实测偶发（6 次里 1 次）产出**只列
+了 11 片、且没有 `#EXT-X-ENDLIST`** 的中间态播放列表，正好撞上 `collectors/hls.py` 的
+完整性门禁 —— **素材生成**的抖动被伪装成**下载层缺陷**。现在生成后有素材自检：缺 ENDLIST
+或"列出的分片数 ≠ 磁盘分片数"就以素材的名义失败。
+
+**通用教训**：验证脚本的 fixture 也是被测契约的一部分。给产品加了一道校验，就要回头问
+"我这些 fixture 还诚实吗"—— 不诚实的 fixture 会把产品缺陷和测试缺陷混成同一个红。
+
+### 12.7 新增/改动文件
+
+| 文件 | 性质 |
+| --- | --- |
+| `backend/core/errors.py` | 改：`GoneError` / `CorruptMediaError` / `classify()` / `KIND_*` / `KIND_LABELS` |
+| `backend/core/mediacheck.py` | **新增**：容器完整性算术判据 |
+| `backend/core/cdn_profile.py` | 改：`RLock` + 读者进临界区 + `replace` 重试（缺陷四） |
+| `backend/downloaders/base.py` | 改：`PERMANENT_STATUS` 分流 + `except GoneError` + mirrors 语义 |
+| `backend/downloaders/image.py` | 改：下载后 `truncation_reason`，不过则删文件并抛错 |
+| `backend/downloaders/video.py` | 改：`_resolve_ffprobe` 拆分 + `_validate_direct_media` + 直链接线 |
+| `backend/core/phash.py` | 改：`decode_gray_ex` / `dhash_ex` + `NO_DECODER` / `DECODE_FAILED` |
+| `backend/core/database.py` | 改：`error_kind` 列（SCHEMA + `_ADD_COLUMNS`）、`error_kinds()`、`summarize_resources` 口径 |
+| `backend/core/task_manager.py` | 改：`gone`/`corrupt` 分支、`error_kind` 落库、`_final_status`、重试口径、`_mark_perceptual_dup` 上报 |
+| `backend/api/tasks.py` | 改：`error_kinds`/`error_kind_labels` 下发、`retry-failed` 纳入 `gone` |
+| `backend/models/schemas.py` | 改：`ResourceOut.error_kind`、`ResourceCounts.gone`、`TaskDetail.error_kind_labels`、`TaskStatsOut.error_kinds` |
+| `frontend/src/components/TaskDetail.vue` | 改：状态中文名、`gone` tab、`error_kind` 归类、损坏标记、重试口径 |
+| `frontend/src/components/StatsPanel.vue` | 改：失败分类聚合块 |
+| `frontend/src/style.css` | 改：`.badge.gone` |
+| `scripts/verify_output.py` | 改：mp4 fixture 换成内嵌真实容器 |
+| `scripts/verify_hls.py` | 改：`-hls_playlist_type vod` + 素材自检 |
+| `tests/test_features_v33.py` | **新增**：50 项 |
+| `tests/test_task_summary.py` | 改：`gone` 口径（含新增一条语义测试） |
+| `tests/test_ffmpeg.py` | 改：直链终检契约 + 坏文件删除 |
 | `tests/test_features_v32.py` | 新增：30 项 |

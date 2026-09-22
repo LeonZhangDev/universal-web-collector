@@ -48,6 +48,9 @@ const STATUS_TABS = [
   { key: "all", label: "全部" },
   { key: "done", label: "已下载" },
   { key: "failed", label: "失败" },
+  // 与"失败"分开一个 tab: 这两类的**下一步动作**完全不同 —— 失败该重试,
+  // 而 gone(源站已删)重试一百次也一样。混在一起会让人反复点重试白等。
+  { key: "gone", label: "源站已无" },
   { key: "filtered", label: "已过滤" },
   { key: "pending", label: "待处理" },
 ];
@@ -120,12 +123,31 @@ const stat = computed(() => {
   }
   return m;
 });
+// 失败分类的中文名: 权威来源是后端随详情下发的 `error_kind_labels`, 这里只留一份
+// **兜底**——用于后端版本较旧(没有这个字段)时不至于把 "gone" 这种代号直接显示给用户。
+const KIND_FALLBACK = {
+  gone: "源站已无此资源",
+  forbidden: "被拒绝访问",
+  corrupt: "文件内容损坏",
+  disk: "磁盘空间不足",
+  ratelimit: "被站点限速",
+  server: "源站服务端错误",
+  network: "网络中断或超时",
+  unknown: "未知原因",
+};
+const labels = computed(() => task.value?.error_kind_labels || {});
+
 function badgeClass(s) {
   if (s === "done") return "success";
   if (s === "failed") return "failed";
+  // gone 用单独的颜色(灰)而不是红: 它传达的是"结束/不用管了", 不是"出错了"
+  if (s === "gone") return "gone";
   if (s === "filtered") return "filtered";
   return "pending";
 }
+
+// 状态徽章的中文名走共享的 `../status`(文件顶部已 import) —— 别在这里再写一份:
+// 本项目已经有过"两处各写一套状态文案"的重复键事故(见 status.js 的注释)。
 
 // 速率曲线的 SVG 几何: 把速率序列归一化到 300x44 的画布。
 // 用**相对峰值**而不是绝对字节来定高: 一张图 2MB 与一段视频 200MB 量级差两个
@@ -154,31 +176,53 @@ const spark = computed(() => {
 const dupCount = computed(
   () => (task.value?.resources || []).filter((r) => r.duplicate_of).length
 );
+// 标记为"可能已损坏"的成功资源(解码器解不开)。文件**保留着**, 所以它不是失败,
+// 但必须让人看见 —— 否则用户会把一张打不开的图当成下载成功。
+const corruptCount = computed(
+  () => (task.value?.resources || []).filter((r) => r.error_kind === "corrupt").length
+);
 const failedSkippedCount = computed(
   () =>
     (task.value?.resources || []).filter((r) =>
-      ["failed", "skipped"].includes(r.status)
+      ["failed", "skipped", "gone"].includes(r.status)
     ).length
 );
 
-// 失败原因聚合: 解析失败资源的 note 归类成 403/超时/404/其他,
-// 让人一眼看出"该换代理还是该换采集器"。
+// 失败原因聚合: 按后端的 `error_kind` 归类, 而不是解析 note 文案。
+//
+// ⚠️ 这里原来是正则匹配 note 字符串(/403|forbidden/、/timeout/ ...)。那是拿人看的
+// 文案当数据用 —— 措辞一改就整片落进"其他", 而且换语言/加标点都会静默失效。
+// 现在 kind 是固定的机器取值(见 core/errors.py), 文案由后端给
+// (stats.error_kind_labels), 两边不会各写一套话。
+//
+// 旧任务(gone/error_kind 上线前)没有这一列, 用 note 关键词兜底, 免得历史任务
+// 的分布图突然变成空白。
+function legacyKind(r) {
+  const n = String(r.note || "");
+  if (/\b403\b|forbidden|blocked|被封|风控|拒绝访问/i.test(n)) return "forbidden";
+  if (/timeout|timed out|超时/i.test(n)) return "network";
+  if (/\b404\b|not found|不存在|已不存在/i.test(n)) return "gone";
+  return "unknown";
+}
 const failReasons = computed(() => {
   const rs = (task.value?.resources || []).filter((r) =>
-    ["failed", "skipped"].includes(r.status)
+    ["failed", "skipped", "gone"].includes(r.status)
   );
-  const buckets = { "403/被封": 0, "超时": 0, "404/不存在": 0, "其他": 0 };
+  const counts = {};
   for (const r of rs) {
-    const n = String(r.note || "");
-    if (/\b403\b|forbidden|blocked|被封|风控/i.test(n)) buckets["403/被封"]++;
-    else if (/timeout|timed out|超时/i.test(n)) buckets["超时"]++;
-    else if (/\b404\b|not found|不存在/i.test(n)) buckets["404/不存在"]++;
-    else buckets["其他"]++;
+    const kind = r.error_kind || legacyKind(r);
+    counts[kind] = (counts[kind] || 0) + 1;
   }
+  const labels = labels.value || {};
   const total = rs.length || 1;
-  return Object.entries(buckets)
-    .filter(([, n]) => n > 0)
-    .map(([label, n]) => ({ label, n, pct: Math.round((n / total) * 100) }));
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([kind, n]) => ({
+      kind,
+      label: labels[kind] || KIND_FALLBACK[kind] || kind,
+      n,
+      pct: Math.round((n / total) * 100),
+    }));
 });
 
 function fmtSize(n) {
@@ -390,6 +434,12 @@ onUnmounted(() => {
             <span class="di">⚠️</span>
             本任务有 <b>{{ dupCount }}</b> 张与已有资源疑似重复（依据感知指纹），文件已保留、未删除。
           </div>
+          <!-- 疑似损坏: 解码器解不开这些文件。状态是"已下载"(字节确实下全了),
+               所以必须单独说一句 —— 否则用户会把打不开的图当成下载成功。 -->
+          <div class="dup-report" v-if="corruptCount">
+            <span class="di">⚠️</span>
+            有 <b>{{ corruptCount }}</b> 个文件解码失败（可能在传输中被截断），文件已保留、请人工确认。
+          </div>
           <!-- 失败原因分布: 判断"换代理"还是"换采集器" -->
           <div class="fail-report" v-if="failReasons.length">
             <div class="fr-head">
@@ -397,7 +447,7 @@ onUnmounted(() => {
               <span class="grow"></span>
               <button class="ghost mini" @click="retryFailedRes">全部重试</button>
             </div>
-            <div class="fr-row" v-for="f in failReasons" :key="f.label">
+            <div class="fr-row" v-for="f in failReasons" :key="f.kind">
               <span class="fr-lb">{{ f.label }}</span>
               <span class="fr-bar"><span class="fr-fill" :style="{ width: f.pct + '%' }"></span></span>
               <span class="fr-n">{{ f.n }}</span>
@@ -429,13 +479,18 @@ onUnmounted(() => {
               <div v-else class="video-placeholder">{{ typeIcon[r.type] || "📄" }}</div>
               <div class="meta">
                 <div class="name">{{ (r.url || "").split("/").pop() || r.url }}</div>
-                <span class="badge" :class="badgeClass(r.status)">{{ r.status }}</span>
+                <span class="badge" :class="badgeClass(r.status)">{{ statusLabel(r.status, "resource") }}</span>
                 <span class="sz dup-hint" v-if="r.duplicate_of" title="感知指纹判定疑似相同, 文件已保留">
                   疑似重复 #{{ r.duplicate_of }}
                 </span>
+                <span
+                  class="sz dup-hint"
+                  v-if="r.error_kind === 'corrupt'"
+                  title="解码器无法读取该文件, 可能已损坏; 文件已保留"
+                >可能已损坏</span>
                 <span class="sz" v-if="r.size">{{ fmtSize(r.size) }}</span>
                 <button
-                  v-if="canRetryResource && ['failed', 'skipped', 'filtered'].includes(r.status)"
+                  v-if="canRetryResource && ['failed', 'skipped', 'filtered', 'gone'].includes(r.status)"
                   class="ghost mini"
                   @click="retryRes(r)"
                 >{{ r.status === 'filtered' ? '强制下载' : '重试' }}</button>
@@ -449,17 +504,22 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr v-for="r in visible" :key="r.id">
-                <td><span class="badge" :class="badgeClass(r.status)">{{ r.status }}</span></td>
+                <td><span class="badge" :class="badgeClass(r.status)">{{ statusLabel(r.status, "resource") }}</span></td>
                 <td class="nm">
                   <a v-if="r.file_url && r.type === 'image'" @click.prevent="openLb(lightboxImages.findIndex((x) => x.url === r.file_url))" class="lk">{{ (r.url || '').split('/').pop() || r.url }}</a>
                   <span v-else>{{ (r.url || '').split('/').pop() || r.url }}</span>
                   <span class="sz dup-hint" v-if="r.duplicate_of" title="感知指纹判定疑似相同, 文件已保留">疑似重复 #{{ r.duplicate_of }}</span>
+                  <span
+                    class="sz dup-hint"
+                    v-if="r.error_kind === 'corrupt'"
+                    title="解码器无法读取该文件, 可能已损坏; 文件已保留"
+                  >可能已损坏</span>
                 </td>
                 <td>{{ typeIcon[r.type] || "📄" }} {{ r.type }}</td>
                 <td>{{ r.size ? fmtSize(r.size) : "—" }}</td>
                 <td>
                   <button
-                    v-if="canRetryResource && ['failed', 'skipped', 'filtered'].includes(r.status)"
+                    v-if="canRetryResource && ['failed', 'skipped', 'filtered', 'gone'].includes(r.status)"
                     class="ghost mini"
                     @click="retryRes(r)"
                   >{{ r.status === 'filtered' ? '强制下载' : '重试' }}</button>

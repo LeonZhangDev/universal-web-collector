@@ -12,10 +12,19 @@ from pathlib import Path
 from collectors import get_collector
 from core import events
 from core import layout
+from core import mediacheck
 from core.cancel import TaskCancelled  # noqa: F401  (下载层要识别它, 在这里重导出)
 from core.config import settings
 from core.disk import ensure_free
-from core.errors import CollectorError, DiskFullError, describe
+from core.errors import (
+    KIND_CORRUPT,
+    CollectorError,
+    CorruptMediaError,
+    DiskFullError,
+    GoneError,
+    classify,
+    describe,
+)
 from core.filters import Filters, probe_size
 from core.imageinfo import fmt_dimensions, image_dimensions
 from core.manifest import manifest_enabled, write_manifest, write_sidecar
@@ -397,7 +406,10 @@ class TaskManager:
         # 把被暂停打断的资源(downloading/skipped)与之前失败的标回 pending
         for r in db.get_resources(task_id):
             if r["status"] in ("pending", "failed", "skipped", "downloading"):
-                db.update_resource(r["id"], status="pending", note=None)
+                # error_kind 一并清掉: 它是"上一次为什么失败"的结论, 重下之前
+                # 留着会让界面显示过期的原因
+                db.update_resource(r["id"], status="pending", note=None,
+                                   error_kind=None)
         db.update_task(task_id, error=None, progress=0)
         if not db.transition_task(task_id, TaskStatus.PENDING, TaskStatus.PAUSED):
             return False, "task state changed concurrently"
@@ -497,7 +509,12 @@ class TaskManager:
         return {"files": count, "bytes": total}
 
     def submit_resource(self, task_id, resource_id):
-        """资源级重试: 单个 failed/skipped 资源重新下载, 不影响任务状态。"""
+        """资源级重试: 单个 failed/skipped/gone 资源重新下载, 不影响任务状态。
+
+        ⚠️ `gone` 也在可重试之列。自动流程**不**重试它(源站没有了, 重试是空转),
+        但用户手动点重试时应该放行 —— 403 可能是代理/Referer 变了, 404 也可能是
+        站点临时抽风。自动的克制与手动的自由, 两者不矛盾。
+        """
         task = db.get_task(task_id)
         r = db.get_resource(resource_id)
         if not task or not r or r["task_id"] != task_id:
@@ -509,10 +526,11 @@ class TaskManager:
             TaskStatus.CANCELLED,
         ):
             return False, "task still running"
-        if r["status"] not in ("failed", "skipped", "filtered"):
+        if r["status"] not in ("failed", "skipped", "filtered", "gone"):
             return False, f"resource status is {r['status']}"
 
-        db.update_resource(resource_id, status="pending", note=None)
+        # 重试要把上一次的失败分类清掉, 否则 error_kind 会一直挂着旧结论
+        db.update_resource(resource_id, status="pending", note=None, error_kind=None)
         out_dir = self._root_dir(task_id)
         self._safe_log(task_id, f"resource retry: {r['url']}")
         # 单资源重试视为用户"强制下载"这一个资源, 不再套用过滤规则
@@ -1173,10 +1191,14 @@ class TaskManager:
 
         过滤与跳过不计为失败: 那是用户规则或能力缺失的结果, 不是任务出错。
         旧行为是不看资源结果一律 success, 于是"56 张全部下载失败"也显示成功。
+
+        ⚠️ `gone`(源站已无此资源)**计入失败**。它在界面上是与 failed 区分开的
+        独立状态(告诉用户"不用重试了, 是源站没有了"), 但对任务整体而言, "要 56 张
+        只拿到 0 张"和"56 张全部失败"是一回事 —— 都不该显示成绿灯。
         """
         stat = self._resource_stat(task_id)
         done = stat.get("done", 0)
-        failed = stat.get("failed", 0)
+        failed = stat.get("failed", 0) + stat.get("gone", 0)
         # ⚠️ 一个资源都没有却走到这里 = 这次运行什么也没产出。空集在"全部成功"
         # 的判定下会被算成 success, 于是"什么也没下到"与"全部下好了"在界面上
         # 长得一模一样。正常路径已在采集后判空抛错, 这里兜住其余入口。
@@ -1383,13 +1405,33 @@ class TaskManager:
                 abort.set()
             # 残片在满盘时只是占位, 清掉还给磁盘一点空间
             self._discard_partial(out_dir, r)
-            db.update_resource(rid, status="failed", note=str(e))
+            db.update_resource(rid, status="failed", note=str(e),
+                               error_kind=classify(e))
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, str(e), "error")
+        except GoneError as e:
+            # 源站已经没有这个资源(404/410), 或明确拒绝访问(401/403/451)。
+            # **单独的终态 gone**: 重试改变不了结果, 但它与"我们下载失败了"是两件
+            # 事 —— 界面上要能一句话说清"是源站删了, 别重试了", 用户才不会反复点
+            # 重试按钮白等。任务整体仍按失败计入(_final_status 见)。
+            db.update_resource(rid, status="gone", note=str(e)[:500],
+                               error_kind=e.kind)
+            self._publish_resource(task_id, rid, "gone")
+            self._safe_log(task_id, f"gone {r['url']}: {e}", "warn")
+        except CorruptMediaError as e:
+            # 字节下全了, 内容是坏的(容器被截断 / 解码器解不开)。下载器在发现时
+            # **已经**删掉了它刚写的那份; 这里再清一次半成品, 保证最终位置上不留
+            # 任何东西 —— 一份坏字节留在那里会被后续任务当成"已有这张图"复用。
+            self._discard_partial(out_dir, r)
+            db.update_resource(rid, status="failed", note=str(e)[:500],
+                               error_kind=KIND_CORRUPT)
+            self._publish_resource(task_id, rid, "failed")
+            self._safe_log(task_id, f"corrupt {r['url']}: {e}", "error")
         except CollectorError as e:
             # 外部世界的问题(站点/URL/环境): 消息本身就是写给用户看的,
             # 不打堆栈 —— 堆栈会把"接下来怎么办"挤到屏幕外。
-            db.update_resource(rid, status="failed", note=str(e)[:500])
+            db.update_resource(rid, status="failed", note=str(e)[:500],
+                               error_kind=classify(e))
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"{r['url']}: {e}", "error")
         except Exception as e:
@@ -1397,7 +1439,9 @@ class TaskManager:
             # 只在**真的走完重试链仍失败**时记账 —— 中间某次重试失败不代表线不好。
             if proxy_pool is not None and picked:
                 proxy_pool.note_failure(picked)
-            db.update_resource(rid, status="failed")
+            # error_kind: 分类之外的多半是我们自己的 bug(unknown), 但网络/5xx
+            # 这类没被包装的异常也常落在这里, 所以还是要过一遍 classify。
+            db.update_resource(rid, status="failed", error_kind=classify(e))
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"fail {r['url']}: {describe(e)}", "error")
             # ⚠️ 走到这里说明**分类之外**: 不是站点的问题, 也不是环境的问题,
@@ -1419,11 +1463,29 @@ class TaskManager:
         try:
             from core import phash
 
-            got = phash.dhash(path)
+            got, why = phash.dhash_ex(path)
             if not got:
-                # 算不出(ffmpeg 不在 / 解码失败)就当作"没有指纹", 静默放行。
+                # ⚠️ 两类失败要分开处理, 原来它们被合并成一个静默 return:
+                #   * NO_DECODER    —— 本机没有 ffmpeg, 这与文件无关, 放行;
+                #   * DECODE_FAILED —— ffmpeg 在、却解不开这个文件。这是整个系统里
+                #     **最可靠的坏文件证据**(比长度校验强: 字节数对得上也可能是坏
+                #     字节), 原来唯一的后果是"这次没算指纹", 信号被完全丢掉。
+                #
+                # 仍然**只标记不删除**(约束 1): 解码器也会认错冷门格式, 删文件
+                # 不可逆。写进 error_kind + note, 在界面上标出来由人决定。
+                if why == phash.DECODE_FAILED:
+                    db.update_resource(
+                        rid,
+                        error_kind=KIND_CORRUPT,
+                        note="解码器无法读取: 文件可能已损坏(已保留, 未删除)",
+                    )
+                    self._safe_log(
+                        task_id,
+                        f"corrupt? {url}: 解码失败, 文件已保留待人工确认",
+                        "warn",
+                    )
                 # 这里刻意**不写日志**: 一个 300 张的相册会刷 300 行同样的
-                # "算不出指纹", 真正的错误会被淹没。要排查就单跑 phash.dhash()。
+                # "算不出指纹", 真正的错误会被淹没。
                 return
             known = db.task_phashes(task_id, exclude_id=rid)
             db.update_resource(rid, phash=got)

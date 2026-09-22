@@ -61,7 +61,11 @@ CREATE TABLE IF NOT EXISTS resources(
     resolved_url TEXT,
     -- 感知指纹与"疑似重复"(见 core/phash.py): 只标记, 绝不自动删除
     phash TEXT,
-    duplicate_of INTEGER
+    duplicate_of INTEGER,
+    -- 失败的机器可读分类: gone/forbidden/corrupt/disk/ratelimit/server/
+    -- network/unknown。见 core/errors.py 的 classify() —— 界面与"按原因重试"
+    -- 都读这一列, 不再靠正则解析 note 文案。
+    error_kind TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_logs(
@@ -135,6 +139,11 @@ _ADD_COLUMNS = [
     # 删文件是不可逆的, 而出错的代价由用户承担。
     ("resources", "phash", "TEXT"),
     ("resources", "duplicate_of", "INTEGER"),
+    # 失败的**机器可读**分类(gone/forbidden/corrupt/disk/ratelimit/server/
+    # network/unknown, 见 core/errors.py 的 classify)。界面此前靠正则去解析 note
+    # 文案来归类失败原因 —— 那是拿人看的字当数据用, 文案一改归类就静默失效, 而且
+    # 没法支持"按原因筛选/批量重试"。
+    ("resources", "error_kind", "TEXT"),
 ]
 
 
@@ -522,13 +531,22 @@ def count_resources(task_id):
 
 
 def summarize_resources(task_id):
-    """返回任务资源总数与面向任务摘要的终态计数。"""
+    """返回任务资源总数与面向任务摘要的终态计数。
+
+    ⚠️ `failed` 把 `gone` **算进去**: 任务摘要只需要回答"成没成", 而"源站已经没有
+    这个资源"与"下载失败"对任务整体是同一件事(要 56 张只拿到 0 张)。分开的那一份
+    单独放在 `gone` 里, 给界面做更细的提示用。这里的口径必须与
+    `task_manager._final_status` 一致, 否则会出现"摘要说 0 失败、状态却是 failed"。
+    """
     by_status = count_resources(task_id)
+    failed = by_status.get("failed", 0)
+    gone = by_status.get("gone", 0)
     return {
         "total": sum(by_status.values()),
         "done": by_status.get("done", 0),
-        "failed": by_status.get("failed", 0),
+        "failed": failed + gone,
         "filtered": by_status.get("filtered", 0),
+        "gone": gone,
     }
 
 
@@ -627,6 +645,25 @@ def failure_reasons(limit=8):
         (limit,),
     )
     return [{"reason": r["note"], "count": r["n"]} for r in rows]
+
+
+def error_kinds():
+    """按 `error_kind` 聚合 —— "哪一类问题最多"的可靠答案。
+
+    ⚠️ 与 `failure_reasons()` 的分工要说清: 那个按 note **全文**分组, 回答
+    "具体报了什么"(每条 note 里都带着各自的 URL, 所以真实数据上几乎每组只有 1 条,
+    聚不出东西); 这个按固定的 kind 取值分组, 回答"该换代理还是该改采集器"。
+
+    统计**所有**带 error_kind 的资源, 不按 status 过滤 —— 因为 `corrupt` 也可能
+    落在 `done` 上(文件保留、只标记损坏, 见 core/phash.py 的约束 1), 那正是最需要
+    被看见的一类。
+    """
+    rows = query(
+        "SELECT error_kind AS kind, COUNT(*) AS n FROM resources "
+        "WHERE error_kind IS NOT NULL AND error_kind <> '' "
+        "GROUP BY error_kind ORDER BY n DESC"
+    )
+    return [{"kind": r["kind"], "count": r["n"]} for r in rows]
 
 
 def duplicate_stats():

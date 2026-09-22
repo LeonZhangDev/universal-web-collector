@@ -250,6 +250,10 @@ h3 { margin: 0 0 12px; font-size: 15px; }
 
 /* ---- 资源元信息 ---- */
 .badge.filtered { background: #3d3524; color: #d9b96a; }
+/* gone = 源站已经删掉这个资源(404/410), 或明确拒绝访问(401/403)。
+   特意用**灰**而不是失败的红: 红会让人以为"再点一次重试也许就好了", 而这一类
+   重试一百次结果都一样。灰色传达的是"这件事结束了, 不用管它"。 */
+.badge.gone { background: #33383f; color: #9aa5b1; }
 .stat-line { display: flex; gap: 8px; flex-wrap: wrap; margin: -6px 0 10px; }
 .stat-item {
   font-size: 11px; color: var(--muted); background: var(--panel-2);

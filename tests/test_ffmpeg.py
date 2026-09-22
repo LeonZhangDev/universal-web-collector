@@ -4,6 +4,7 @@
 这样在没装 ffmpeg 的环境/CI 上也能跑。
 """
 
+import struct
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import core.ffmpeg as ffm
 from core import config as cfgmod
 from core.cancel import TaskCancelled
 from core.config import settings
+from core.errors import CorruptMediaError
 import downloaders.video as video_mod
 from downloaders.video import (
     ENGINES,
@@ -347,10 +349,20 @@ def test_hls_duration_boundary_and_short_container_tolerance(
 
 
 def test_direct_video_does_not_require_hls_duration_probe(monkeypatch, tmp_path):
+    """直链走**自己那套**内容终检, 不能套用 HLS 的时长校验。
+
+    ⚠️ 两条路径的判据不同, 混用会让直链直接报错: HLS 的校验拿**播放列表给的**
+    expected 时长当基准, 而直链根本没有播放列表。V33 给直链补了
+    `_validate_direct_media`(容器 box 链 + ffprobe 时长), 这里钉住"补的是它,
+    不是 HLS 那个"。
+    """
+    def boom(*a, **k):
+        raise AssertionError("HLS-only guard")
+
+    monkeypatch.setattr(video_mod, "_validate_hls_duration", boom)
+    checked = []
     monkeypatch.setattr(
-        video_mod,
-        "_validate_hls_duration",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("HLS-only guard")),
+        video_mod, "_validate_direct_media", lambda *a, **k: checked.append(a) or None
     )
     monkeypatch.setattr(
         video_mod,
@@ -363,6 +375,27 @@ def test_direct_video_does_not_require_hls_duration_probe(monkeypatch, tmp_path)
     )
     assert path.suffix == ".mp4"
     assert digest == "a" * 64
+    assert len(checked) == 1, "直链必须走自己的内容终检"
+
+
+def test_direct_download_deletes_the_file_when_validation_fails(monkeypatch, tmp_path):
+    """校验不过就必须**删掉那份字节**。
+
+    ⚠️ 留在最终位置的后果是静默的: 后续任务用 sha256 查出"已有这张图"就直接复用,
+    坏文件于是被传下去, 而每一环都报告成功。
+    """
+    def fake_download(url, path, headers, **kw):
+        path.write_bytes(struct.pack(">I", 24) + b"ftyp" + b"isom" + b"\x00" * 8 + b"isom"
+                         + struct.pack(">I", 40000) + b"mdat" + b"\x00" * 32)
+        return "a" * 64, path
+
+    monkeypatch.setattr(video_mod, "download_with_mirrors", fake_download)
+    # 只跑算术判据(不依赖本机 ffprobe), 才能确定是 box 链那次拦下的
+    monkeypatch.setattr(video_mod, "_resolve_ffprobe", lambda ff: None)
+
+    with pytest.raises(CorruptMediaError):
+        VideoDownloader().download("https://example.com/broken.mp4", save_dir=tmp_path)
+    assert not list(tmp_path.glob("*.mp4")), "坏文件必须被删掉"
 
 
 def test_hls_duration_validation_accepts_small_container_variance(monkeypatch, tmp_path):

@@ -33,6 +33,13 @@ dHash 的做法: 把图缩成 9x8 的灰度, 逐行比较相邻像素的明暗, 
 3. **不改变既有 sha256 去重的行为。** 两条路径并行: sha256 命中就照旧复用文件,
    感知指纹只在"sha256 没命中但人眼看着一样"时补一句提示。
 
+4. **解码失败要上报, 不能吞掉。** 约束 2 说的是"失败即放行"(不阻断下载), 不是
+   "失败即遗忘"。`DECODE_FAILED` —— ffmpeg 在、却解不开这个文件 —— 是整个系统里
+   **最可靠的一条坏文件证据**(比长度校验强: 长度对得上也可能是坏字节)。所以
+   `decode_gray_ex` 把它作为原因码返回给调用方, 由调用方写进
+   `resources.error_kind='corrupt'`。仍然**只标记不删除**(见约束 1): 解码器也会
+   认错冷门格式, 而删文件不可逆。
+
 为什么用 ffmpeg 而不是自己解码: 项目已经依赖 ffmpeg(视频 remux/AES-128 解密),
 而图片解码要覆盖 jpeg/png/webp/gif/bmp/avif 的话, 自己写等于重造一个解码器。
 ffmpeg 一条命令行就够, 且与已有依赖**同一份探测逻辑**(`core/ffmpeg.py`)。
@@ -80,6 +87,28 @@ def decode_gray(path, width=_W, height=_H) -> Optional[bytes]:
     返回长度恰好 `width*height` 的 bytes; 任何一步不顺利都返回 None
     (约束 2: 失败即放行, 不抛异常给上层)。
 
+    需要知道**为什么**失败时用 `decode_gray_ex` —— 本函数把两种截然不同的原因
+    压成了同一个 None, 详见那里的说明。
+    """
+    return decode_gray_ex(path, width, height)[0]
+
+
+#: 解码失败的原因码 —— 调用方据此分辨"本机缺解码器"与"文件真坏了"。
+#:
+#: ⚠️ 这两个值**不能合并**。合并之后, "ffmpeg 说这个文件解不开"这条最可靠的坏文件
+#: 证据就和"本机没装 ffmpeg"混在一起, 于是要么把整机所有文件都当成坏的, 要么把
+#: 真正损坏的文件当成"环境问题"放过去。原实现就是后者: 一个解不开的文件, 唯一的
+#: 后果是"这次没算指纹", 没有任何地方知道它坏。
+NO_DECODER = "no_decoder"        # 本机没有 ffmpeg(或环境异常): 与文件无关
+DECODE_FAILED = "decode_failed"  # ffmpeg 在, 但解不开 —— 文件可疑
+
+
+def decode_gray_ex(path, width=_W, height=_H):
+    """解码成灰度字节, 并说明失败原因; 返回 `(raw, reason)`。
+
+    reason 为 None 表示成功; 否则取 `NO_DECODER` 或 `DECODE_FAILED`。
+    `raw` 为 None 时 reason 一定有值。
+
     ⚠️ 必须带 `-frames:v 1`: 动图(gif/webp)和解码器的好奇心会让 ffmpeg 一直
     吐帧, 输出就会超过 `width*height` 字节。多出来的字节会让指纹算错而不是
     算失败 —— 那种错误最难发现, 所以宁可多一个参数。
@@ -89,7 +118,7 @@ def decode_gray(path, width=_W, height=_H) -> Optional[bytes]:
 
         ff = find_ffmpeg()
         if not ff:
-            return None
+            return None, NO_DECODER
         cmd = [
             ff, "-v", "error", "-nostdin",
             "-i", str(path),
@@ -102,16 +131,21 @@ def decode_gray(path, width=_W, height=_H) -> Optional[bytes]:
             cmd, capture_output=True, timeout=_TIMEOUT, **_no_window_kwargs()
         )
         if proc.returncode != 0:
-            return None
+            # 解码器明确报错: 这不是"没算出来", 是"这个文件有问题"
+            return None, DECODE_FAILED
         raw = proc.stdout or b""
         want = int(width) * int(height)
         if len(raw) < want:
-            return None
+            # 退出码 0 但吐不出一整帧 = 文件头合法、后半截没了。
+            # 这正是纯长度校验(Content-Length 对得上)抓不到的那一类。
+            return None, DECODE_FAILED
         # 截断而不是丢弃: 有些解码器会多吐一点, 前面的像素仍然是对的。
-        return raw[:want]
+        return raw[:want], None
     except Exception:
-        # 约束 2: ffmpeg 不在 / 超时 / 文件被别的进程占着 —— 都不该影响下载
-        return None
+        # 约束 2: ffmpeg 不在 / 超时 / 文件被别的进程占着 —— 都不该影响下载。
+        # ⚠️ 这里**不能**返回 DECODE_FAILED: OSError("文件被占用") 是我们的环境
+        # 问题, 拿它去指认"文件已损坏"就是冤枉。
+        return None, NO_DECODER
 
 
 def dhash_from_gray(raw, width=_W, height=_H) -> Optional[str]:
@@ -126,9 +160,23 @@ def dhash_from_gray(raw, width=_W, height=_H) -> Optional[str]:
     return "%016x" % bits
 
 
+def dhash_ex(path, width=_W, height=_H):
+    """算指纹并说明失败原因; 返回 `(指纹, reason)`。
+
+    reason 语义同 `decode_gray_ex`: None=成功, `NO_DECODER`=无法判断,
+    `DECODE_FAILED`=**文件可疑**。
+    """
+    raw, reason = decode_gray_ex(path, width, height)
+    if raw is None:
+        return None, reason
+    got = dhash_from_gray(raw, width, height)
+    # 灰度字节齐全却算不出指纹 = 本模块自己的问题, 不是文件的问题
+    return got, (None if got else NO_DECODER)
+
+
 def dhash(path, width=_W, height=_H) -> Optional[str]:
     """算一张图(或一段视频的首帧)的 dHash; 算不出返回 None。"""
-    return dhash_from_gray(decode_gray(path, width, height), width, height)
+    return dhash_ex(path, width, height)[0]
 
 
 def _unhex(value) -> Optional[int]:

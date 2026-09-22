@@ -13,6 +13,8 @@ ffmpeg 拉流, 而假分片不是合法 TS —— ffmpeg 直接报错, 验证失
   (比只看魔术字节强得多 —— 那只能证明文件头对)
 * 字节校验: 内置器路径额外比对「按 m3u8 顺序拼接的 sha256」,
   能发现分片错序/丢块这类解码器不一定报错的问题
+* 素材自检: 生成后先确认播放列表已终结(有 #EXT-X-ENDLIST)且收录了全部磁盘分片。
+  素材有毛病就以"素材"的名义报错 —— 不让它伪装成下载层缺陷(见 `build_hls`)
 
 用法: uv run python scripts/verify_hls.py
 """
@@ -71,6 +73,13 @@ def build_hls(dirpath: Path) -> list:
         "-sc_threshold", "0",
         "-c:a", "aac", "-shortest",
         "-f", "hls", "-hls_time", str(SEG_DUR), "-hls_list_size", "0",
+        # ⚠️ 必须显式声明 vod。不写这个参数时, ffmpeg 靠"hls_list_size==0 就当 VOD"的
+        # 隐式收敛来决定要不要收尾, 实测偶发(6 次里出现过 1 次)产出一个**只列了 11 个
+        # 分片、也没有 #EXT-X-ENDLIST** 的中间态播放列表。那正好撞上
+        # `collectors/hls.py` 的完整性门禁, 脚本于是报"站点播放列表缺少 ENDLIST" ——
+        # 一次**素材生成**的抖动被伪装成**下载层缺陷**, 排查方向直接跑偏。显式声明
+        # vod 之后 ffmpeg 必须写收尾标记。
+        "-hls_playlist_type", "vod",
         "-hls_segment_filename", str(dirpath / "seg%d.ts"),
         str(dirpath / "index.m3u8"),
     ]
@@ -79,11 +88,35 @@ def build_hls(dirpath: Path) -> list:
         print("[x] 生成 HLS 素材失败:", (r.stderr or "").strip()[-300:])
         sys.exit(2)
     text = (dirpath / "index.m3u8").read_text(encoding="utf-8")
-    return [
+    order = [
         line.strip()
         for line in text.splitlines()
         if line.strip() and not line.startswith("#")
     ]
+
+    # ---- 素材自检 ----
+    # 后面十几条断言全部建立在"这是一份完整的 VOD 播放列表"之上。素材本身有问题时
+    # 必须先在这里、以"素材"的名义失败: 否则报出来的错指向下载层, 而下载层其实是对的
+    # —— 这种误导比直接失败昂贵得多(实测为了定位上面那次抖动翻了好几个文件)。
+    # 判据只用两条与 ffmpeg 版本无关的不变量:
+    #   * 已终结 —— 有 #EXT-X-ENDLIST;
+    #   * 无遗漏 —— 播放列表列出的分片数 == 磁盘上的分片数。
+    #     (不写死 12: 分片数取决于关键帧落点, 换 ffmpeg 版本可能差一片。)
+    on_disk = len(list(dirpath.glob("seg*.ts")))
+    problems = []
+    if "#EXT-X-ENDLIST" not in text:
+        problems.append("缺少 #EXT-X-ENDLIST(播放列表没被收尾)")
+    if len(order) != on_disk:
+        problems.append(f"播放列表列了 {len(order)} 片, 磁盘上有 {on_disk} 片(有分片没被收录)")
+    if len(order) < 6:
+        problems.append(f"分片只有 {len(order)} 个, 不够后续断言用(需要 >= 6)")
+    if problems:
+        print("[x] HLS 素材自检不通过 —— 这是**素材生成**的问题, 不是下载层的:")
+        for p in problems:
+            print("     -", p)
+        print(f"     素材目录: {dirpath}")
+        sys.exit(2)
+    return order
 
 
 def expected_sha(work: Path, order: list) -> str:

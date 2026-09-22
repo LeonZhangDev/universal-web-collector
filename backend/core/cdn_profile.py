@@ -26,6 +26,13 @@
 ⚠️ 画像只是**线索**不是结论: 排序靠前只意味着"先试它", 每条候选仍然真探一次。
 画像缺失/损坏/写不进去都不影响采集 —— 一律退回站点声明的固定顺序。
 
+并发
+====
+读者(`preferred_bases` / `preferred_seq_format` / `summarize`)与写者
+(`record_hit` / `reset`)共用一把**可重入**锁。这不是"顺手加个锁", 而是必须:
+写者靠 `tmp.replace(p)` 换文件, 而 Windows 上只要目标还有别的句柄开着就替换不了,
+失败又是静默的 —— 探测和记录一并发, 命中就丢一半(见 `_read` 的实测数据)。
+
 环境变量
 ========
 `UWC_CDN_PROFILE` 可以覆盖画像文件位置, 或设成 `off` 完全关闭::
@@ -44,11 +51,22 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
-_LOCK = threading.Lock()
+#: ⚠️ 必须是**可重入**锁。`record_hit` 要在同一次"读-改-写"里依次调 `_read` 与
+#: `_write`, 而这两个函数各自也要加锁(读者必须与写者互斥, 理由见 `_read`)。
+#: 用普通 Lock 会直接自锁死, RLock 让两种情况共用一把锁。
+_LOCK = threading.RLock()
 #: 每站点只留最近命中的前 N 条, 防止长期运行后文件无限膨胀
 _MAX_BASES = 8
+
+#: `tmp.replace(p)` 在 Windows 上会因为"目标文件被别的句柄打开着"而抛
+#: PermissionError(见 `_read`)。**进程内**的占用已经由锁挡掉, 剩下的只有编辑器、
+#: 杀毒软件这类**外部**占用, 窗口是微秒级 —— 重试几次就够。画像文件很小, 重试成本
+#: 可以忽略, 比静默丢掉一次命中划算得多。
+_WRITE_RETRIES = 5
+_WRITE_BACKOFF = 0.02       # 秒; 第 n 次重试前等 _WRITE_BACKOFF * n
 
 #: 视为"关闭"的取值。写成集合而不是 `in ("off",)`, 因为用户会写 `0`、`no`、`false`
 _OFF = {"", "0", "off", "no", "false", "none", "disable", "disabled"}
@@ -71,30 +89,47 @@ def _path():
 
 
 def _read():
-    p = _path()
-    if p is None or not p.is_file():
+    """读画像; 文件不存在或内容不可解析都退化成"没有画像"。
+
+    ⚠️ 必须与写者互斥 —— 这里修的是一个**静默丢更新**的缺陷。写者用
+    `tmp.replace(p)` 换文件, 而在 Windows 上只要目标文件还有别的句柄开着(哪怕只是
+    只读), `os.replace` 就会以 PermissionError 失败。旧代码把读者放在锁外, 于是
+    "有任务正在探测基址(读)"和"另一个任务命中并记一笔(写)"一并发就丢 —— 实测
+    "一个只读线程 + 一个写线程", 300 次写入只记下 150 次, **丢一半且毫无声响**。
+    """
+    p = _path()     # 锁外取路径: `_path` 会惰性 import core.database, 别在锁里做
+    if p is None:
         return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (ValueError, OSError):
-        return {}
+    with _LOCK:
+        if not p.is_file():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (ValueError, OSError):
+            return {}
 
 
 def _write(data):
     p = _path()
     if p is None:
         return
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # 先写临时文件再替换: 半截的 JSON 会让之后每一次读取整体失效
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
-        tmp.replace(p)
-    except OSError:
-        pass    # 画像写不进去不该影响采集
+    text = json.dumps(data, ensure_ascii=False, indent=1)
+    with _LOCK:
+        for attempt in range(_WRITE_RETRIES):
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                # 先写临时文件再替换: 半截的 JSON 会让之后每一次读取整体失效
+                tmp = p.with_suffix(".json.tmp")
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(p)
+                return
+            except OSError:
+                # 多数是"目标被外部句柄占着"(见 `_read` 的说明)。等一小会儿再换,
+                # 不要在这里丢掉这次更新 —— 本模块唯一会静默丢数据的地方就是这里。
+                if attempt + 1 < _WRITE_RETRIES:
+                    time.sleep(_WRITE_BACKOFF * (attempt + 1))
+        # 重试遍了还是写不进去(只读盘/磁盘满): 画像只是线索, 不该让采集失败
 
 
 def record_hit(site_name, base, seq_format=None):

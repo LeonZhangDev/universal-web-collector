@@ -25,6 +25,7 @@ from core import events
 from core import layout
 from core.config import settings
 from core.content_identity import canonical_content_key
+from core.errors import KIND_LABELS
 from core.filters import parse_size
 from core.manifest import read_manifest
 from core.task_dedup import create_or_dispose
@@ -799,6 +800,8 @@ def task_stats():
         by_date=db.resources_by_date(30),
         download_series=db.stats_download_series(30),
         failure_reasons=db.failure_reasons(8),
+        error_kinds=db.error_kinds(),
+        error_kind_labels=KIND_LABELS,
         duplicates=db.duplicate_stats(),
     )
 
@@ -884,6 +887,7 @@ def get_task(task_id: int):
         **dict(task),
         resources=resources,
         resource_counts=db.summarize_resources(task_id),
+        error_kind_labels=KIND_LABELS,
     )
 
 
@@ -1026,17 +1030,21 @@ def retry_resource(task_id: int, resource_id: int):
 
 @router.post("/tasks/{task_id}/retry-failed", response_model=RetryFailedOut)
 def retry_failed(task_id: int):
-    """失败资源选择性重试: 只把 failed / skipped 的资源重新派发下载。
+    """失败资源选择性重试: 只把 failed / skipped / gone 的资源重新派发下载。
 
     与整任务 retry(删除全部资源重来)不同, 这里保留已成功的资源, 只重下失败的
     那部分 —— 网络抖动/单张 403 这类局部失败时最省时。复用已有的单资源
     submit_resource(它直接把资源丢进下载执行器), 逐个派发。
+
+    `gone` 也纳入: 自动流程**不**重试它(源站没了, 重试是空转), 但这个接口是用户
+    主动点的 —— 403 可能因为换了代理/Referer 就好了, 404 也可能是站点临时抽风。
+    API 的克制与用户的选择权是两件事。
     """
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     retried = []
-    for r in db.get_resources_with_status(task_id, ["failed", "skipped"]):
+    for r in db.get_resources_with_status(task_id, ["failed", "skipped", "gone"]):
         ok, err = task_manager.submit_resource(task_id, r["id"])
         if ok:
             retried.append(r["id"])

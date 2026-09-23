@@ -446,9 +446,10 @@ onUnmounted(() => {
       <span
         v-if="partials && partials.count"
         class="summary muted"
-        :title="`${partials.dir}\n保留 ${partials.ttl_hours} 小时 · 上限 ${partials.max_bytes_h}`"
+        :title="`${partials.dir}\n保留 ${partials.ttl_hours} 小时 · 上限 ${partials.max_bytes_h}\n单文件 ${partials.files} 份 · 分片缓存 ${partials.bundles} 份 —— 取消或失败之后, 换个相册名/目录也能接着下`"
       >
         · 待续传 {{ partials.count }} 份 / {{ partials.bytes_h }}
+        <template v-if="partials.bundles">(含 {{ partials.bundles }} 份分片缓存)</template>
       </span>
       <button
         v-if="partials && partials.count"

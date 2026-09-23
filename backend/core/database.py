@@ -100,6 +100,21 @@ CREATE TABLE IF NOT EXISTS resource_tags(
     PRIMARY KEY (resource_id, tag)
 );
 
+-- 标签自身的外观(目前只有颜色)。⚠️ 与 resource_tags **分表**的道理:
+-- 颜色属于"标签"这个对象, 不属于"某个资源带了某个标签"这一行。放进 resource_tags
+-- 就是同一个标签在 N 个资源上各存一份, 改一次色要改 N 行 —— 少改一行就是
+-- "同一个标签在这里是红的, 在那里是蓝的"。层级则更轻: 直接用名字里的 `/`
+-- 表达(见 tag_parent), 不另立树表 —— 一张只有父子两列的表撑不起移动/重命名,
+-- 而名字本身已经携带了全部信息。
+CREATE TABLE IF NOT EXISTS tag_meta(
+    -- 与 resource_tags.tag 同样 NOCASE: 否则 "Sunset" 和 "sunset" 会有两条颜色
+    tag TEXT PRIMARY KEY COLLATE NOCASE,
+    -- 存**调色板键**(如 "red")而不是色值: 色值是渲染细节, 改了要回头迁移全表;
+    -- 键还能被校验(见 normalize_color), 存色值的写法没法拦住 `#zzz`
+    color TEXT NOT NULL DEFAULT '',
+    updated_time TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_logs(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -304,15 +319,17 @@ def get_task(task_id):
     return query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
 
 
-def _like_pattern(s):
-    """把用户输入的关键词转成 LIKE 模式: 转义通配符, 两侧补 %。
+def _like_pattern(s, prefix=""):
+    """把用户输入的关键词转成 LIKE 模式: 转义通配符, 两侧补 %(`prefix` 则只补右)。
 
     ⚠️ 不转义就会出"搜索能用但结果不对"这种最难怀疑的偏差: 搜 `100%` 里的
     `%` 会被当成"匹配任意串", 搜 `a_b` 里的 `_` 会连 `axb` 一起捞出来。
     用户看到的只是"怎么多出来几条", 不会想到是自己输入的字符被吃掉了。
+    标签层级的前缀匹配(`tag_children`)走的是同一条路 —— 标签是用户自己起的
+    名字, 里面出现 `%`/`_` 这种事迟早会发生。
     """
     esc = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{esc}%"
+    return f"{esc}{prefix}%" if prefix else f"%{esc}%"
 
 
 def _task_filters(q=None, status=None, collector=None):
@@ -865,6 +882,60 @@ MAX_TAG_LEN = 32
 #: 上万行明细, 而用户根本不会去用那么多标签。
 MAX_TAGS_PER_RESOURCE = 20
 
+#: 标签层级的**唯一**分隔符。用 `/` 而不是别的: 它天然可读(`系列/角色`),
+#: 用户不用学任何东西就能用, 而"层级"这件事本身只是个前缀 —— 不需要一张树表。
+TAG_SEP = "/"
+#: 最多几层。与 `MAX_TAG_LEN` 同属防呆: 它挡住的是"把一整条路径粘进来"。
+MAX_TAG_DEPTH = 4
+
+#: 标签颜色的调色板: 键 -> (中文名, 色值)。
+#: ⚠️ **由后端定义并下发**(接口回 `colors`), 与 `error_kind` 的中文标签同一条
+#: 理由(第 9 条静默坑): 界面上"人看的文案"只有一个来源, 前端不许自己编一套。
+TAG_COLORS = {
+    "red": ("红", "#e5484d"),
+    "orange": ("橙", "#f76b15"),
+    "yellow": ("黄", "#d9a900"),
+    "green": ("绿", "#30a46c"),
+    "cyan": ("青", "#00a2c7"),
+    "blue": ("蓝", "#0091ff"),
+    "purple": ("紫", "#8e4ec6"),
+    "pink": ("粉", "#e93d82"),
+    "gray": ("灰", "#8b8d98"),
+}
+
+
+def normalize_color(color):
+    """调色板键归一化。空串 = "没有颜色"(合法的取值, 用来取消已有的颜色)。
+
+    非法取值**抛错**而不是悄悄退回默认色: 用户点了一个不存在的颜色, 界面上却
+    变成灰的, 那比报错更难查。
+    """
+    s = str(color or "").strip().lower()
+    if not s:
+        return ""
+    if s not in TAG_COLORS:
+        raise ValueError(
+            f"未知的颜色 {s!r}, 可选: {', '.join(TAG_COLORS)}"
+        )
+    return s
+
+
+def tag_parent(tag):
+    """标签的父标签(名字里最后一个 `/` 之前的部分)。没有 `/` 则是顶层。
+
+    ⚠️ 尾随 `/` 要在归一化阶段就被挡住(见 `normalize_tag`), 否则 `a/` 与 `a`
+    是两个标签却互为父子, 层级里会出现一个空的父节点。
+    """
+    s = str(tag or "")
+    i = s.rfind(TAG_SEP)
+    return s[:i] if i > 0 else ""
+
+
+def tag_depth(tag):
+    """层级深度(顶层 = 0), 供界面缩进。"""
+    s = str(tag or "")
+    return s.count(TAG_SEP)
+
 
 def normalize_tag(tag):
     """标签归一化: 去首尾空白 + 折叠内部空白 + 校验长度。
@@ -884,11 +955,23 @@ def normalize_tag(tag):
         )
     if any(ord(c) < 32 for c in s):
         raise ValueError("标签不能包含控制字符")
-    return s
+    # 层级(`/`)的三种坏形状。它们都会让同一件东西有多个写法, 而层级是按名字
+    # 算出来的 —— `a/` 与 `a` 互为父子、"a//b" 里有个看不见的空节点。
+    parts = s.split(TAG_SEP)
+    if any(not p.strip() for p in parts):
+        raise ValueError(
+            f"标签的层级分隔符 {TAG_SEP!r} 两侧都要有内容(现在是 {s!r}),"
+            f" 例如 `系列{TAG_SEP}角色`"
+        )
+    if len(parts) > MAX_TAG_DEPTH:
+        raise ValueError(
+            f"标签层级太深(最多 {MAX_TAG_DEPTH} 层): {s}"
+        )
+    return TAG_SEP.join(p.strip() for p in parts)
 
 
 def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
-                    tag=None, favorite=None):
+                    tag=None, favorite=None, tag_children=False):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
     单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
@@ -899,6 +982,10 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
     出来会让"库"变成"所有见过的 URL", 那不是浏览而是调试。
 
     tag / favorite 是**两个独立维度**, 可叠加(既筛标签又只看收藏)。
+
+    tag_children=True 时连**子标签**一起收(点 `系列` 能看到 `系列/角色A`):
+    层级是名字里的前缀, 所以这是一次前缀匹配。默认关 —— 精确匹配是老行为,
+    也是"我就要这一个标签"时唯一正确的语义。
     """
     where = ["1=1"]
     args = []
@@ -930,11 +1017,21 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
         # 真正的重复)。EXISTS 天然只判在不在, 配合 idx_tags_tag 是一次索引探测。
         # ⚠️ 不要手写 `LOWER(tag)=LOWER(?)`: 列的 COLLATE NOCASE 已经在管这件事,
         # 两套写法混用会让"能走索引"变成"函数包住列 → 走不了索引"。
-        where.append(
-            "EXISTS (SELECT 1 FROM resource_tags rt "
-            "WHERE rt.resource_id = r.id AND rt.tag = ?)"
-        )
-        args.append(normalize_tag(tag))
+        clean = normalize_tag(tag)
+        if tag_children:
+            # 含子标签: 前缀匹配(`系列/` 开头)。用 ESCAPE 声明转义符, 与 `%`
+            # 的语义分开 —— 否则用户起的 `a_b` 会连带命中的东西一起进来。
+            where.append(
+                "EXISTS (SELECT 1 FROM resource_tags rt "
+                "WHERE rt.resource_id = r.id AND (rt.tag = ? OR rt.tag LIKE ? ESCAPE '\\'))"
+            )
+            args += [clean, _like_pattern(clean, prefix=TAG_SEP)]
+        else:
+            where.append(
+                "EXISTS (SELECT 1 FROM resource_tags rt "
+                "WHERE rt.resource_id = r.id AND rt.tag = ?)"
+            )
+            args.append(clean)
 
     if favorite:
         where.append("r.favorite=1")
@@ -950,9 +1047,10 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
 
 
 def library_count(q=None, kind=None, task_id=None, album=None, status="done",
-                  tag=None, favorite=None):
+                  tag=None, favorite=None, tag_children=False):
     """资源库总数(与 library_list 同一口径)。"""
-    where, args = library_filters(q, kind, task_id, album, status, tag, favorite)
+    where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
+                                  tag_children)
     row = query_one(
         f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
         f"WHERE {where}",
@@ -962,9 +1060,11 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
 
 
 def library_list(q=None, kind=None, task_id=None, album=None, status="done",
-                 limit=50, offset=0, tag=None, favorite=None):
+                 limit=50, offset=0, tag=None, favorite=None,
+                 tag_children=False):
     """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。"""
-    where, args = library_filters(q, kind, task_id, album, status, tag, favorite)
+    where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
+                                  tag_children)
     rows = query(
         f"""SELECT r.*, t.name AS task_name, t.collector AS collector,
                    t.created_time AS task_time
@@ -1108,12 +1208,21 @@ def remove_tags(resource_ids, tags):
 
 
 def all_tags(limit=200):
-    """标签清单(带资源数), 供筛选下拉。
+    """标签清单(带资源数 + 颜色 + 层级), 供筛选下拉与树。
 
     ⚠️ 只统计**已落盘**资源上的标签: 资源库只显示 done, 若这里把 failed 资源
     的标签也算进去, 用户会看到一个点进去什么都没有的标签(数量非 0 但列表空)。
+
+    每条回:
+      * `n`      —— 这个标签**自己**身上的资源数;
+      * `n_tree` —— 连子标签一起的数量(点父节点时能筛出多少);
+      * `parent` / `depth` —— 层级(名字里的 `/` 算出来的, 见 `tag_parent`);
+      * `color`  —— 调色板键, 空串 = 没设过。
+    层级是**算出来的**: 父标签未必自己是个标签(用户可能只打了 `系列/角色`),
+    所以界面不能只渲染"有资源的那些节点", 得按 `parent` 把中间层补齐(见
+    `tag_tree`)。
     """
-    return query(
+    rows = query(
         """SELECT rt.tag AS tag, COUNT(*) AS n
            FROM resource_tags rt JOIN resources r ON r.id = rt.resource_id
            WHERE r.status='done'
@@ -1121,6 +1230,71 @@ def all_tags(limit=200):
            ORDER BY n DESC, rt.tag LIMIT ?""",
         (int(limit),),
     )
+    colors = tag_colors()
+    items = []
+    for r in rows:
+        tag = r["tag"]
+        items.append({
+            "tag": tag,
+            "n": int(r["n"] or 0),
+            "n_tree": int(r["n"] or 0),
+            "parent": tag_parent(tag),
+            "depth": tag_depth(tag),
+            "color": colors.get(tag.lower(), ""),
+        })
+    # n_tree: 从后往前累加(父标签一定排在子标签**前面**吗? 不一定 —— 排序按
+    # 数量。所以这里按名字长度做分组累加, 与出现顺序无关。
+    by_tag = {it["tag"]: it for it in items}
+    for it in sorted(items, key=lambda x: -x["depth"]):
+        p = it["parent"]
+        while p:
+            up = by_tag.get(p)
+            if up is None:
+                # 父标签自己没资源: 补齐一个只有统计数的节点, 否则树上会缺一层
+                up = {"tag": p, "n": 0, "n_tree": 0, "parent": tag_parent(p),
+                      "depth": tag_depth(p), "color": colors.get(p.lower(), "")}
+                by_tag[p] = up
+                items.append(up)
+            up["n_tree"] += it["n"]
+            p = up["parent"]
+    items.sort(key=lambda x: (x["tag"].lower(),))
+    return items
+
+
+def tag_colors():
+    """已设置的颜色: `{小写标签: 调色板键}`。
+
+    ⚠️ 键取小写: `tag_meta.tag` 是 NOCASE 列, 但 Python 字典不是 —— 不折一下
+    就会出现"库里查得到颜色、字典里查不到"。
+    """
+    return {str(r["tag"]).lower(): r["color"] for r in query(
+        "SELECT tag, color FROM tag_meta WHERE color <> ''"
+    )}
+
+
+def set_tag_color(tag, color):
+    """设置/清除一个标签的颜色, 返回生效后的键(空串 = 已清除)。
+
+    颜色是**标签**的属性(不挂在资源上), 所以与"哪些资源带这个标签"完全无关:
+    标签还没有任何资源也能先设色, 反之资源全删了颜色也不会跟着丢 —— 用户重新
+    打上同一个标签时它还在。
+    """
+    clean = normalize_tag(tag)
+    if not clean:
+        raise ValueError("标签不能为空")
+    key = normalize_color(color)
+    if key:
+        execute(
+            "INSERT INTO tag_meta(tag, color, updated_time) VALUES (?,?,?)"
+            " ON CONFLICT(tag) DO UPDATE SET color=excluded.color,"
+            " updated_time=excluded.updated_time",
+            (clean, key, _now()),
+        )
+    else:
+        # 清色 = 删行, 不留 `color=''` 的空壳(否则 tag_meta 会随着"点了一下
+        # 又取消"慢慢涨)
+        execute("DELETE FROM tag_meta WHERE tag=?", (clean,))
+    return key
 
 
 def set_favorite(resource_ids, value=True):

@@ -56,6 +56,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from core import mediacheck
+from core import partials
 from core.cancel import TaskCancelled
 from core.config import settings
 from core.errors import CorruptMediaError
@@ -74,6 +75,7 @@ from .base import (
     validators_for,
 )
 from .browser_session import browser_session_for
+from . import dash as _dash
 from .dash import parse_mpd
 from .ratelimit import DomainLimiter, domain_slot
 
@@ -89,6 +91,34 @@ SHUTDOWN_IO_TIMEOUT = TASK_IO_TIMEOUT
 def _short(err, limit=180):
     """异常压成一行短文本, 便于写进任务日志。"""
     return f"{type(err).__name__}: {err}".replace("\n", " ")[:limit]
+
+
+def _seg_target(seg, headers):
+    """分片寻址 -> `(url, headers)`。
+
+    分片有两种写法(见 `downloaders/dash.py` 的模块 docstring):
+
+      * `"https://.../s1.m4s"`                     —— 一片一个文件;
+      * `("https://.../m.mp4", (start, end))`      —— 同一个文件里的字节区间。
+
+    第二种会加上 `Range: bytes=start-end`(闭区间, 与 DASH 的 range 属性同义)。
+
+    ⚠️ 带 `Range` 时**绝不能**再带 `If-None-Match`/`If-Modified-Since`:
+    服务器对"条件 + Range"回的是 **304 而不是 206**, 于是那一段字节永远取不到。
+    这里直接构造 headers 而不复用调用方那份, 就是为了这个 —— 调用方的 headers
+    可能带着条件请求(条件请求 ⊥ 续传, 见 `downloaders/base.py`)。
+    """
+    if isinstance(seg, (tuple, list)) and len(seg) == 2:
+        url, rng = seg
+        try:
+            start, end = rng
+        except (TypeError, ValueError):
+            return str(url), headers
+        hdrs = {k: v for k, v in (headers or {}).items()
+                if k.lower() not in ("if-none-match", "if-modified-since", "range")}
+        hdrs["Range"] = f"bytes={int(start)}-{int(end)}"
+        return str(url), hdrs
+    return seg, headers
 
 
 def _notify_bytes(progress_cb, data):
@@ -394,10 +424,16 @@ class VideoDownloader:
         #    一路畅通地下完并报告 success —— 用户只拿到几十秒占位画面。这里在开工
         #    前就判定凭证是否还活着、分片是不是真的, 不通过就响亮地失败。
         #    主 URL 失败时依次试备用下载点(镜像)。
-        leaf, info, last_err = murl, None, None
+        #
+        # ⚠️ `pl`(播放列表信息)与 `info`(调用方的回填槽)**不是一回事**: `info` 是
+        # task_manager 传进来要 `fill_info` 写 `resolved_url`/`content_type` 的那只
+        # dict。这里曾经把两者混用同一个名字, 于是这次预检的结果把调用方那只 dict
+        # 顶掉了 —— 结局是 HLS 视频的 `resolved_url` 永远是空的, 而 DASH/直链都有。
+        # 不报错、不影响下载, 只是那条溯源信息静静地没了。
+        base, pl, last_err = murl, None, None
         for cand in [murl] + [m for m in (mirrors or []) if m and m != murl]:
             try:
-                leaf, info = self._preflight_hls(
+                base, pl = self._preflight_hls(
                     cand, headers, log, progress_cb=progress_cb
                 )
                 break
@@ -405,7 +441,7 @@ class VideoDownloader:
                 last_err = e
                 if log:
                     log(f"播放列表校验失败 {cand.split('/')[-1]}: {_short(e, 80)}")
-        if info is None or not info["ok"]:
+        if pl is None or not pl["ok"]:
             raise RuntimeError(
                 f"m3u8 未通过校验: {_short(last_err or '空响应', 160)}"
             )
@@ -418,13 +454,13 @@ class VideoDownloader:
                 # 也能刷新进度）+ 时长校验（分支：拒绝"退出码 0 但只封了前一小段"的
                 # 假成功）；而进度上报用 _notify_bytes（HEAD/V32：报**字节数**，
                 # 前端据此画速率曲线，兼容无参回调）。
-                self._ffmpeg_pull(leaf, headers, path, ff, progress_cb=progress_cb)
-                _validate_hls_duration(path, info, ff, progress_cb=progress_cb)
+                self._ffmpeg_pull(base, headers, path, ff, progress_cb=progress_cb)
+                _validate_hls_duration(path, pl, ff, progress_cb=progress_cb)
                 if progress_cb:
                     _notify_bytes(progress_cb, path)
                 if log:
                     log(f"ffmpeg 拉流完成: {path.name}")
-                fill_info(info, leaf, "video/mp4")
+                fill_info(info, base, "video/mp4")
                 return path, sha256_file(path, progress_cb=progress_cb)
             except TaskCancelled:
                 # ⚠️ 用户点了停止。这不是"ffmpeg 拉流失败" —— 落到下面的
@@ -457,17 +493,16 @@ class VideoDownloader:
         )
 
         # 2) 复用预检已解析的绝对化分片清单(主 URL 失败时会落到这里, 此时已是镜像)
-        segments = info["segments"]
-        base = leaf
+        segments = pl["segments"]
         if not segments:
             raise RuntimeError("播放列表没有任何分片")
         # 加密流必须用 ffmpeg 解密: 内置分片器只会把密文 .ts 拼在一起, 得到垃圾文件
-        if info["encrypted"] and not pull_with_ffmpeg:
+        if pl["encrypted"] and not pull_with_ffmpeg:
             method = next(
-                (k.get("method") for k in (info.get("keys") or []) if k.get("method")),
+                (k.get("method") for k in (pl.get("keys") or []) if k.get("method")),
                 "AES-128",
             )
-            n_keys = len(info.get("keys") or []) or 1
+            n_keys = len(pl.get("keys") or []) or 1
             raise RuntimeError(
                 f"播放列表声明 {method} 加密({n_keys} 把密钥), 内置分片器无法解密; "
                 f"请安装 ffmpeg 或改用 video_engine=ffmpeg(当前 engine={engine}, "
@@ -477,13 +512,35 @@ class VideoDownloader:
             log(f"分片清单: {len(segments)} 个 (来源 {base.split('/')[-1]})")
 
         # 3) 并发下载分片(带续传与分片级重试)
+        #
+        # ⚠️ 缓存目录不能只躺在目标路径旁边: 换过相册名/命名模板之后, 谁也找不到
+        # 它了。所以这里做两件事 ——
+        #   ① 先用**清单指纹**确认原地那堆分片是不是这一批(清单 URL 没变而分片
+        #      换代是最隐蔽的那种错配, 见 partials.ensure_fingerprint), 不符就清掉;
+        #   ② 再从按**清单 URL**寻址的暂存区取回上一次中断留下的分片。
         parts_dir = out / f".{stem}.parts"
-        parts = self._fetch_segments(
-            segments, headers, parts_dir, limiter, progress_cb, log
-        )
-
-        # 4) 按序合并; 合并成功后才清掉分片缓存
-        merged = self._concat_parts(parts, out / f"{stem}.ts", progress_cb)
+        if not partials.ensure_fingerprint(parts_dir, segments) and log:
+            log("分片缓存与当前清单不一致(清单变过或来路不明), 已丢弃重下")
+        resumed = partials.take_segments(base, parts_dir, segments)
+        if resumed and log:
+            log(f"暂存区取回 {resumed} 字节分片缓存 (共 {len(segments)} 片)")
+        try:
+            parts = self._fetch_segments(
+                segments, headers, parts_dir, limiter, progress_cb, log
+            )
+            # 4) 按序合并; 合并成功后才清掉分片缓存
+            merged = self._concat_parts(parts, out / f"{stem}.ts", progress_cb)
+        except TaskCancelled:
+            # 用户点了停止: 已下好的分片收进暂存区, 再让信号原样穿透
+            # (⚠️ 这一条必须**显式**写出来, 不能只靠下面的 BaseException 兜着 ——
+            #  `tests/test_cancel_guard.py` 会当成吞掉取消信号, 见第 4 条静默坑)
+            partials.park_segments(base, parts_dir, segments)
+            raise
+        except BaseException:
+            # 其它失败(分片重试耗尽 / 磁盘错 / 进程级中断): 同样把字节收进暂存区。
+            # 原地留着也行, 但换个目标路径就找不到了 —— 那正是这次要解决的事。
+            partials.park_segments(base, parts_dir, segments)
+            raise
         shutil.rmtree(parts_dir, ignore_errors=True)
         if log:
             log(f"分片合并完成: {merged.name} ({len(parts)} 片)")
@@ -582,11 +639,19 @@ class VideoDownloader:
             log(f"清单来源 {leaf.split('/')[-1] or leaf}")
 
         ff = find_ffmpeg()
-        if spec.get("audio") and not ff:
+        per = spec.get("periods") or []
+        multi = len(per) > 1
+        if any(p.get("audio") for p in per) and not ff:
             raise RuntimeError(
                 "这段 DASH 的音视频分成两条轨, 合并需要 ffmpeg, 但现在没找到它。"
                 " 请安装 ffmpeg 或用 UWC_FFMPEG 指定路径 ——"
                 " 只下视频轨会得到一个没有声音的文件, 那不是成品。"
+            )
+        if multi and not ff:
+            raise RuntimeError(
+                f"这段 DASH 分成 {len(per)} 个时段, 需要 ffmpeg 把各时段逐轨拼起来,"
+                f" 但现在没找到它。请安装 ffmpeg 或用 UWC_FFMPEG 指定路径 ——"
+                f" 只留一个时段会得到一个少了后半段的文件, 那不是成品。"
             )
 
         limiter = DomainLimiter(
@@ -594,30 +659,71 @@ class VideoDownloader:
             settings.segment_min_interval,
             settings.segment_max_interval,
         )
-        # 分片缓存目录沿用 HLS 那套命名: 中断后重跑能续传已下好的分片
+        # 分片缓存目录沿用 HLS 那套语义: 中断后重跑能续传已下好的分片,
+        # 且**换个目标路径也照样能续**(按清单 URL 存在暂存区里)。
         work = out / f".{stem}.dash"
-        parts = {}
         done = False
         ctype = "video/mp4"
+        #: 分片缓存落点 -> (目录, 分片清单)。失败/取消时按这份表 park 进暂存区。
+        parked = {}
         try:
-            for kind in ("video", "audio"):
-                track = spec.get(kind)
-                if not track:
+            # ---- 逐个时段、逐条轨下全分片 ----
+            got_by_kind = {"video": [], "audio": []}
+            for pi, period in enumerate(per):
+                # 单时段时不套一层 p1/ 目录: 与旧行为完全一致, 也让 "换个相册名
+                # 接着下" 的缓存地址不变(它是按清单 URL 寻址的)。
+                sub = work / f"p{pi + 1}" if multi else work
+                for kind in ("video", "audio"):
+                    track = period.get(kind)
+                    if not track:
+                        continue
+                    self._resolve_index(track, headers, log=log)
+                    # 初始化段必须排在分片前面: 它是 fMP4 的轨道元数据(moov)。
+                    # 少了它, 拼出来的文件播放器直接判为损坏 —— 而字节数是"够"的。
+                    segs = ([track["init"]] if track.get("init") else []) + list(
+                        track["segments"]
+                    )
+                    if not segs:
+                        raise RuntimeError(
+                            f"DASH {kind} 轨没有任何分片可下 —— 清单里的索引是空的。"
+                        )
+                    if log:
+                        tag = f"时段 {pi + 1} " if multi else ""
+                        log(f"{tag}{kind} 轨: {len(segs)} 个文件"
+                            + ("(含初始化段)" if track.get("init") else ""))
+                    # 分片缓存的地址带轨后缀(多时段再加时段后缀): 各轨各有各的
+                    # 一份, 不能互相顶掉 —— 顶掉之后拼出来的是"视频头 + 音频身"。
+                    addr = f"{leaf}#{kind}" if not multi else f"{leaf}#p{pi + 1}#{kind}"
+                    d = sub / kind
+                    if not partials.ensure_fingerprint(d, segs) and log:
+                        log(f"{kind} 轨: 分片缓存与当前清单不一致, 已丢弃重下")
+                    resumed = partials.take_segments(addr, d, segs)
+                    if resumed and log:
+                        log(f"{kind} 轨: 暂存区取回 {resumed} 字节分片缓存")
+                    parked[addr] = (d, segs)
+                    got = self._fetch_segments(segs, headers, d, limiter,
+                                              progress_cb, log)
+                    ext = ".ts" if "mp2t" in (track.get("mime") or "") else ".mp4"
+                    got_by_kind[kind].append(
+                        self._concat_parts(got, sub / f"{kind}{ext}", progress_cb)
+                    )
+
+            # ---- 多时段: 逐轨按序把各时段的产物拼起来 ----
+            # ⚠️ 必须**逐轨**拼: 每个时段各有自己的 moov, 字节拼起来是坏文件;
+            # 而音视频混着拼会得到音画错位。所以这里交给 ffmpeg 重新封一遍
+            # (仍 `-c copy`, 不重编码)。
+            parts = {}
+            for kind, files in got_by_kind.items():
+                if not files:
                     continue
-                # 初始化段必须排在分片前面: 它是 fMP4 的轨道元数据(moov)。
-                # 少了它, 拼出来的文件播放器直接判为损坏 —— 而字节数是"够"的。
-                segs = ([track["init"]] if track.get("init") else []) + list(
-                    track["segments"]
-                )
-                if log:
-                    log(f"{kind} 轨: {len(segs)} 个文件"
-                        + ("(含初始化段)" if track.get("init") else ""))
-                got = self._fetch_segments(segs, headers, work / kind, limiter,
-                                           progress_cb, log)
-                ext = ".ts" if "mp2t" in (track.get("mime") or "") else ".mp4"
-                parts[kind] = self._concat_parts(
-                    got, work / f"{kind}{ext}", progress_cb
-                )
+                if len(files) == 1:
+                    parts[kind] = files[0]
+                else:
+                    dst = work / f"{kind}{files[0].suffix or '.mp4'}"
+                    self._ffmpeg_concat(files, dst, ff, progress_cb=progress_cb)
+                    parts[kind] = dst
+                    if log:
+                        log(f"{kind} 轨: {len(files)} 个时段的产物已拼接")
 
             video = parts.get("video")
             audio = parts.get("audio")
@@ -629,7 +735,7 @@ class VideoDownloader:
                 if log:
                     log(f"这段 MPD 只有音频轨, 直接作为 {final.name} 落盘")
             elif audio is None:
-                if video.suffix == ".ts" and ff:
+                if (video.suffix == ".ts" or multi) and ff:
                     final = out / f"{stem}.mp4"
                     self._ffmpeg_remux(video, final, ff, progress_cb=progress_cb)
                 else:
@@ -651,10 +757,93 @@ class VideoDownloader:
             done = True
             return final, sha256_file(final, progress_cb=progress_cb)
         finally:
-            # ⚠️ 只有**成功**才清分片缓存。失败/取消时原样留着 —— 那是续传的资本
-            # (与 `_fetch_segments` 的"已下好的分片保留在 parts_dir"是同一套语义)。
+            # ⚠️ 只有**成功**才清分片缓存。失败/取消时把分片收进暂存区 —— 那是续传
+            # 的资本(与 `_fetch_segments` 的"已下好的分片保留在 parts_dir"同一套语义)。
             if done:
                 shutil.rmtree(work, ignore_errors=True)
+            else:
+                left = False
+                for addr, (d, segs) in parked.items():
+                    partials.park_segments(addr, d, segs, origin=murl)
+                    if d.exists():
+                        # 没搬走(体积太小/搬不动) -> 原地那份**保持不动**,
+                        # 连同 work 一起留着, 别顺手删掉(见 partials.park 的方向性说明)
+                        left = True
+                if not left:
+                    shutil.rmtree(work, ignore_errors=True)
+
+    def _resolve_index(self, track, headers, log=None):
+        """`SegmentBase` 的分片要先取回 `sidx` 才算得出来 —— 在这里补上。
+
+        只请求 `indexRange` 那一段字节(几百字节), 不是整个文件。
+
+        ⚠️ 服务器忽略 `Range` 直接把整个文件返回时**明确报错**: 那种情况下
+        `blob` 从文件开头开始, 我们是用"索引区间的绝对偏移"去解它的, 解出来的
+        分片边界会整体错位 —— 拼出来长度对得上、能播、但每隔几秒糊一下。
+        """
+        idx = track.get("index")
+        if not idx:
+            return track
+        media = idx["media"]
+        start, end = idx["range"]
+        url, hdrs = _seg_target((media, (start, end)), headers)
+        resp = None
+        try:
+            resp = self.session.get(url, headers=hdrs, timeout=SHUTDOWN_IO_TIMEOUT)
+            resp.raise_for_status()
+            blob = resp.content
+            status = getattr(resp, "status_code", 0)
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        want = end - start + 1
+        if status != 206 and len(blob) != want:
+            raise RuntimeError(
+                f"请求索引区间 {start}-{end} 时服务器没有按区间返回"
+                f"(状态 {status}, 返回 {len(blob)} 字节)。无法确定分片边界,"
+                f" 硬解会得到错位的分片。"
+            )
+        ranges = _dash.parse_sidx(blob, start)
+        track["segments"] = [(media, r) for r in ranges]
+        if log:
+            log(f"sidx 解出 {len(ranges)} 个分片 (索引 {start}-{end})")
+        return track
+
+    def _ffmpeg_concat(self, files, dst, ff, progress_cb=None):
+        """按序把多个**成品**文件拼成一个(`-c copy`, 不重编码)。
+
+        与 `_concat_parts` 的分工: 那个是**字节拼接**, 只能用于"同一个序列的分片";
+        这里是**容器级**拼接 —— 每个时段各有自己的 moov, 字节拼起来是坏文件,
+        必须让 ffmpeg 重新封一遍。
+        """
+        if not ff:
+            raise RuntimeError(
+                "这段 DASH 分成多个时段, 逐轨拼接需要 ffmpeg, 但现在没找到它。"
+                " 请安装 ffmpeg 或用 UWC_FFMPEG 指定路径 ——"
+                " 只留一个时段会得到一个少了后半段的文件, 那不是成品。"
+            )
+        lst = Path(dst).with_name(Path(dst).name + ".concat.txt")
+
+        def esc(p):
+            # ⚠️ concat demuxer 的清单里单引号是字符串结束符: 相册名/文件名里
+            # 出现 `'` 会让它读到半个路径 -> "文件不存在", 而文件明明在那里。
+            return str(Path(p).resolve()).replace("'", "'\\''")
+
+        lst.write_text(
+            "\n".join(f"file '{esc(p)}'" for p in files) + "\n",
+            encoding="utf-8", newline="",
+        )
+        try:
+            self._run_ffmpeg(
+                [ff, "-y", "-nostats", "-f", "concat", "-safe", "0",
+                 "-i", str(lst), "-c", "copy", str(dst)],
+                progress_cb=progress_cb,
+            )
+        finally:
+            lst.unlink(missing_ok=True)
 
     def _preflight_hls(self, murl, headers, log, progress_cb=None):
         """下载前预检播放列表, 返回 (leaf_url, info)。
@@ -695,6 +884,15 @@ class VideoDownloader:
     def _fetch_segments(self, segments, headers, parts_dir, limiter, progress_cb, log):
         """并发下载分片, 返回按序排列的 part 路径。
 
+        「分片」有两种寻址:
+          * URL 字符串 —— 一片一个文件;
+          * `(URL, (起, 止))` —— 同一个文件里的字节区间(`SegmentBase` 的 sidx
+            分片 / `SegmentList@mediaRange`), 会带上 `Range` 头。
+
+        ⚠️ 带 `Range` 时**不发**任何条件请求(ETag/If-None-Match)。服务器对
+        "条件 + Range" 会回 304 而不是 206, 于是拿到的不是那一段字节 ——
+        与 `downloaders/base.py` 里那条纪律是同一件事(条件请求 ⊥ 续传)。
+
         续传: 已存在且非空的 part 直接跳过。因为落盘走"先 .tmp 再原子替换",
         不会有半个 part 被误认为完整, 所以只需判断存在即可。
         """
@@ -713,6 +911,7 @@ class VideoDownloader:
             part = paths[i]
             if part.exists() and part.stat().st_size > 0:
                 return
+            url, hdrs = _seg_target(segments[i], headers)
             last = None
             for attempt in range(1, settings.segment_retries + 1):
                 tmp = part.with_name(part.name + ".tmp")
@@ -720,7 +919,7 @@ class VideoDownloader:
                 try:
                     with limiter.slot():
                         resp = self.session.get(
-                            segments[i], headers=headers, stream=True,
+                            url, headers=hdrs, stream=True,
                             timeout=SHUTDOWN_IO_TIMEOUT,
                         )
                     resp.raise_for_status()

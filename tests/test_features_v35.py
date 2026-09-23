@@ -538,15 +538,19 @@ def test_drm_is_refused_with_an_actionable_message():
     assert "EDEF8BA9" in msg, "要把 scheme 带出来, 否则无从判断是哪家的保护"
 
 
-def test_segment_base_is_refused():
-    """SegmentBase 只声明区间: 硬当普通分片下只会得到一小段垃圾数据。"""
+def test_segment_base_without_a_baseurl_is_refused():
+    """SegmentBase 少了 `BaseURL`, 所谓"媒体文件"就是 MPD 自己所在的位置。
+
+    拿它当媒体去请求会下回一份 XML, 而字节数是"有内容"的 —— 所以必须在**开始
+    下载之前**拒绝, 而不是下完了再看容器对不对。
+    """
     mpd = """<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"><Period>
      <AdaptationSet contentType="video"><Representation id="v" bandwidth="1">
       <SegmentBase indexRange="0-999"/>
      </Representation></AdaptationSet></Period></MPD>"""
     with pytest.raises(ValueError) as ei:
         parse_mpd(mpd, "https://c.example.com/m.mpd")
-    assert "SegmentBase" in str(ei.value) or "区间" in str(ei.value)
+    assert "BaseURL" in str(ei.value)
 
 
 def test_live_is_refused():
@@ -560,18 +564,29 @@ def test_live_is_refused():
     assert "dynamic" in str(ei.value) or "直播" in str(ei.value)
 
 
-def test_multi_period_is_refused():
-    """多时段意味着同一部片由若干段拼成; 取第一段会**静默少下后面全部**。"""
-    mpd = """<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
-     <Period><AdaptationSet contentType="video"><Representation id="v" bandwidth="1">
+def test_multi_period_is_parsed_and_never_silently_truncated():
+    """多时段现在**支持**了(V36), 但要钉死"不会被静默截成第一段"。
+
+    ⚠️ 这条以前断言的是"抛错拒绝"。产品能力变了, 但**原来要守的那件事没变** ——
+    "取第一段会静默少下后面全部"。现在它由另一条机制守住: 多时段时顶层的
+    `video`/`audio` 是 `None`, 只读第一条轨的调用方会拿到空值而**自己炸**。
+    """
+    mpd = """<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+       mediaPresentationDuration="PT2S">
+     <Period duration="PT1S"><AdaptationSet contentType="video">
+      <Representation id="v" bandwidth="1">
       <SegmentTemplate media="v/$Number$.m4s" duration="1000" timescale="1000"/>
      </Representation></AdaptationSet></Period>
-     <Period><AdaptationSet contentType="video"><Representation id="v2" bandwidth="1">
+     <Period duration="PT1S"><AdaptationSet contentType="video">
+      <Representation id="v2" bandwidth="1">
       <SegmentTemplate media="v2/$Number$.m4s" duration="1000" timescale="1000"/>
      </Representation></AdaptationSet></Period></MPD>"""
-    with pytest.raises(ValueError) as ei:
-        parse_mpd(mpd, "https://c.example.com/m.mpd")
-    assert "Period" in str(ei.value) or "时段" in str(ei.value)
+    spec = parse_mpd(mpd, "https://c.example.com/m.mpd")
+    assert len(spec["periods"]) == 2
+    assert spec["video"] is None and spec["audio"] is None, \
+        "多时段时顶层轨必须是空 —— 否则调用方会静默只下第一段"
+    urls = [u for p in spec["periods"] for u in p["video"]["segments"]]
+    assert urls == ["https://c.example.com/v/1.m4s", "https://c.example.com/v2/1.m4s"]
 
 
 def test_timeline_open_ended_is_refused():
@@ -719,7 +734,11 @@ def test_all_tags_only_counts_done_resources(ctx):
     pending = ctx.res(t, status="pending", url="https://example.com/p.jpg")
     db.add_tags([done, pending], ["shared"])
     rows = [dict(r) for r in db.all_tags()]
-    assert rows == [{"tag": "shared", "n": 1}]
+    # ⚠️ 断言**字段的值**而不是整个字典: `all_tags` 后来又长了 `n_tree`/`parent`/
+    # `depth`/`color`(层级与颜色), 拿 `== {...}` 去比会因为加了键就红 —— 那红的是
+    # 断言写得太死, 不是产品坏了。这里要守的是"pending 那份没被算进来"。
+    assert [r["tag"] for r in rows] == ["shared"]
+    assert rows[0]["n"] == 1
 
 
 def test_tags_cascade_when_resource_is_deleted(ctx):

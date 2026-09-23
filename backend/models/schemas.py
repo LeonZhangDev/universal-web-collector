@@ -318,6 +318,22 @@ class LibraryTagsOut(BaseModel):
     touched: int = 0              # 涉及的资源条数
 
 
+class TagColorIn(BaseModel):
+    """设置 / 清除一个标签的颜色。
+
+    `color` 是**调色板键**(red/orange/... 由后端下发), 空串 = 清除。
+    颜色是标签自己的属性, 不随资源增删而丢 —— 用户重新打上同一个标签时它还在。
+    """
+
+    tag: str
+    color: str = ""
+
+
+class TagColorOut(BaseModel):
+    tag: str = ""
+    color: str = ""               # 空串 = 已清除
+
+
 class LibraryFavoriteIn(BaseModel):
     ids: List[int]
     value: bool = True            # False = 取消收藏

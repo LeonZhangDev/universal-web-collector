@@ -79,6 +79,7 @@ export function listLibrary(opts = {}) {
   if (opts.album) params.album = opts.album;
   if (opts.task_id) params.task_id = opts.task_id;
   if (opts.tag) params.tag = opts.tag;
+  if (opts.tag_children) params.tag_children = "true";
   if (opts.favorite) params.favorite = "true";
   if (opts.page) params.page = opts.page;
   if (opts.page_size) params.page_size = opts.page_size;
@@ -87,9 +88,17 @@ export function listLibrary(opts = {}) {
 export function listLibraryAlbums() {
   return api.get("/library/albums").then((r) => r.data);
 }
-// 标签清单(带资源数)。只统计已落盘资源上的标签 —— 否则会出现"点进去空的标签"。
+// 标签清单(带资源数 / 颜色 / 层级)。只统计已落盘资源上的标签 —— 否则会出现"点进去空的标签"。
+// 返回里还带 `colors` 调色板与 `sep`/`max_depth`: 界面上人眼的配色与层级分隔符
+// 只由后端定义, 前端不硬编码(否则后端改了色, 界面还是旧的)。
 export function listLibraryTags() {
   return api.get("/library/tags").then((r) => r.data);
+}
+// 设置 / 清除一个标签的颜色。color="" 表示清除。
+export function setTagColor(tag, color = "") {
+  return api
+    .post("/library/tags/color", { tag, color })
+    .then((r) => r.data);
 }
 // 批量改标签。add / remove 一次请求内完成, clear 表示先清空再 add。
 // ⚠️ 校验不过会整个失败(400)而不是"能加的加上" —— 静默部分成功会让用户以为

@@ -14,6 +14,7 @@ import {
   listLibrary,
   listLibraryAlbums,
   listLibraryTags,
+  setTagColor,
   thumbUrl,
 } from "../api";
 import { toast } from "../toast";
@@ -24,6 +25,10 @@ const pages = ref(1);
 const stats = ref(null);
 const albums = ref([]);
 const tags = ref([]);
+// 调色板由后端下发(`/library/tags` 的 `colors`)。⚠️ 前端**不硬编码色值** ——
+// 否则后端改了配色, 界面上还是旧的, 而没人会想到去查"色值写在哪"。
+const tagPalette = ref([]);
+const tagSep = ref("/");
 const loading = ref(false);
 
 const query = ref({
@@ -31,6 +36,9 @@ const query = ref({
   kind: "all",
   album: "",
   tag: "",
+  // 含子标签: 层级是名字前缀, 这是一次前缀匹配。默认**关** —— 精确匹配才是
+  // "我就要这一个标签"时唯一正确的语义, 含子标签是额外的便利。
+  tag_children: false,
   favorite: false,
   page: 1,
   page_size: 40,
@@ -84,15 +92,84 @@ function clearSel() {
 // 只是资源库这一层的附加信息 —— 所以它们永远不该让采集失败或数据丢失。
 const tagDraft = ref("");        // 批量打标签的输入框
 const busyTag = ref(false);
+// 正在改颜色的那个标签(点一下色块弹出调色板)。空 = 没有弹层。
+const colorEditTag = ref("");
+
+// 标签 -> 色值。键取小写: 后端是 NOCASE 列, 而 JS 对象不是 —— 不折一下就会
+// 出现"后端查得到颜色、界面点不亮"。
+const tagColorMap = computed(() => {
+  const m = {};
+  for (const t of tags.value) {
+    if (t.color) m[String(t.tag).toLowerCase()] = t.color;
+  }
+  return m;
+});
+function colorOf(tag) {
+  return tagColorMap.value[String(tag).toLowerCase()] || "";
+}
+// 从后端下发的调色板里取色值。取不到就不上色(而不是猜一个) ——
+// 猜出来的颜色会与"这个标签本来就没设色"无法区分。
+function colorValue(key) {
+  const hit = tagPalette.value.find((c) => c.key === key);
+  return hit ? hit.value : "";
+}
+// 树里只显示**末段名**(`系列/角色A` -> `角色A`), 靠缩进表达层级。
+// 全路径已经由缩进与父节点表达了, 再重复一遍会让长名字把这一行撑爆。
+function tagLeaf(t) {
+  const s = String(t || "");
+  const i = s.lastIndexOf(tagSep.value);
+  return i >= 0 ? s.slice(i + tagSep.value.length) : s;
+}
+// 缩进用**不换行空格**而不是普通空格/margin: HTML 会把连续普通空格折成一个,
+// 而这块是横向换行排布的, margin 在折行时不会把标签自然地推到右边。
+function tagIndent(t) {
+  return "\u00a0\u00a0\u00a0".repeat(Math.max(0, t.depth || 0));
+}
+// 中间层节点自己可能一条资源都没有(用户只打过 `系列/角色A`), 这时显示"连子
+// 标签一共多少"才是用户点下去会看到的数量。
+function tagCount(t) {
+  return t.n || t.n_tree || 0;
+}
+//: 当前筛选的标签有没有子标签(有才显示"含子标签"开关 —— 否则是个点了没用的按钮)
+const hasChildren = computed(() => {
+  const cur = query.value.tag;
+  if (!cur) return false;
+  const p = cur + tagSep.value;
+  return tags.value.some((t) => String(t.tag).startsWith(p));
+});
 
 function pickTag(t) {
   // 再点一次同一个标签 = 取消筛选(比"再去找清空按钮"顺手)
-  query.value.tag = query.value.tag === t ? "" : t;
+  if (query.value.tag === t) {
+    query.value.tag = "";
+    query.value.tag_children = false;
+  } else {
+    query.value.tag = t;
+  }
+  colorEditTag.value = "";
+  search();
+}
+function toggleTagChildren() {
+  query.value.tag_children = !query.value.tag_children;
   search();
 }
 function toggleFavoriteOnly() {
   query.value.favorite = !query.value.favorite;
   search();
+}
+
+// 设置 / 清除标签颜色。⚠️ 成功后就地改 `tags` 里的那条, 而不是整份重拉:
+// 重拉会把用户滚动到的位置和展开状态一起冲掉, 而颜色是这一屏内的操作。
+async function applyTagColor(tag, color) {
+  try {
+    const r = await setTagColor(tag, color);
+    const hit = tags.value.find((t) => t.tag === tag);
+    if (hit) hit.color = r.color;
+    colorEditTag.value = "";
+    toast(r.color ? `已设置颜色` : "已清除颜色", "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
 }
 
 // 逗号/顿号/空格都当分隔符: 中文输入法下用户会自然地打顿号
@@ -265,6 +342,7 @@ async function load() {
       kind: query.value.kind,
       album: query.value.album || undefined,
       tag: query.value.tag || undefined,
+      tag_children: query.value.tag_children || undefined,
       favorite: query.value.favorite || undefined,
       page: query.value.page,
       page_size: query.value.page_size,
@@ -293,6 +371,8 @@ async function loadTags() {
   try {
     const r = await listLibraryTags();
     tags.value = r.items || [];
+    tagPalette.value = r.colors || [];
+    if (r.sep) tagSep.value = r.sep;
   } catch (e) {
     // 标签是附加信息, 拉不到就让筛选区空着 —— 不该因此挡住整个资源库
     tags.value = [];
@@ -386,17 +466,42 @@ onMounted(() => {
       </button>
     </div>
 
-    <!-- 标签条: 点一下筛, 再点一下取消。只在真有标签时占版面 -->
+    <!-- 标签条: 点一下筛, 再点一下取消。只在真有标签时占版面。
+         ⚠️ 层级是**名字里的前缀**(`系列/角色A`), 父节点本身未必是个标签 ——
+         所以这里按 `parent` 补齐中间层并缩进, 而不是只平铺"有资源的那些"。 -->
     <div class="tag-bar" v-if="tags.length || query.tag">
       <span class="tb-label">标签</span>
-      <button
-        v-for="t in tags.slice(0, 24)"
-        :key="t.tag"
-        class="chip"
-        :class="{ on: query.tag === t.tag }"
-        :title="`${t.n} 项`"
-        @click="pickTag(t.tag)"
-      >{{ t.tag }} <em>{{ t.n }}</em></button>
+      <span class="tb-chips">
+        <span class="chip-wrap" v-for="t in tags.slice(0, 24)" :key="t.tag">
+          <button
+            class="chip"
+            :class="{ on: query.tag === t.tag }"
+            :style="colorOf(t.tag) ? { '--tc': colorValue(colorOf(t.tag)) } : null"
+            :title="`${t.tag}\n自己 ${t.n} 项${t.n_tree > t.n ? ` · 连子标签 ${t.n_tree} 项` : ''}`"
+            @click="pickTag(t.tag)"
+          >
+            <i class="tc-dot" v-if="colorOf(t.tag)"></i>
+            <span class="tc-pad">{{ tagIndent(t) }}</span>{{ tagLeaf(t) }}
+            <em>{{ tagCount(t) }}</em>
+          </button>
+          <button
+            class="tc-edit"
+            :title="`给「${t.tag}」设颜色`"
+            @click.stop="colorEditTag = colorEditTag === t.tag ? '' : t.tag"
+          >🎨</button>
+          <span class="palette" v-if="colorEditTag === t.tag">
+            <button
+              v-for="c in tagPalette"
+              :key="c.key"
+              class="sw"
+              :style="{ background: c.value }"
+              :title="c.label"
+              @click="applyTagColor(t.tag, c.key)"
+            ></button>
+            <button class="sw sw-none" title="清除颜色" @click="applyTagColor(t.tag, '')">✕</button>
+          </span>
+        </span>
+      </span>
       <!-- 被筛的标签如果不在前 24 个里, 上面那行就看不到它 —— 补一颗,
            否则用户会看到一个"筛选生效了但标签条里没有高亮项"的困惑状态 -->
       <button
@@ -404,6 +509,10 @@ onMounted(() => {
         class="chip on"
         @click="pickTag(query.tag)"
       >{{ query.tag }} ✕</button>
+      <label v-if="hasChildren" class="tb-sub">
+        <input type="checkbox" :checked="query.tag_children" @change="toggleTagChildren" />
+        含子标签
+      </label>
       <span v-if="tags.length > 24" class="tb-more">还有 {{ tags.length - 24 }} 个</span>
       <button v-if="query.tag" class="ghost mini" @click="pickTag(query.tag)">清除筛选</button>
     </div>
@@ -522,15 +631,21 @@ onMounted(() => {
             </span>
           </div>
           <!-- 标签: 点一下就地筛选。标签是用户自己定的, 所以顺序按存储顺序(字母序)即可,
-               不做"重要度排序" —— 那需要用户去维护优先级, 是另一种负担。 -->
+               不做"重要度排序" —— 那需要用户去维护优先级, 是另一种负担。
+               有颜色的标签左侧带一个圆点: 颜色是**标签**的属性, 全库统一, 所以
+               同一颗标签在每张卡上都长一样 —— 这正是它有用的原因。 -->
           <div class="card-tags" v-if="(r.tags || []).length">
             <button
               v-for="t in r.tags"
               :key="t"
               class="minichip"
               :class="{ on: query.tag === t }"
+              :style="colorOf(t) ? { '--tc': colorValue(colorOf(t)) } : null"
+              :title="t"
               @click.stop="pickTag(t)"
-            >{{ t }}</button>
+            >
+              <i class="tc-dot" v-if="colorOf(t)"></i>{{ t }}
+            </button>
           </div>
         </div>
       </div>
@@ -610,6 +725,15 @@ onMounted(() => {
 }
 .tb-label { color: var(--muted); font-size: 12px; flex: none; }
 .tb-more { color: var(--muted); font-size: 11px; }
+/* 含子标签: 只在当前标签真有子标签时才出现 */
+.tb-sub {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 11px;
+  color: var(--muted); cursor: pointer; user-select: none; flex: none;
+}
+.tb-sub input { margin: 0; accent-color: var(--accent); }
+/* display:contents 让这层包装对 flex 布局透明 —— 里面的每颗标签仍然直接参与
+   `.tag-bar` 的换行与间距, 而不是被塞进一个不会换行的格子里。 */
+.tb-chips { display: contents; }
 .chip {
   background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
   border-radius: 20px; padding: 3px 10px; font-size: 12px; cursor: pointer;
@@ -620,6 +744,39 @@ onMounted(() => {
 .chip.on {
   color: var(--accent); border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+/* 有颜色的标签: 边框与一颗圆点跟着走。⚠️ 只改**边框和圆点**, 不改文字色 ——
+   调色板里有黄有绿, 直接当文字色会有几档在深色底上读不清。 */
+.chip[style*="--tc"] { border-color: color-mix(in srgb, var(--tc) 55%, var(--border)); }
+.chip[style*="--tc"].on { border-color: var(--tc); }
+.tc-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--tc); margin-right: 5px; vertical-align: 1px;
+}
+/* 缩进用不换行空格(见 tagIndent), 这里只在折行时不允许被断开 */
+.tc-pad { white-space: pre; }
+/* 改颜色: 平时不出现, hover 那颗标签才浮现 —— 一页几十个色块太吵 */
+.chip-wrap { position: relative; display: inline-flex; align-items: center; }
+.tc-edit {
+  opacity: 0; background: none; border: none; cursor: pointer; font-size: 11px;
+  padding: 0 2px; margin-left: -4px; line-height: 1; transition: opacity .15s;
+}
+.chip-wrap:hover .tc-edit { opacity: .7; }
+.tc-edit:hover { opacity: 1; }
+.palette {
+  position: absolute; top: 100%; left: 0; z-index: 30; margin-top: 4px;
+  display: flex; gap: 4px; padding: 6px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .28);
+}
+.sw {
+  width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(0, 0, 0, .25);
+  cursor: pointer; padding: 0;
+}
+.sw:hover { transform: scale(1.15); }
+.sw-none {
+  background: var(--panel-2); color: var(--muted); font-size: 10px; line-height: 1;
+  border-color: var(--border);
 }
 /* 批量栏里的标签输入 */
 .bulk-bar .sep {
@@ -652,6 +809,12 @@ onMounted(() => {
 }
 .minichip:hover { color: var(--text); border-color: var(--border); }
 .minichip.on { color: var(--accent); border-color: var(--accent); }
+/* 带颜色的标签: 圆点跟着走, 文字色不动(理由同上方 `.chip[style*="--tc"]`) */
+.minichip[style*="--tc"] {
+  background: color-mix(in srgb, var(--tc) 14%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--tc) 40%, transparent);
+}
+.minichip .tc-dot { width: 6px; height: 6px; margin-right: 4px; }
 .lib-empty {
   display: flex; flex-direction: column; align-items: center; gap: 10px;
   padding: 56px 0; color: var(--muted); font-size: 13px;

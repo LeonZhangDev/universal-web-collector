@@ -483,3 +483,70 @@ faulthandler.dump_traceback_later(45, exit=True)   # 45 秒还没完就打印所
 （`id_patterns`/`page_tail`（可为列表）/`gid_shape`/`id_samples`/URL 模板/变体/画质映射/
 `base_candidate_digits`/`base_host_templates`），并可加 `match_score`。
 **`id_samples` 必填** —— 那是声明自检唯一的护栏。开工前按 skill `gallery-site-probe` 探测。
+
+## V36 新增：一条静默缺陷 + 三条同族
+
+### 第 13 条 ⚠️ 形参被局部变量遮蔽，症状是"那条信息静静地没了"
+
+`downloaders/video.py::_download_m3u8` 的**参数**里有 `info`（调用方传进来的一只空 dict，
+下载完要把 `resolved_url` / `content_type` 回填进去）；方法体里预检那段又写了一次：
+
+```python
+leaf, info, last_err = murl, None, None     # ← 参数 info 被顶掉, 从此与调用方无关
+for cand in ...:
+    leaf, info = self._preflight_hls(cand, ...)   # 这里的 info 是预检结果
+```
+
+后半段再 `fill_info(info, leaf, ctype)` 填的是**预检那只 dict**，而任务管理器手里那只
+永远是空的。结果：HLS 视频的 `resolved_url` 恒为空（DASH 与直链都正常）。
+
+**为什么难发现**：不报错、不影响下载、不影响时长终检 —— 只是资源列表里少一列溯源信息。
+没有任何一条现有断言会碰它。
+
+**判据**：命名遮蔽（shadowing）在 Python 里合法，读代码时眼睛会自动把它当成"同一个东西"。
+唯一的防线是**在测试里直接断言那只被传进来的 dict 被回填了**
+（`test_hls_fills_the_callers_info_dict`）。只要有人重命名，它立刻炸。
+
+### 同族：「通过但理由已经不对」比失败更危险
+
+产品能力变了之后，旧断言**仍然绿**，但它守的已经不是原来那件事：
+
+| 用例 | 为什么还在过 |
+| --- | --- |
+| `test_segment_base_is_refused` | 新代码确实还报错 —— 但换成"没有 `BaseURL`"那条判据了，报错文本里恰好含 `SegmentBase` |
+| `test_multi_period_is_refused` | 新 fixture 没声明时长，**在时长那一步**就先炸了，根本没走到多时段判断 |
+
+失败会逼你看，通过不会。所以**改产品能力之后，第一件事是回头看旧断言的"理由"**，
+而不是只看红绿灯。做法：把断言从"某个词出现在报错里"改成"我守的那件事成立"
+（例：多时段时顶层 `video`/`audio` 必须是 `None`）。
+
+### 同族：静默降级必须留痕（`park` 搬不动 → `last_error`）
+
+`partials.park*` 搬不动时**故意不抛错**（原地那份保持不动，最坏只是下次从头下）。
+但那样一来"暂存区怎么永远攒不起来"就**没有任何线索** —— 用户能察觉现象却说不清原因。
+
+按那条心法问两个问题：**失败会发生吗？** 会（Windows 上目录 rename 会被"另一个句柄
+还开着"打断，实测偶发）。**失败之后有人知道吗？** 原本**否**。所以补上留痕：
+模块级 `_LAST_PARK_ERROR` → `stats()["last_error"]` → `GET /library/partials`。
+
+顺带一个副作用：测试里 `assert moved == 300, f"没收下: {stats().get('last_error')}"`
+把偶发失败变成了**能自己解释自己**的失败。
+
+### 同族：`Range` 与条件请求不能共存（第 A 条的延伸）
+
+第 A 条讲的是**续传**时不能带 `If-None-Match`。V36 给 DASH 加字节区间寻址后又遇到同一件事，
+只是这次的代价不同：
+
+* 续传场景：服务器回 304 → "416 = 本地已完整"那条收尾路径永远走不到（**少下**）；
+* 区间场景：分片请求带 `Range` 又带 `If-None-Match` → 回 304，那一段字节**永远取不到**。
+
+所以 `_seg_target()` 构造 headers 时**主动剥掉** `if-none-match` / `if-modified-since` /
+`range`，再放上自己的 `Range`。另一条同族的：**服务器忽略 `Range`**（回 200 全量）时
+必须**报错** —— 拿整份文件从 0 开始去解 `sidx`，分片边界会**整体错位**，
+拼出来"长度对得上、能播、但每隔几秒糊一下"。
+
+### 环境类：Windows 目录 `os.replace` 偶发失败
+
+`park_segments` 走 `os.replace(src_dir, dest_dir)`（同盘原子）。Windows 上只要**有别的句柄
+开着目录里的任何一个文件**就会失败（`PermissionError` → 被归入 `OSError`）。全套 991 用例
+里偶发 1 次，诊断插桩后再跑一次就没复现 —— 结论是环境而非回归，但必须能被看见（见上条）。

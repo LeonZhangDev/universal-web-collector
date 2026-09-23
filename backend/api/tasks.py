@@ -67,6 +67,8 @@ from models.schemas import (
     TaskListOut,
     TaskOut,
     TaskStatsOut,
+    TagColorIn,
+    TagColorOut,
 )
 
 router = APIRouter()
@@ -764,6 +766,9 @@ def resource_library(
     album: Optional[str] = Query(None, description="按相册名精确筛选"),
     task_id: Optional[int] = Query(None, description="只看某个任务的产出"),
     tag: Optional[str] = Query(None, description="只看带这个标签的资源(大小写不敏感)"),
+    tag_children: bool = Query(
+        False, description="标签按层级筛: 连 `系列/角色` 这类子标签一起收"
+    ),
     favorite: bool = Query(False, description="只看收藏"),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
@@ -776,11 +781,13 @@ def resource_library(
     想删的是"某个任务的那条记录", 而真删文件与否由 refs 决定(见 DELETE 端点)。
     """
     total = db.library_count(q=q, kind=kind, task_id=task_id, album=album,
-                             tag=tag, favorite=favorite)
+                             tag=tag, favorite=favorite,
+                             tag_children=tag_children)
     offset = (page - 1) * page_size
     rows = db.library_list(
         q=q, kind=kind, task_id=task_id, album=album,
         limit=page_size, offset=offset, tag=tag, favorite=favorite,
+        tag_children=tag_children,
     )
     # ⚠️ refs 与 tags 都**批量取**。逐行查的话一页 40 条就是 80 次往返, 而这是
     # 最高频的接口 —— 列表页的"N+1"是最容易被写出来、也最难被察觉的一类慢。
@@ -805,9 +812,41 @@ def resource_library(
 
 @router.get("/library/tags")
 def library_tag_list(limit: int = Query(200, ge=1, le=1000)):
-    """标签清单(带资源数), 供筛选下拉与自动补全。"""
-    items = [dict(r) for r in db.all_tags(limit)]
-    return {"items": items, "total": len(items)}
+    """标签清单(带资源数 / 颜色 / 层级), 供筛选下拉、树与自动补全。
+
+    ⚠️ `colors` 调色板由**后端下发**(与 `error_kind` 的中文标签同一条理由):
+    界面上人看的文案与配色只有一个来源, 前端自己编一套就会出现"后端改了颜色,
+    界面上还是旧的"。前端只拿键去查表, 不硬编码色值。
+
+    `items` 里每条带 `parent` / `depth` / `n_tree`, 前端据此把中间层补齐成树 ——
+    父标签**未必**自己是个标签(用户可能只打过 `系列/角色`), 所以树不能只由
+    "有资源的节点"拼出来。
+    """
+    items = db.all_tags(limit)
+    return {
+        "items": items,
+        "total": len(items),
+        "sep": db.TAG_SEP,
+        "max_depth": db.MAX_TAG_DEPTH,
+        "colors": [
+            {"key": k, "label": label, "value": value}
+            for k, (label, value) in db.TAG_COLORS.items()
+        ],
+    }
+
+
+@router.post("/library/tags/color", response_model=TagColorOut)
+def library_tag_color(payload: TagColorIn):
+    """设置 / 清除标签颜色。`color=""` 表示清除。
+
+    ⚠️ 未知颜色**报错**而不是悄悄退回默认色: 界面显示成灰的, 用户会以为
+    "点了没反应", 而真正的原因是前端传了一个后端不认识的键。
+    """
+    try:
+        key = db.set_tag_color(payload.tag, payload.color)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TagColorOut(tag=payload.tag.strip(), color=key)
 
 
 @router.post("/library/tags", response_model=LibraryTagsOut)

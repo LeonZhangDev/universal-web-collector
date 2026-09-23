@@ -155,12 +155,14 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | 落盘后完整性巡检 | 已实现：`POST /library/verify` 用 `mediacheck` 巡检缺失/截断，只标记不删；新增 `missing` 分类 |
 | 测试隔离即时守卫 | 已实现：`isolation.install_real_db_guard()` 在**打开真实库的那一刻**带调用栈失败（指纹守卫只能事后发现，且 `_migrate` 幂等） |
 | 断点续传持久化 | 已实现：`core/partials.py` 按 **URL** 寻址的暂存区（`_meta/partial/{sha1(url)}.part` + `index.json`），取消/失败时 park、坏文件/满盘时 discard，TTL + 总量预算按「最久没用」淘汰；`GET/DELETE /library/partials` + 首页可见可清 |
-| DASH（`.mpd`） | 已实现：`downloaders/dash.py` 解析 `SegmentTemplate`（`$Number$` / `$Time$`+`SegmentTimeline`）与 `SegmentList`，视频取最高档、音频单独一轨，下载后 `-c copy` mux；DRM / `SegmentBase` / 直播 / 多 Period **明确拒绝**（那些会下出「成功但没用」的文件） |
+| DASH（`.mpd`） | 已实现：`downloaders/dash.py` 解析 `SegmentTemplate`（`$Number$` / `$Time$`+`SegmentTimeline`）、`SegmentList`、`SegmentBase` / `mediaRange`（字节区间）与多 `Period`；视频取最高档、音频单独一轨，下载后 `-c copy` mux；DRM / 直播 / `r=-1` / 嵌套 sidx **明确拒绝**（那些会下出「成功但没用」的文件） |
 | 资源库标签与收藏 | 已实现：`resource_tags` 明细表（`COLLATE NOCASE`，级联删除）+ `resources.favorite`；`/library/tags`、`/library/favorite`、`GET /library?tag=&favorite=`；标签筛选用 `EXISTS` 而非 JOIN（JOIN 会让「一个资源 3 个标签」变成 3 行，分页口径全错） |
+| 标签层级与颜色 | 已实现：层级 = 标签名里的 `/`（`系列/角色A`），**不建树表**；`all_tags()` 回 `parent`/`depth`/`n_tree` 并补齐中间层，`/library/tags` 下发调色板（界面不硬编码色值）；颜色存在 `tag_meta`，是**标签**的属性（资源删光也不丢）；`GET /library?tag=&tag_children=true` 做带分隔符的前缀匹配 |
+| 分片缓存的跨任务复用 | 已实现：分片缓存也进暂存区（`{sha1(清单URL)}.seg/`），与单文件 `.part` 共用 TTL/预算/淘汰；**按清单指纹**（`fingerprint`，支持字节区间）判断能否复用，不符整份丢弃 |
 
 ## 后续可做
 
-截至 V35，前面几轮列出的建议已**全部实施**，无遗留项。
+截至 V36，前面几轮列出的建议已**全部实施**，无遗留项。
 
 - V33 是四条**缺陷修复**（跑通了但结果是错的）。
 - V34 把 V33 列的八项 backlog 一次做完，并修掉两个"看不见"的问题（前端引用的
@@ -168,15 +170,17 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
   `DB_PATH` 还原成真实路径，那之后任何 DB 访问都落到用户的真库上）。
 - V35 收掉最后三项（断点续传持久化 / DASH / 标签收藏），并复核出项目文档本身在
   **撒谎**：两处声称缺失的能力其实早就有了（见下）。
+- V36 收掉 V35 结束时列出的最后三项（分片缓存跨任务复用 / 标签层级与颜色 /
+  DASH 的 `SegmentBase` 与多 Period），并顺手修掉 HLS 路径**丢掉调用方 `info`**
+  的那个静默缺陷。
 
 若之后继续扩展，方向明确的有：
 
 | 优先级 | 建议 | 价值与范围 |
 | --- | --- | --- |
-| P2 | 资源库标签的层级/颜色 | 现在是扁平标签。数量上去之后（几十个）会难找；可加分组或颜色标记 |
-| P3 | DASH 的 `SegmentBase` / 多 Period | 目前明确拒绝。前者要支持字节区间请求（`Range` 已具备），后者要按时段分别拼接再合并 |
-| P3 | 分片级断点续传的跨任务复用 | HLS/DASH 的分片缓存目录（`.<stem>.parts/`）**留在目标路径旁边**，换路径就找不到 —— 与单文件 `.part` 是同一个问题，只是暂存区目前只收单文件 |
 | 按需求 | 更多站点插件 | 契约已稳定（`GallerySite` + `@register`），新增站点只需声明 + `match_score` 把关 |
+| 低 | `sidx` 的嵌套索引（`reference_type=1`） | 需要连取多层索引再展开。真实站点几乎不出现，出现时**明确报错**已经足够 |
+| 低 | 直播（`type="dynamic"`） | 要引入"跟到某个时间点为止"的语义（`availabilityStartTime` + 结束条件），与"点播产物是一个完整文件"的模型冲突，暂不做 |
 
 > **复核纠错记录（V35）**：曾有两条列在这里，去代码里核时发现**已经实现**，属文档
 > 过期（声称缺失的能力其实在）：
@@ -187,6 +191,12 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 >
 > 这与「fixture 不诚实」「旧测试断言的前提失效」是**同一型**：声称某能力不在，其实早有。
 > 区别只是这次说谎的是**文档**。**维护文档时要去代码里核，不能凭印象增删条目。**
+>
+> V36 的提交前照例做了关键词扫描（`暂不支持 / 还没有 / 只放内存 / 未实现 / 缺一个 /
+> 明确拒绝`），逐条去代码里核。**这一轮没有发现新的"谎报能力缺失"** —— 上一轮列的
+> 三项目标确实都还没做（这次才做完），V35 写的边界描述当时是准的。
+> 唯一需要改的是**能力描述本身过期**（`SegmentBase` / 多 `Period` / 扁平标签 /
+> 「暂存区只收单文件」四处），已在上面四处改掉。
 
 > ⚠️ 新增站点时注意：纯 ID 样本存在跨站歧义，`match_score` 必须用自己的 `gid_shape`
 > 对纯 ID 二次把关，否则会静默抢走别的站点的输入（详见 `AGENT_DEVELOPMENT_GUIDE.md` 第 11 节）。

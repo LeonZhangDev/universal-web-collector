@@ -37,10 +37,13 @@
 | 10 | `except OSError: pass` | 盖在"本来就会失败"的写入上 = 把丢数据改装成静默（两问：会发生吗？有人知道吗？） |
 | 11 | 引用不存在的接口 | 前端引用 `/files/raw` 而它**从没实现过** → 404 被 `onerror` 藏掉，"只是没缩略图" |
 | 12 | 流式响应不关 = 连接泄漏 | `_fetch_segments` 一条 404 漏一个连接（池 `max(10, domain_concurrency*2)`，`pool_block=True`）→ 漏满后所有 worker 阻塞在 `urllib3._get_conn`，表现为**任务卡死不报错** |
+| 13 | 形参被局部变量遮蔽 | `_download_m3u8` 里 `info` 被预检结果顶掉 → 调用方那只 dict 永远空，HLS `resolved_url` 恒缺；不报错、不影响下载，只有「直接断言那只 dict」才炸得出来 |
 | A | 条件请求 ⊥ 续传 | 有 `Range` 时不能带 `If-None-Match`（服务器会答 **304 而非 206**，收尾路径永远走不到） |
 | B | 隔离的窗口期 | `monkeypatch.undo()` 把 `DB_PATH` 还原成真路径 → 谁在那时碰库就写**用户真库** |
 | C | 素材/断言的前提会失效 | 产品加了校验或能力，回头问 fixture 与旧断言还成立吗（**也包括文档声称**） |
 | D | 测试基线会漂 | 会话间有"自动提交"合并别处的分支 → 别拿旧用例数当事实 |
+| F | **通过但理由已经不对** | 产品能力变了, 旧断言却还绿 —— 因为新代码在**另一条**判据上报错、或在更早一步就炸。比失败更危险：失败会逼你看, 通过不会 |
+| G | 静默降级必须有痕 | `park*` 搬不动时故意不抛错, 但「怎么永远攒不起来」得有人知道 → `stats()['last_error']`（心法②的又一次应用） |
 | E | 测试替身写死签名 | 抽出通用函数时旧的 `lambda *a:` 会立刻炸 —— **那正是它在尽职**，是替身不诚实，不是回归 |
 
 **四条通用心法**（比记具体条目重要）：
@@ -102,5 +105,14 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 - **V32**：代理熔断 / 字节级进度 / 跨任务资源库 / Pexels 采集器；首次配远端并推送成功。测试 587。
 - **V33**：下载层四缺陷 —— 4xx 分流（`PERMANENT_STATUS`→`GoneError`，新资源状态 `gone`）/ `mediacheck` 算术判据 / `decode_gray_ex` 分开"缺解码器"与"解码失败" / `cdn_profile` 并发丢更新。测试 819。
 - **V34**：八项 backlog —— 资源遥测 / 缩略图 + `/files/raw` / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 熔断持久化 / Pexels 集合页；顺带修掉"接口从不存在"与隔离窗口期。测试 **880**（874 passed / 6 skipped）；前端 90 modules / 209.35 kB。
-- **V35**：最后三项 —— 断点续传持久化（`core/partials.py`，**按 URL 寻址** + TTL/预算 + 启动清扫）/ DASH(.mpd)（`downloaders/dash.py`，纯解析 + 初始化段顺序 + DRM 明确报错）/ 资源库标签与收藏（`resource_tags` FK 级联 + `favorite` 独立维度）。**顺带修掉一个真缺陷**：`_fetch_segments` 不关响应 → 404 漏连接 → 池(8)漏满后任务卡死（第 12 条静默坑）。**文档复核又抓出 3 处谎报**（站点并发配额 / 巡检落库 / 熔断"只在内存"；GUIDE 甚至同文件自相矛盾）。测试 **942**（936 passed / 6 skipped）；前端 90 modules / 213.75 kB。
+- **V36**：V35 结束时列的最后三项 —— 分片缓存跨任务复用（`partials` 扩 `kind=segments`，
+  按**清单 URL** 寻址 + **指纹**校验，指纹支持字节区间）/ 标签层级与颜色（层级 = 名字里的 `/`，
+  零新表；调色板后端下发）/ DASH 字节区间与多时段（`parse_sidx` 按 §8.16.3，**拿 ffmpeg 真吐的
+  sidx 钉答案**；多时段**逐轨** `-f concat` 拼，顶层 `video`/`audio` 置 `None` 防静默截断）。
+  **顺带修掉**：`_download_m3u8` 的 `info` 形参被局部变量遮蔽（HLS `resolved_url` 恒空）、
+  `park` 失败无痕 → `stats()['last_error']`。测试 **997**（991 passed / 6 skipped）；
+  前端 90 modules / 216.05 kB。
+- **V37 候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：更多站点插件（按需求）/
+  `sidx` 嵌套索引 / 直播（`type="dynamic"`）—— 后两条都标了"低"。
+- **V35**：最后三项 —— 断点续传持久化（`core/partials.py`，**按 URL 寻址** + TTL/预算 + 启动清扫）/ DASH(.mpd)（`downloaders/dash.py`，纯解析 + 初始化段顺序 + DRM 明确报错）/ 资源库标签与收藏（`resource_tags` FK 级联 + `favorite` 独立维度）。**顺带修掉一个真缺陷**：`_fetch_segments` 不关响应 → 404 漏连接 → 池(10)漏满后任务卡死（第 12 条静默坑）。**文档复核又抓出 3 处谎报**（站点并发配额 / 巡检落库 / 熔断"只在内存"；GUIDE 甚至同文件自相矛盾）。测试 **942**（936 passed / 6 skipped）；前端 90 modules / 213.75 kB。
 - **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：标签层级/颜色 / DASH 的 `SegmentBase`+多 Period / 分片级断点续传的跨任务复用（`.<stem>.parts/` 仍在目标路径旁，是单文件 `.part` 的同一个问题）。

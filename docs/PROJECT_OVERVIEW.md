@@ -159,6 +159,9 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | 资源库标签与收藏 | 已实现：`resource_tags` 明细表（`COLLATE NOCASE`，级联删除）+ `resources.favorite`；`/library/tags`、`/library/favorite`、`GET /library?tag=&favorite=`；标签筛选用 `EXISTS` 而非 JOIN（JOIN 会让「一个资源 3 个标签」变成 3 行，分页口径全错） |
 | 标签层级与颜色 | 已实现：层级 = 标签名里的 `/`（`系列/角色A`），**不建树表**；`all_tags()` 回 `parent`/`depth`/`n_tree` 并补齐中间层，`/library/tags` 下发调色板（界面不硬编码色值）；颜色存在 `tag_meta`，是**标签**的属性（资源删光也不丢）；`GET /library?tag=&tag_children=true` 做带分隔符的前缀匹配 |
 | 分片缓存的跨任务复用 | 已实现：分片缓存也进暂存区（`{sha1(清单URL)}.seg/`），与单文件 `.part` 共用 TTL/预算/淘汰；**按清单指纹**（`fingerprint`，支持字节区间）判断能否复用，不符整份丢弃 |
+| 媒体元数据 | 已实现：`resources.width/height/duration`，图片在落盘后读文件头量宽高、视频取下载层**已经测过**的容器时长（`info["probed_duration"]`，三条收尾路径统一回填）。⚠️ 没装 ffprobe 时 `duration` 留 **NULL**，不写 0 —— "没测量"与"0 秒"是两件事 |
+| 下载顺序（优先级） | 已实现：`options.resource_order` ∈ `original` / `video_first` / `small_first`。线程池固定大小、空闲 worker 按**提交序**取任务，所以重排提交顺序就是事实上的优先级；`task_manager.order_resources` 只排序不过滤（输出长度与输入恒等） |
+| 跨任务死信重放 | 已实现：`GET /library/failures`（按 `error_kind` 分组，每个原因给 `n` 与 `replayable` 两个数字）+ `POST /library/replay`（按 `refs`/`kinds`，同给取交集）。全部复用 `submit_resource` 这一条重下入口，跳过理由逐条回报 |
 
 ## 后续可做
 

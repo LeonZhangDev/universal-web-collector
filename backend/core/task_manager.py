@@ -43,6 +43,52 @@ logger = logging.getLogger("uwc")
 
 DOWNLOADS_DIR = settings.download_dir
 
+#: `options.resource_order` 的合法取值。**提交顺序就是下载优先级** —— 下载池是
+#: 固定大小的 ThreadPoolExecutor, 空闲 worker 按提交序取任务, 所以重排提交顺序
+#: 是真实生效的, 不需要另造一套"优先级队列"。
+RESOURCE_ORDERS = ("original", "video_first", "small_first")
+
+
+def order_resources(resources, mode="original"):
+    """按任务选项重排**提交给下载池的顺序**。
+
+    背景: 原来一次性按采集顺序全提交, "先下哪个"完全由站点枚举顺序决定 ——
+    用户想让最慢的那批(视频)先开跑无从表达, 只能干等前面几百张图下完。
+
+    ⚠️ 这是一次**排序, 不是过滤**: 不认识的 mode、缺字段的行、体积为 None 的行
+    都必须原样留在结果里。任何"顺手丢掉一部分"的实现都会让资源静默不下, 那正是
+    第 10 条静默坑("把丢数据改装成静默")。这里只保证 `len(out) == len(in)`。
+
+    ⚠️ `sorted` 是稳定的, 同档次内保持采集原序 —— 同站请求的先后节奏不该因为
+    开了个开关就变。
+    """
+    items = list(resources)
+    if mode == "video_first":
+        # 视频优先: 它体积最大、最容易被站点限速拖成长尾, 先开跑等于把长尾提前;
+        # 图片小而多, 并行度足够时在后面照样下得很快。
+        return sorted(
+            items,
+            key=lambda r: 0 if (r["type"] or "").lower() == "video" else 1,
+        )
+    if mode == "small_first":
+        # 已知体积的按小到大: 完成数涨得快, 进度条更早动起来。
+        # ⚠️ 体积未知的排**最后**, 不是当 0 排最前 —— 采集阶段只有视频会自报体积
+        # (见 `add_resource(size=r.get("size"))`), 图片的体积要下完才知道; 若把
+        # None 当 0, 一整个相册的图会全部插到已声明体积之前, 等于把"唯一可能很慢
+        # 的那批"推到最前面, 与这个模式的意图正好相反。
+        def key(r):
+            keys = r.keys() if hasattr(r, "keys") else ()
+            size = r["size"] if "size" in keys else None
+            try:
+                return (1, 0.0) if not size else (0, float(size))
+            except (TypeError, ValueError):
+                return (1, 0.0)
+
+        return sorted(items, key=key)
+    # original / 不认识的取值: 原样返回。**不抛错** —— 选项是用户/旧前端填的,
+    # 一个拼错的值不该让整个任务起不来, 退化成默认顺序即可。
+    return items
+
 
 def _notification_for(task_id, status):
     """把终态翻译成一条通知(level, title, body)。非终态返回 (None, None, None)。
@@ -1169,6 +1215,16 @@ class TaskManager:
         # 环境级失败(如磁盘满)的广播通道: 一个资源撞上, 同批剩下的直接跳过,
         # 而不是各自走完重试链 —— 那样几百个资源就是长时间空转。
         abort = threading.Event()
+        # 提交顺序 = 下载优先级(见 order_resources)。这里只重排、不改集合, 长度
+        # 不变, 所以上面的 `total` 依旧成立。老任务/旧前端不带这个选项时即
+        # `original`, 行为与本模块此前逐字节一致。
+        order = (self._options(task_id) or {}).get("resource_order") or "original"
+        ordered = order_resources(resources, order)
+        if order in RESOURCE_ORDERS and order != "original":
+            resources = ordered
+            # 记一条日志: 顺序是个"看不见的开关", 不写下来就没人知道这次为什么
+            # 先从视频开始(第 10 条静默坑: 改变行为的地方要留痕)。
+            self._safe_log(task_id, f"下载顺序: {order} (按提交序决定优先级)")
         futures = [
             self._download_executor.submit(
                 self._download_one, task_id, r, referer, out_dir, filters, abort,
@@ -1406,13 +1462,35 @@ class TaskManager:
             if size is not None:
                 db.update_resource(rid, size=size)
 
+            # 媒体元数据落库(图片宽高 / 视频时长)。
+            # ⚠️ 这不是新增开销, 而是**把本来就在做、做完就丢的事留下结果**:
+            #   * 图片尺寸原来只在 `filters.need_dimensions` 为真时才算, 结果只喂给
+            #     过滤器; 关掉尺寸过滤就完全不算, 于是"分辨率"这个字段永远空着。
+            #   * 视频时长在下载层收尾时**已经 ffprobe 过**(直链/HLS/DASH 三条路都
+            #     量过), 但返回值没人接, 用完即弃。
+            # 放在这里(而不是另找地方补算)是因为此刻手上是完整文件: 零额外请求、
+            # 零误判 —— 与尺寸终检同一个理由。
+            rtype = (r["type"] or "").lower()
+            dims = None
+            if rtype == "image":
+                dims = image_dimensions(final_path)
+                if dims:
+                    db.update_resource(rid, width=dims[0], height=dims[1])
+            elif rtype == "video":
+                # 只有下载层真的量到才写。没装 ffprobe 时保持 NULL —— 与
+                # `_resolve_ffprobe` 那条约束一致: **缺探测器不等于文件坏**, 写 0
+                # 会让界面显示"时长 0 秒", 把能力缺失伪装成内容问题。
+                measured = info.get("probed_duration")
+                if measured:
+                    db.update_resource(rid, duration=float(measured))
+
             # 尺寸终检(可选): 广告横幅(728x90)、按钮(88x31)、信标(1x1)的文件名
             # 和体积都可能"正常", 只有量宽高才认得出。放在**下载后**是有意的 ——
             # 那时手上是完整文件, 零额外请求、零误判; 下载前用 Range 抓头部遇到
             # progressive JPEG 会读不到 SOF, 于是广告照样落盘, 等于没做。
-            if filters.need_dimensions and (r["type"] or "").lower() == "image":
-                dims = image_dimensions(final_path)
-                reason = filters.match_dimensions(*dims) if dims else None
+            # (dims 上面已经算过, 这里直接复用, 不再重复读文件头。)
+            if filters.need_dimensions and dims is not None:
+                reason = filters.match_dimensions(*dims)
                 if reason:
                     if owned:
                         Path(final_path).unlink(missing_ok=True)

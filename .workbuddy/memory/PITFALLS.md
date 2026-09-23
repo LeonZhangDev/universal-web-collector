@@ -550,3 +550,64 @@ for cand in ...:
 `park_segments` 走 `os.replace(src_dir, dest_dir)`（同盘原子）。Windows 上只要**有别的句柄
 开着目录里的任何一个文件**就会失败（`PermissionError` → 被归入 `OSError`）。全套 991 用例
 里偶发 1 次，诊断插桩后再跑一次就没复现 —— 结论是环境而非回归，但必须能被看见（见上条）。
+
+---
+
+## V37：一条"测试里的真 worker"泄漏 + 环境三则
+
+### 第 14 条 ⚠️ 测试里"顺手调真实入口"= 点火真 worker
+
+**症状**：`test_watchdog.py::test_watchdog_fails_orphan_task` 随机红
+（`assert 'running' == 'failed'`），而**单独跑那个文件全绿**。
+先怀疑"新测试文件泄漏了 TaskManager 实例"——方向对了一半。
+
+**真机制**（`tests/test_features_v37.py`）：
+
+1. 新用例用 `client.post("/tasks/create", ...)` 触发真实接口；
+2. `create()` 里那句 `task_manager.submit(result.task_id)` 点的是**模块级全局实例**
+   （不是用例夹具造的那个），于是往它固定的线程池里排了一个**真采集任务** —— 真 worker 起来了；
+3. 用例结束，夹具把 `db.DB_PATH` 换成**下一个用例**的库，**但线程还活着**；
+4. 每个用例的库 id 都从 1 开始 → 那个 worker 的 `db.update_task(tid, hb=now)`
+   **正好在给下一个用例的任务 1 续心跳**；
+5. 看门狗看到心跳新鲜 → 不判"遗留任务" → 断言红。
+
+**为什么难发现**：泄漏出去的是**线程**，不是状态变量；而且它只在
+"上一条用例恰好 submit 过 + 下一条用例恰好用 id 1"时命中 —— 表现为**随机**。
+`TaskManager.shutdown()` 的 docstring 早就写了这件事（"上一条用例没跑完的 worker
+会继续在下一个用例里写库…表现为随机失败，极难定位"），只是新文件没照做。
+
+**判据 / 防法**（三条，缺一不可）：
+
+* 夹具里把 `submit` stub 掉 —— 它是**真 worker 的点火开关**。要测的是 HTTP 与落库，
+  不是采集流水线。（反例见下：`submit_resource` 故意**不** stub，因为"护栏真的拦住了"
+  正是被测对象，而它的早退分支不会起线程。）
+* 任何创建 `TaskManager` 的用例：`try/finally: m.shutdown(wait=True)`。
+  本仓库其它文件全这么写，只有新文件漏了 —— **新文件要照着老文件的夹具抄**。
+* 写测试时对自己问一句：**这条路径会不会起后台线程？**
+
+**诊断手法**（一次就定位，比读代码快）：挂一个 `pytest_runtest_teardown` 钩子，
+打印 `_LIVE_MANAGERS` 里每个实例的 `_active` 键 + 当前库的 tasks 行。
+本次一跑就看见全局实例挂着 `['1','2']` —— 铁证。
+（⚠️ 钩子里**必须写文件**，pytest 会按用例捕获 stderr，只有失败的用例才回放。）
+
+### 环境类：宿主命令包装器缺失 → 长命令直接失败
+
+`... app.asar.unpacked/cli/bin/windows-child-process-containment.cjs` 报
+`Cannot find module` + `MODULE_NOT_FOUND`（宿主在更新/被清理时会这样）。
+**症状极具误导性**：命令根本没跑，看起来像 pytest 自己崩了；短命命令（`echo`、`python -c`）
+正常，跑得久的命令被"升级到沙箱外"时才炸。
+**绕过**：该命令加 `run_in_background=true`（本次就是这么跑完 1001 条用例的）。
+
+### 环境类：`export PATH="/usr/bin:/bin:$PATH"` 会把 python 换掉
+
+前置式 export 会让裸 `python` 解析到**托管版 3.13.12（没装 pytest）**，
+报 `No module named pytest` —— 看着像依赖丢了，其实是解释器换了。
+要么别前置（必要时用 `PY` 全路径），要么先 `python -c "import sys; print(sys.executable)"` 自证。
+
+### 环境类：safe-delete 守卫的第三个实例 —— pytest 的 `tmp_path` 清理
+
+已知两个（`verify_output.py` 的 `rmtree`、`vite build` 的 `emptyDir`）。第三个更迷惑：
+**全部用例都过了**（进度行全是点），会话收尾删 `pytest-of-admin/...` 时撞守卫
+（本次 3221 文件 / 阈值 50）→ **exit 1、没有 FAILED 行、连汇总行都没有**。
+所以"exit 1"在这台机器上**不等于有失败**，要看进度行里有没有 `F`/`E`。
+

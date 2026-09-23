@@ -54,6 +54,16 @@ CREATE TABLE IF NOT EXISTS resources(
     status TEXT NOT NULL DEFAULT 'pending',
     created_time TEXT NOT NULL,
     size INTEGER,
+    -- 媒体元数据: 图片实测宽高 / 视频容器时长(秒)。
+    -- ⚠️ 这两个数字**本来就被算出来过**, 只是随手丢了: 尺寸终检在
+    -- `filters.need_dimensions` 时已经调过 `image_dimensions()`, 直链与 HLS 的
+    -- 内容终检也早就用 ffprobe 量过时长 —— 都用完即弃。落库后它们才产生价值:
+    -- 可以按分辨率筛选/排序、列表直接显示尺寸、认出 0x0 之类的坏产物。
+    -- 没装 ffprobe 时 duration 留 NULL: **缺探测器不等于文件坏**(见
+    -- `downloaders/video.py::_resolve_ffprobe` 那段两种 None 的区分)。
+    width INTEGER,
+    height INTEGER,
+    duration REAL,
     note TEXT,
     mirrors TEXT,
     filename TEXT,
@@ -205,6 +215,10 @@ _ADD_COLUMNS = [
     # 收藏(0/1)。标签另立 resource_tags 明细表(见 SCHEMA) —— 那是多值, 放列里
     # 就只能拼串, 筛选和统计都会退化成全表扫 + 拆串。
     ("resources", "favorite", "INTEGER NOT NULL DEFAULT 0"),
+    # V37: 媒体元数据(图片宽高 / 视频时长)。旧库靠这里补齐, 新库由 SCHEMA 直接建。
+    ("resources", "width", "INTEGER"),
+    ("resources", "height", "INTEGER"),
+    ("resources", "duration", "REAL"),
 ]
 
 
@@ -1044,6 +1058,91 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
         args.extend([pat, pat])
 
     return " AND ".join(where), args
+
+
+def failure_kinds(include_gone=True, include_corrupt=True):
+    """按 `error_kind` 统计失败资源(跨任务) —— 死信面板的分布。
+
+    每项给**两个**数字:
+      * `n`          —— 这个原因下有多少条(`corrupt` 含 `status='done'` 的那些);
+      * `replayable` —— 其中**重放真的能救**的条数(口径 = `_failure_where`)。
+
+    只给一个数字是不够的: 界面会顺手拿它当"即将重放的条数"用, 于是点 `corrupt`
+    那一类时"提示 12 条、实际起来 0 条" —— 用户只会以为点了没生效。
+
+    ⚠️ "总数"与"可重放"是两个问题, 但"什么算可重放"只能有**一个定义**, 两条 SQL
+    共用 `_failure_where` 构造。
+    """
+    where, args = _failure_where(None, include_gone)
+    replayable = {
+        r["kind"]: r["n"]
+        for r in query(
+            f"SELECT r.error_kind AS kind, COUNT(*) AS n FROM resources r "
+            f"WHERE {where} GROUP BY r.error_kind",
+            tuple(args),
+        )
+    }
+    seen = ["r.error_kind IS NOT NULL", "r.error_kind <> ''"]
+    if not include_gone:
+        seen.append("r.error_kind <> 'gone'")
+    if not include_corrupt:
+        seen.append("r.error_kind <> 'corrupt'")
+    rows = query(
+        f"SELECT r.error_kind AS kind, COUNT(*) AS n FROM resources r "
+        f"WHERE {' AND '.join(seen)} GROUP BY r.error_kind ORDER BY n DESC, kind"
+    )
+    return [
+        {"kind": r["kind"], "n": r["n"], "replayable": replayable.get(r["kind"], 0)}
+        for r in rows
+    ]
+
+
+def _failure_where(kinds=None, include_gone=False):
+    """「可重放的死信」的**唯一定义**。
+
+    ⚠️ 列表(`failure_refs`)与计数(`failure_count`)必须共用这一份 —— 分开写的话
+    界面上的"能重放 37 条"与实际起来 40 条(或 31 条)会对不上, 而这种偏差不会
+    报错, 只会在用户数了两遍之后变成"这软件有毛病"。
+
+    `status` 的取值与 `TaskManager.submit_resource` 的放行条件**逐字对齐**:
+    它才是真正干活的入口, 两边条件漂移的后果是"列出来的重放不了"。
+    """
+    where = ["r.status IN ('failed','skipped','gone')",
+             "r.error_kind IS NOT NULL", "r.error_kind <> ''"]
+    args = []
+    if not include_gone:
+        # `gone` = 源站已删/已下线。自动重放它是纯空转; 手动点单条重试仍然放行
+        # (403 可能只是代理/Referer 变了, 见 submit_resource 的注释)。
+        where.append("r.error_kind <> 'gone'")
+    picked = [k for k in (kinds or []) if k]
+    if picked:
+        where.append("r.error_kind IN (" + ",".join("?" * len(picked)) + ")")
+        args.extend(picked)
+    return " AND ".join(where), args
+
+
+def failure_refs(kinds=None, include_gone=False, limit=200):
+    """挑出**值得重放**的失败资源(跨任务), 最近失败的优先。
+
+    带任务名与采集器(与 `library_list` 同形): 死信面板要能说清"这是哪个任务里
+    的哪一条", 逐行再去查任务就是典型的 N+1。
+    """
+    where, args = _failure_where(kinds, include_gone)
+    return query(
+        f"""SELECT r.*, t.name AS task_name, t.collector AS collector
+            FROM resources r JOIN tasks t ON t.id = r.task_id
+            WHERE {where} ORDER BY r.id DESC LIMIT ?""",
+        tuple(args) + (int(limit),),
+    )
+
+
+def failure_count(kinds=None, include_gone=False):
+    """可重放的死信条数(口径同 `failure_refs`)。"""
+    where, args = _failure_where(kinds, include_gone)
+    row = query_one(
+        f"SELECT COUNT(*) AS n FROM resources r WHERE {where}", tuple(args)
+    )
+    return row["n"] if row else 0
 
 
 def library_count(q=None, kind=None, task_id=None, album=None, status="done",

@@ -35,6 +35,7 @@ from core.task_dedup import create_or_dispose
 from core.task_manager import (
     ACTIVE_STATES,
     DOWNLOADERS,
+    RESOURCE_ORDERS,
     TaskStatus,
     task_base_dir,
     task_manager,
@@ -49,8 +50,11 @@ from models.schemas import (
     BulkActionOut,
     LibraryBulkDeleteIn,
     LibraryBulkOut,
+    LibraryFailuresOut,
     LibraryFavoriteIn,
     LibraryFavoriteOut,
+    LibraryReplayIn,
+    LibraryReplayOut,
     LibraryTagsIn,
     LibraryTagsOut,
     LibraryVerifyIn,
@@ -126,7 +130,7 @@ def _validate_download_dir(value):
 
 
 def _gallery_options(filters=None, quality=None, media=None, album_title=None,
-                     max_items=None, aggregate_depth=None):
+                     max_items=None, aggregate_depth=None, resource_order=None):
     """收集并校验采集器相关 options(**创建任务与预览共用**)。
 
     共用是有意的: 否则"预览通过、创建却被拒"(或反过来)这种不一致
@@ -182,6 +186,17 @@ def _gallery_options(filters=None, quality=None, media=None, album_title=None,
                 detail=f"aggregate_depth 应在 1~{AGGREGATE_MAX_DEPTH} 之间: {aggregate_depth}",
             )
         options["aggregate_depth"] = d
+    # 下载优先级(= 提交顺序, 见 task_manager.order_resources)。与 quality/media
+    # 同样处理: 不认识的值直接 400, 而不是存进库里让下载层悄悄退回原序 ——
+    # "选了却没效果、也不报错"正是这个项目反复踩的那类静默缺陷。
+    if resource_order:
+        if resource_order not in RESOURCE_ORDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"resource_order 非法: {resource_order}. "
+                       f"可选: {', '.join(RESOURCE_ORDERS)}",
+            )
+        options["resource_order"] = resource_order
     return options
 
 
@@ -247,6 +262,7 @@ def create(payload: TaskCreateIn):
         album_title=payload.album_title,
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
+        resource_order=payload.resource_order,
     )
     # 两侧都是往 options 里塞独立字段，互不覆盖，合并保留：
     if payload.proxy:
@@ -294,6 +310,10 @@ BATCH_MAX_URLS = 500
 #: 单行长度上限。URL 与图集 ID 都不会这么长, 超过基本可以断定粘错了东西。
 _MAX_URL_LEN = 2000
 
+#: 单次死信重放的条数上限。与批量创建同一种保护: 死信常常积到几百条, 一次全放
+#: 出去会同时打死站点和本机(每个资源都会走重试链)。要更多就分批来。
+REPLAY_MAX = 300
+
 
 def _batch_key(s):
     """批量去重用的比较键。
@@ -339,6 +359,7 @@ def batch_create(payload: BatchTaskIn):
         album_title=payload.album_title,
         max_items=payload.max_items,
         aggregate_depth=payload.aggregate_depth,
+        resource_order=payload.resource_order,
     )
     if payload.proxy:
         options["proxy"] = payload.proxy
@@ -513,6 +534,10 @@ def get_config():
         "default_media": DEFAULT_MEDIA,
         "album_titles": list(ALBUM_TITLE_MODES),
         "default_album_title": DEFAULT_ALBUM_TITLE,
+        # 下载顺序(提交顺序 = 优先级)。与 AGGREGATE_MAX_* 同样的理由下发:
+        # 取值来自后端的 RESOURCE_ORDERS, 前端硬编码一份的话, 后端加一个模式
+        # 界面就永远看不到(而这类"少一个选项"没人会当成 bug 报)。
+        "resource_orders": list(RESOURCE_ORDERS),
         # 聚合页闸门的可选上限, 前端拿它渲染输入框的 max 属性。
         # 与后端校验共用同一个常量, 避免"前端允许 999 后端只收 500"。
         "aggregate_max_items": AGGREGATE_MAX_ITEMS,
@@ -1098,6 +1123,102 @@ def library_verify(payload: LibraryVerifyIn):
             # 标记失败不影响这次巡检的结论 —— 报告本身仍然有效
             pass
     return out
+
+
+@router.get("/library/failures", response_model=LibraryFailuresOut)
+def library_failures(
+    include_gone: bool = Query(
+        False, description="连 gone(源站已删/下线)一起算进可重放集合"
+    ),
+    limit: int = Query(100, ge=1, le=500, description="明细条数上限"),
+):
+    """跨任务的"死信"视图: 失败资源按原因分组 + 最近的一批明细。
+
+    与 `/tasks/{id}/retry-failed` 的区别不是粒度而是**视角**: 那个回答"这个任务
+    哪里没下好", 这个回答"整个库里现在坏在哪"。同一批 404 散在十几个任务里时,
+    逐个任务点进去看根本拼不出全貌 —— 也就没人会去重放它们。
+
+    ⚠️ `total` 与 `items` 刻意不同源(见 `LibraryFailuresOut`): total 含
+    `corrupt` 那些(status='done' 但解码器说坏了), 用户需要看得见; items 只含
+    能重放的(status IN failed/skipped/gone), 因为重下解决不了坏字节。
+    """
+    kinds = [
+        {
+            "kind": r["kind"],
+            # 中文标签由后端下发, 界面不硬编码(见 KIND_LABELS 的注释)
+            "label": KIND_LABELS.get(r["kind"], r["kind"]),
+            "n": r["n"],
+            # 这个原因下真正能重放的条数, 与 `n` 一起下发(见 FailureKindItem)。
+            "replayable": r["replayable"],
+        }
+        for r in db.failure_kinds(include_gone=include_gone)
+    ]
+    # ⚠️ total 用 kinds 求和而不是另查一次 COUNT(*): 两个数字若来自两条不同的
+    # SQL, 将来加一个筛选条件就会只改一处, 于是"分组加起来 37、总数 41"。
+    return {
+        "total": sum(k["n"] for k in kinds),
+        "kinds": kinds,
+        "items": [dict(r) for r in db.failure_refs(
+            include_gone=include_gone, limit=limit)],
+        "replayable": db.failure_count(include_gone=include_gone),
+    }
+
+
+@router.post("/library/replay", response_model=LibraryReplayOut)
+def library_replay(payload: LibraryReplayIn):
+    """把跨任务的失败资源重新排进下载队列(死信重放)。
+
+    ⚠️ 全部走 `task_manager.submit_resource` —— 那是唯一的重下入口, 自带两道
+    护栏(任务必须是终态、资源状态必须允许)。这里**不另开一条"直接下"的路**:
+    两条入口的判据一定会漂移, 而漂移的后果是绕过护栏 —— 在任务还在跑的时候插
+    进去, 和正在工作的 worker 抢同一个目标路径(第 6 条静默坑)。
+    """
+    limit = max(1, min(int(payload.limit or REPLAY_MAX), REPLAY_MAX))
+    wants = [str(k) for k in (payload.kinds or []) if k]
+
+    targets = []
+    if payload.refs:
+        # refs 与 kinds 都给时取交集, 不是并集 —— 见 LibraryReplayIn 的注释。
+        # 逐条按主键取(而不是拼一条 IN): 上限 300, 且这样能对"这一条为什么没重放"
+        # 给出准确理由, 而不是让它在集合里静默消失。
+        for rid in [int(x) for x in payload.refs][:limit]:
+            row = db.get_resource(rid)
+            if not row:
+                targets.append((rid, None, "资源不存在"))
+                continue
+            if not wants or (row["error_kind"] or "") in wants:
+                targets.append((rid, row["task_id"], None))
+    else:
+        rows = db.failure_refs(kinds=wants, include_gone=payload.include_gone,
+                               limit=limit)
+        targets = [(r["id"], r["task_id"], None) for r in rows]
+
+    submitted = 0
+    skipped = 0
+    notes = []
+    for rid, task_id, why in targets:
+        if why is None:
+            ok, reason = task_manager.submit_resource(task_id, rid)
+            if ok:
+                submitted += 1
+                continue
+            why = reason
+        skipped += 1
+        # 只留前若干条理由: 300 条全一样的原因(如"任务正在运行")没有信息量,
+        # 但**必须**给出条数, 否则用户会以为程序吞掉了多余的几十条。
+        if len(notes) < 20:
+            notes.append(f"#{rid} 跳过: {why}")
+    if skipped > len(notes):
+        notes.append(f"...另有 {skipped - len(notes)} 条同类跳过(原因同上)")
+    # 不在这里额外记一条汇总日志: 每成功一条, `submit_resource` 都会往**该任务**
+    # 的日志里写 `resource retry: <url>`, 那才是排查"站点流量为什么涨了"要看的地方
+    # (能对上是哪个任务的哪个 URL)。再写一条跨任务的汇总只会多一处要同步的口径。
+    return {
+        "requested": len(targets),
+        "submitted": submitted,
+        "skipped": skipped,
+        "notes": notes,
+    }
 
 
 @router.get("/library/partials")

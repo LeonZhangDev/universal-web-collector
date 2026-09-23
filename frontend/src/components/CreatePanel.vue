@@ -52,6 +52,13 @@ const albumTitleLabel = {
   h1: "页面 <h1> (信息更全)",
   id: "图集 ID (不开浏览器)",
 };
+// 下载顺序 = 资源**提交给下载池**的顺序。线程池是固定大小的, 空闲 worker 按提交
+// 序取任务, 所以这个顺序就是事实上的优先级。它只影响"谁先开始", 不改变"下不下"。
+const orderLabel = {
+  original: "站点顺序 (默认)",
+  video_first: "视频优先 (最慢的先开跑)",
+  small_first: "小文件优先 (进度涨得快)",
+};
 
 // ---- 表单状态(单一 reactive, 方便预设整体套用) ----
 const form = ref({
@@ -61,6 +68,8 @@ const form = ref({
   quality: "original",
   media: "auto",
   albumTitle: "clean",
+  // 提交顺序(下载优先级)。默认 "original" = 与历史行为完全一致。
+  resourceOrder: "original",
   aggregateDepth: 1,
   aggregateMax: 50,
   selTypes: [],
@@ -205,6 +214,9 @@ function snapshotOpts() {
     aggregate_depth: form.value.aggregateDepth,
     max_items: form.value.aggregateMax,
     download_dir: form.value.downloadDir,
+    // 下载顺序不受采集器类型限制(任何任务都有"先下哪个"的问题), 所以不像
+    // quality/media 那样带 isGallery 判断。
+    resource_order: form.value.resourceOrder,
     filters: Object.keys(f).length ? f : {},
   };
 }
@@ -218,6 +230,11 @@ const qualities = computed(() => props.config.qualities || ["original", "1200", 
 const medias = computed(() => props.config.medias || ["auto", "image", "video", "both"]);
 const albumTitles = computed(
   () => props.config.album_titles || ["clean", "full", "h1", "id"]
+);
+// 兜底值必须与后端 RESOURCE_ORDERS 一致(连顺序都对着, 否则旧后端 + 新前端时
+// 下拉框会少一项, 而"少一项"没人会当成 bug 报)。
+const orders = computed(
+  () => props.config.resource_orders || ["original", "video_first", "small_first"]
 );
 
 function splitWords(s) {
@@ -323,6 +340,7 @@ async function submitSingle() {
       media: isGallery.value ? form.value.media : null,
       album_title: isGallery.value ? form.value.albumTitle : null,
       proxy: form.value.proxy.trim() || null,
+      resource_order: form.value.resourceOrder,
       ...aggregateOpts(),
     });
     if (res.warning) toast(res.warning, "warn");
@@ -358,6 +376,7 @@ async function submitBatch() {
       media: isGallery.value ? form.value.media : null,
       album_title: isGallery.value ? form.value.albumTitle : null,
       proxy: form.value.proxy.trim() || null,
+      resource_order: form.value.resourceOrder,
       ...aggregateOpts(),
       allow_duplicates: allowDup.value,
     });
@@ -434,6 +453,7 @@ function savePrefs() {
         quality: form.value.quality,
         media: form.value.media,
         albumTitle: form.value.albumTitle,
+        resourceOrder: form.value.resourceOrder,
         selTypes: form.value.selTypes,
         exts: form.value.exts,
         excludeExts: form.value.excludeExts,
@@ -464,6 +484,11 @@ function loadPrefs() {
     if (p.media && medias.value.includes(p.media)) form.value.media = p.media;
     if (p.albumTitle && albumTitles.value.includes(p.albumTitle))
       form.value.albumTitle = p.albumTitle;
+    // 与上面三条同一个道理: 只在**当前后端认识的取值**里还原。存过的偏好可能来自
+    // 更老的/更新的版本, 直接套用会把下拉框设成一个不存在的选项(显示成空白),
+    // 而且提交时会因为 400 被拒 —— 那看起来像"软件坏了"。
+    if (p.resourceOrder && orders.value.includes(p.resourceOrder))
+      form.value.resourceOrder = p.resourceOrder;
     if (Array.isArray(p.selTypes)) form.value.selTypes = p.selTypes;
     form.value.exts = p.exts || "";
     form.value.excludeExts = p.excludeExts || "";
@@ -683,6 +708,17 @@ onMounted(() => {
           <option v-for="a in albumTitles" :key="a" :value="a">{{ albumTitleLabel[a] || a }}</option>
         </select>
         <span class="tip">相册名取自相册页 &lt;title&gt;; 取不到时回退图集 ID</span>
+      </div>
+
+      <!-- 下载顺序对所有采集器都成立(任何任务都有"先下哪个"的问题), 所以不像
+           上面三行那样带 isGallery 判断。它只决定**开始顺序**: 线程池空闲 worker
+           按提交序取任务, 排在前面只是先开跑, 不改变任何资源的下载结论。 -->
+      <div class="dir-row">
+        <span class="lbl">下载顺序</span>
+        <select v-model="form.resourceOrder" @change="savePrefs">
+          <option v-for="o in orders" :key="o" :value="o">{{ orderLabel[o] || o }}</option>
+        </select>
+        <span class="tip">决定资源开始下载的先后(不改下不下); 视频通常最慢, 先下它把长尾提前</span>
       </div>
 
       <div class="dir-row" v-if="isAggregate">

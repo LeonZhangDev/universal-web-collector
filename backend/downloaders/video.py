@@ -213,6 +213,25 @@ def _probe_media_duration(path, ff, progress_cb=None):
         return None
 
 
+def _note_duration(info, measured):
+    """把已经量到的容器时长记回调用方的 `info`, 供 `resources.duration` 落库。
+
+    ⚠️ 这不是"多算一次": 直链 / HLS / DASH 三条收尾路径**本来就会** ffprobe 一次
+    最终容器, 只是把结果用完即弃。再在别处为落库单独探测一遍, 等于每个视频
+    spawn 两次 ffprobe, 而两处判据将来必然漂移。
+
+    与 `_resolve_ffprobe` 同一条约束: **拿不到就留空, 不要编一个 0**。
+    没装 ffprobe 时留 NULL 是正确的("缺探测器"不等于"视频坏"), 写 0 会让界面
+    显示成"时长 0 秒", 把能力缺失伪装成内容问题。
+    """
+    if not measured or not isinstance(info, dict):
+        return
+    try:
+        info["probed_duration"] = float(measured)
+    except (TypeError, ValueError):
+        pass
+
+
 def _validate_hls_duration(path, info, ff, progress_cb=None):
     """拒绝 ffmpeg 退出码为 0、但只封装了播放列表前一小段的假成功。"""
     return _check_duration(path, float((info or {}).get("duration") or 0), ff,
@@ -373,7 +392,8 @@ class VideoDownloader:
         # 文件: 零额外请求、零误判。校验不过就删掉 —— 一份坏字节留在最终位置上会
         # 一路冒充"已完成", 比明确失败糟糕得多。
         try:
-            _validate_direct_media(real, info, find_ffmpeg(), progress_cb=progress_cb)
+            _note_duration(info, _validate_direct_media(
+                real, info, find_ffmpeg(), progress_cb=progress_cb))
         except TaskCancelled:
             raise
         except Exception:
@@ -455,7 +475,8 @@ class VideoDownloader:
                 # 假成功）；而进度上报用 _notify_bytes（HEAD/V32：报**字节数**，
                 # 前端据此画速率曲线，兼容无参回调）。
                 self._ffmpeg_pull(base, headers, path, ff, progress_cb=progress_cb)
-                _validate_hls_duration(path, pl, ff, progress_cb=progress_cb)
+                _note_duration(info, _validate_hls_duration(
+                    path, pl, ff, progress_cb=progress_cb))
                 if progress_cb:
                     _notify_bytes(progress_cb, path)
                 if log:
@@ -749,8 +770,9 @@ class VideoDownloader:
 
             # 落盘后终检: 拿 MPD **自报**的时长对一遍。ffmpeg 退出码 0 但只封了
             # 前一小段的情况是真实存在的(与 HLS 同一种假成功)。
-            _check_duration(final, float(spec.get("duration") or 0), ff,
-                            progress_cb=progress_cb, what="MPD")
+            _note_duration(info, _check_duration(
+                final, float(spec.get("duration") or 0), ff,
+                progress_cb=progress_cb, what="MPD"))
             if progress_cb:
                 _notify_bytes(progress_cb, final)
             fill_info(info, leaf, ctype)

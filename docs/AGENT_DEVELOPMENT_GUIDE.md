@@ -2877,3 +2877,126 @@ V35 把 `SegmentBase` 与多 `Period` **明确拒绝**了。拒绝是对的（�
 | `tests/test_features_v36.py` | **新增**：55 项 |
 | `tests/test_features_v35.py` | 改：3 处断言（前提失效，见 §15.5） |
 | `scripts/verify_output.py` / `verify_hls.py` / `selfcheck.py` | 未改，均通过（40 / 18 / 自检） |
+
+---
+
+## 16. V37 — 媒体元数据 / 下载顺序 / 死信重放（外加一条测试泄漏）
+
+这一版的三项**不是新想法**：它们在 2026-09-22 那轮深度分析里就写下过建议，只是既没进
+`PROJECT_OVERVIEW` 的「后续可做」表、也没实现，于是从**所有**清单上消失了。复核时靠
+"逐条读代码"才发现 —— 这三个能力在代码里**根本不存在**。
+
+> 反向教训（第 C/D 类的另一半）：**写清单的人不会回头读清单**。
+> 复核要同时问两个方向：①「清单上写的，代码里有没有？」②「代码里没有的，清单上记了没有？」
+> 只做 ① 会把"被丢掉的建议"永久留在盲区 —— 而它已经在盲区里躺了一轮。
+
+### 16.1 媒体元数据落库：`resources` 补上宽高与时长
+
+三项里最讽刺的一项 —— 这两个数字**本来就算出来过**，只是随手丢掉：
+
+| 数字 | 哪里算过 | 原来怎么丢的 |
+| --- | --- | --- |
+| 图片宽高 | `imageinfo.image_dimensions()` | 只在 `filters.need_dimensions` 为真时才调 → 关掉尺寸过滤就**完全不算** |
+| 视频时长 | 直链 / HLS / DASH 三条收尾路径都 ffprobe 过 | 结果留在下载器局部 `info` 里，没人往库里写 |
+
+所以这版**不新增任何探测**，只是把已经在做的事留下结果：
+`SCHEMA` 加 `width` / `height` / `duration`，`_ADD_COLUMNS` 加同样三条（旧库升级幂等）。
+时长走 `_note_duration(info, measured)` 回填到 `info["probed_duration"]`，任务层在收尾时读它 ——
+**不在任务层再探测一遍**（每个视频 spawn 两次 ffprobe，而且两处判据将来必然漂移）。
+
+⚠️ **"没测量" ≠ 0**。没装 ffprobe（或对无时长流返回 0）时 `duration` 必须留 **NULL**。
+写 0 的后果不是报错，而是界面上一个"时长 0:00"的视频 —— 用户会去重下它，
+然后得到同一个"0:00"：**把本机缺个探测器伪装成"这个文件是坏的"**。
+
+⚠️ `ResourceOut` 必须**显式声明**这三个字段。pydantic 对未声明字段是静默丢弃（第 5 条）——
+不声明的话，库里写得再对，接口也只回 `null`，而没有任何东西会报错。
+
+### 16.2 下载顺序：重排**提交序**就是事实上的优先级
+
+采集完 `futures` 是一次性按枚举顺序全提交的，"先下哪个"完全由站点枚举顺序决定。
+线程池是**固定大小**的，空闲 worker 按**提交序**取任务 —— 所以**重排提交顺序就是优先级**，
+不需要另造一套优先级队列（造了反而有两处口径要同步）。
+
+```python
+RESOURCE_ORDERS = ("original", "video_first", "small_first")
+ordered = order_resources(resources, mode)   # 纯函数, 稳、可测、不碰网络
+```
+
+两条纪律：
+
+* **排序不是过滤** —— `order_resources` 的输出长度必须与输入**恒等**。
+  少一条就是静默漏下一个资源（而"少下一个"没人会跟"排了个序"联系起来）。
+  用例直接断言 `len(out) == len(rows)` 且集合不变。
+* `small_first` 里**未知尺寸排最后，不是最前**。只有视频会在采集期自报 size，图片到下载完
+  才知道多大 —— 把 `None` 当 0 会让"最慢的一批"排到队首，与意图正好相反。
+
+取值由 `GET /config` 的 `resource_orders` 下发（前端不硬编码一份），未知值在创建接口上 **400**
+（与 `quality` / `media` 同一套处理：静默忽略 = "界面选了却没效果、也不报错"）。
+
+### 16.3 跨任务死信重放：一个判据、两个数字、一个入口
+
+原来的重试都是**任务内**的（`/tasks/{id}/retry-failed`）。同一批 404 散在十几个任务里时，
+逐个任务点进去看不出全貌，也就没人会去重放它们。
+
+**一个判据**：`database._failure_where()` 是"可重放"的**唯一定义**
+（`status IN ('failed','skipped','gone')` + `error_kind` 非空；`gone` 默认排除），
+`failure_refs`（清单）与 `failure_count`（计数）共用它 —— 否则界面上的"将重放 N 条"
+和真正会起来的条数会各自漂移。
+
+**两个数字**：每个 `error_kind` 同时给 `n`（总条数）与 `replayable`（其中能救回来的）。
+只给总数会被界面顺手当成"即将重放 N 条"，于是 `corrupt` 那一类"提示 12 条、实际起来 0 条"
+（`corrupt` 且 `status='done'` 确实存在：文件留着、解码器说它坏了 —— 它该被**看见**，
+但重下救不了，源站给的就是坏字节）。
+
+**一个入口**：`POST /library/replay` 调的是 `task_manager.submit_resource` ——
+**唯一的重下路径**，不另开一条"直接下"。两条入口的判据一定会漂移，而漂移的后果是绕过护栏
+（任务还在跑时必须拒：否则新起的下载会和正在工作的 worker 抢同一个目标路径，第 6 条）。
+
+另外两条：`refs` 与 `kinds` 同时传时取**交集**（并集会让"我勾了 2 条"变成"整个原因全下"），
+单次上限 300、跳过理由**必须回传**（点了 30 条只起来 4 条而不解释，等于让用户以为程序吞了 26 条）。
+
+### 16.4 ⚠️ 顺带抓出：测试里"顺手调真实入口"点着了真 worker（第 14 条）
+
+新测试文件写完，全套出现 **5 条随机红**（`test_watchdog` / `test_pause_resume` / `test_robustness`
+里的"遗留任务应判 failed"断言），单独跑那三个文件却全绿。
+
+**根因不是**"新文件泄漏了 TaskManager 实例"（那是第一层）：
+`POST /tasks/create` 里那句 `task_manager.submit(...)` 点的是**模块级全局实例**，
+于是真 worker 被排进它的固定线程池；用例结束、夹具把 `DB_PATH` 换成下一个用例的库之后，
+**线程还活着**，而每个用例的库 id 都从 1 开始 —— 它的 `db.update_task(tid, hb=now)`
+正好在给**下一个用例**的任务 1 续心跳，看门狗据此认为"有心跳 ⇒ 别的工作进程在跑"。
+
+修法两条（都已落地）：夹具里 stub `submit`（点火开关），以及给创建 `TaskManager` 的用例
+加 `try/finally: shutdown(wait=True)`。定位手法写在 `PITFALLS.md` 第 14 条
+（挂 `pytest_runtest_teardown` 钩子打印 `_LIVE_MANAGERS` 里每个实例的 `_active` 键，
+⚠️ 必须写文件 —— pytest 按用例捕获 stderr，只有失败的用例才回放）。
+
+### 16.5 验证（2026-09-23）
+
+| 项 | 结果 |
+| --- | --- |
+| `pytest` | **1020 用例**；仅 4 条红，全部是 `curl_cffi` 缺失的**环境问题**（`test_downloaders` ×3 / `test_gallery_preview` ×1，堆栈都是 `ModuleNotFoundError`） |
+| `scripts/verify_output.py` | **40 / 40** |
+| `scripts/verify_hls.py` | **18 / 18**（0 失败） |
+| `scripts/selfcheck.py` | 站点声明自洽；CDN 画像正常（`xchina_gallery` 命中 23 次） |
+| 前端构建 | 90 modules / 220.76 kB |
+
+⚠️ 本机跑全套时会看到 **exit 1 但没有 FAILED 行**：pytest 收尾清 `tmp_path` 撞上宿主的
+safe-delete 守卫（阈值 50 文件）。判定看进度行有没有 `F`，别看退出码 —— 见 `PITFALLS.md`。
+
+### 16.6 新增/改动文件（V37）
+
+| 文件 | 性质 |
+| --- | --- |
+| `backend/core/database.py` | 改：`resources` 加 `width`/`height`/`duration`（SCHEMA + `_ADD_COLUMNS`）、`_failure_where`（可重放唯一定义）、`failure_kinds` 补 `replayable`、`failure_refs`（带 `task_name`，免 N+1）、`failure_count` |
+| `backend/core/task_manager.py` | 改：`RESOURCE_ORDERS` / `order_resources`（纯函数）、提交前按 `resource_order` 重排、成功收尾写宽高/时长 |
+| `backend/downloaders/video.py` | 改：`_note_duration` + 三处调用点（直链 / HLS / MPD），把实测时长回填进调用方的 `info` |
+| `backend/models/schemas.py` | 改：`ResourceOut` 加 `width`/`height`/`duration`；`TaskCreateIn`/`BatchTaskIn` 加 `resource_order`；新增 `FailureKindItem` / `LibraryFailuresOut` / `LibraryReplayIn` / `LibraryReplayOut` |
+| `backend/api/tasks.py` | 改：`_gallery_options` 接 `resource_order`（未知值 400）、`/config` 下发 `resource_orders`；新增 `GET /library/failures`、`POST /library/replay` |
+| `frontend/src/api.js` | 改：`listLibraryFailures` / `replayLibraryFailures` |
+| `frontend/src/components/CreatePanel.vue` | 改：「下载顺序」下拉（取值来自 `/config`，偏好只在合法时保存/恢复） |
+| `frontend/src/components/LibraryPanel.vue` | 改：尺寸/时长标签、死信面板（按原因分组的「重放 N」用 `replayable`、含源站已删开关、跳过理由） |
+| `tests/test_features_v37.py` | **新增**：22 项 |
+| `README.md` / `docs/PROJECT_OVERVIEW.md` | 改：两个新接口 + 三行能力 + 用例数 |
+| `scripts/verify_output.py` / `verify_hls.py` / `selfcheck.py` | 未改，均通过（40 / 18 / 自检） |
+

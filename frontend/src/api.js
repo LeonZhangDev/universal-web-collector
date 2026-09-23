@@ -127,6 +127,30 @@ export function libraryBulkDelete(ids, withFiles = false) {
 export function libraryArchiveUrl(ids) {
   return `/library/archive?ids=${encodeURIComponent((ids || []).join(","))}`;
 }
+// 跨任务的"死信"视图: 失败资源按 error_kind 的分布 + 最近的一批明细。
+// ⚠️ 返回的 `total`(含 corrupt)与 `items`/`replayable`(只含能重放的)口径不同,
+// 两个数字回答的是两个问题 —— 界面上别混着显示(见后端 LibraryFailuresOut)。
+// `label` 由后端下发, 前端不维护中文映射表。
+export function listLibraryFailures(opts = {}) {
+  const params = {};
+  if (opts.include_gone) params.include_gone = "true";
+  if (opts.limit) params.limit = opts.limit;
+  return api.get("/library/failures", { params }).then((r) => r.data);
+}
+// 死信重放: 按 refs(指定资源) 或 kinds(按失败原因整批)重新排进下载队列。
+// 两者同时给时后端取**交集**。返回里有 submitted/skipped 与逐条理由 ——
+// 必须把理由显示出来, 否则"点了 30 条只起来 4 条"会被当成程序吞了。
+export function replayLibraryFailures({
+  refs = [],
+  kinds = [],
+  includeGone = false,
+  limit = 200,
+} = {}) {
+  const body = { include_gone: includeGone, limit };
+  if (refs.length) body.refs = refs;
+  if (kinds.length) body.kinds = kinds;
+  return api.post("/library/replay", body).then((r) => r.data);
+}
 // 落盘后完整性巡检: 库里有记录、磁盘上却不在或被截断的那些。只标记不删除。
 export function libraryVerify(payload = {}) {
   return api.post("/library/verify", payload).then((r) => r.data);

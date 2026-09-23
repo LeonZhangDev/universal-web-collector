@@ -13,7 +13,9 @@ import {
   libraryVerify,
   listLibrary,
   listLibraryAlbums,
+  listLibraryFailures,
   listLibraryTags,
+  replayLibraryFailures,
   setTagColor,
   thumbUrl,
 } from "../api";
@@ -271,6 +273,79 @@ async function runVerify() {
   }
 }
 
+// ---- 死信(跨任务失败资源)与重放 ----
+// null = 还没查过。与巡检不同: 巡检问"库里的记录还在不在磁盘上", 死信问
+// "整个库里现在坏在哪、哪些还能救" —— 同一批 404 散在十几个任务里时, 逐个任务
+// 点进去看根本拼不出全貌, 也就没人会去重放它们。
+const failData = ref(null);
+const failBusy = ref(false);
+const failNotes = ref([]);
+// 连 gone(源站已删/下线)一起看。默认关: 它们重放基本是空转, 混在一起会把
+// "其实还有救的"淹没掉。
+const failIncludeGone = ref(false);
+
+async function loadFailures() {
+  if (failBusy.value) return;
+  failBusy.value = true;
+  try {
+    failData.value = await listLibraryFailures({
+      limit: 50,
+      include_gone: failIncludeGone.value,
+    });
+    failNotes.value = [];
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    failBusy.value = false;
+  }
+}
+
+function toggleGone() {
+  failIncludeGone.value = !failIncludeGone.value;
+  loadFailures();
+}
+
+// 失败原因的中文标签: 从后端下发的 kinds 里取, 前端**不维护映射表** ——
+// 维护一份就会在后端改措辞时静默对不上(这正是原来"正则解析文案"翻车的同一型)。
+function kindLabel(kind) {
+  return failData.value?.kinds.find((k) => k.kind === kind)?.label || kind;
+}
+
+// kind 为空 = 全部可重放的。条数取 `replayable` 而**不是** `n` —— 后者含
+// corrupt(文件在、解码器说坏), 重放救不了, 拿它提示"将要重下 N 条"就是谎报。
+async function replayFailures(kind = "") {
+  if (failBusy.value) return;
+  const n = kind
+    ? (failData.value?.kinds.find((k) => k.kind === kind)?.replayable ?? 0)
+    : (failData.value?.replayable ?? 0);
+  if (!n) {
+    toast("没有可重放的资源", "warn");
+    return;
+  }
+  // 重放是对站点的**真实请求**, 必须先确认数量与范围。
+  if (!confirm(`重新下载 ${n} 条(向站点发真实请求)?`)) return;
+  failBusy.value = true;
+  try {
+    const r = await replayLibraryFailures({
+      kinds: kind ? [kind] : [],
+      includeGone: failIncludeGone.value,
+    });
+    // 跳过理由**一定要显示**: 点了 30 条只起来 4 条时, 不解释就等于让用户以为
+    // 程序吞了 26 条。后端最多回 20 条理由 + 一条汇总。
+    failNotes.value = r.notes || [];
+    toast(
+      `已提交 ${r.submitted} 条${r.skipped ? `, 跳过 ${r.skipped} 条` : ""}`,
+      r.submitted ? "ok" : "warn"
+    );
+    await loadFailures();
+    await load();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    failBusy.value = false;
+  }
+}
+
 function downloadSelected() {
   if (!selectedCount.value) {
     toast("先勾选要下载的资源", "warn");
@@ -332,6 +407,23 @@ function baseName(p) {
   if (!p) return "—";
   const s = String(p).split(/[\\/]/);
   return s[s.length - 1] || p;
+}
+
+// 媒体元数据: 图片宽高 / 视频时长。数据由后端在下载完成时落库(见
+// core/task_manager.py 的"媒体元数据落库")。
+//
+// ⚠️ 视频时长在**没装 ffprobe** 的机器上就是 null —— 那是"没测量", 不是 0 秒。
+// 所以这里返回空串而不是 "0:00": 把能力缺失显示成内容问题, 会让用户去重新下载
+// 一个其实完好、只是本机缺个探测器的文件。
+function mediaMeta(r) {
+  if (r.width && r.height) return `${r.width}×${r.height}`;
+  const d = Number(r.duration);
+  if (!Number.isFinite(d) || d <= 0) return "";
+  const t = Math.round(d);
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = String(t % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
 
 async function load() {
@@ -426,6 +518,9 @@ onMounted(() => {
       <span class="grow"></span>
       <button class="ghost mini" :disabled="verifying" @click="runVerify">
         {{ verifying ? "校验中…" : "校验文件" }}
+      </button>
+      <button class="ghost mini" :disabled="failBusy" @click="loadFailures">
+        {{ failBusy ? "读取中…" : "失败诊断" }}
       </button>
       <div class="kind-tabs">
         <button
@@ -543,6 +638,65 @@ onMounted(() => {
       </p>
     </div>
 
+    <!-- 死信: 跨任务的失败资源分布 + 重放。与上面的"校验文件"是**两件事**:
+         那个问"库里的记录还在不在磁盘上", 这个问"整个库现在坏在哪、哪些还能救"。
+         同一批 404 散在十几个任务里时, 逐个任务点进去看根本拼不出全貌。 -->
+    <div v-if="failData" class="fail-box">
+      <div class="fb-head">
+        <b>失败 {{ failData.total }} 项</b>
+        <span class="fb-sub">其中可重放 {{ failData.replayable }} 项</span>
+        <label class="fb-gone" title="源站已删/已下线。默认不看 —— 重放它们基本是空转">
+          <input type="checkbox" :checked="failIncludeGone" @change="toggleGone" />
+          含源站已删
+        </label>
+        <span class="grow"></span>
+        <button
+          class="ghost mini"
+          :disabled="failBusy || !failData.replayable"
+          @click="replayFailures()"
+        >全部重放</button>
+        <button class="ghost mini" @click="failData = null; failNotes = []">收起</button>
+      </div>
+
+      <div class="fb-kinds" v-if="failData.kinds.length">
+        <span class="fb-kind" v-for="k in failData.kinds" :key="k.kind">
+          <span class="fb-lab">{{ k.label }}</span>
+          <em class="fb-n">{{ k.n }}</em>
+          <!-- ⚠️ 用 k.replayable 而不是 k.n: n 含 corrupt(文件还在、只是解码器
+               读不动), 那批重下救不了。按 n 显示会变成"点 12 条、起来 0 条"。 -->
+          <button
+            v-if="k.replayable"
+            class="ghost mini"
+            :disabled="failBusy"
+            :title="`只重放「${k.label}」这一类, 共 ${k.replayable} 条`"
+            @click="replayFailures(k.kind)"
+          >重放 {{ k.replayable }}</button>
+          <span
+            v-else
+            class="fb-nr"
+            title="重下救不了(多数是文件还在、只是内容坏了), 所以不提供重放"
+          >重放不了</span>
+        </span>
+      </div>
+      <p class="fb-note" v-else>没有失败资源。</p>
+
+      <!-- 跳过理由必须显示: "点了 30 条只起来 4 条"不解释就等于程序吞了 26 条 -->
+      <div class="fb-notes" v-if="failNotes.length">
+        <div class="fb-nrow" v-for="(n, i) in failNotes" :key="i">{{ n }}</div>
+      </div>
+
+      <div class="fb-list" v-if="failData.items.length">
+        <div class="fb-row" v-for="it in failData.items.slice(0, 20)" :key="it.id">
+          <em class="fb-k">{{ kindLabel(it.error_kind) }}</em>
+          <span class="fb-p" :title="it.local_path || it.url">{{ it.url }}</span>
+          <span class="fb-t">{{ it.task_name || `#${it.task_id}` }}</span>
+        </div>
+        <div v-if="failData.items.length > 20" class="fb-more">
+          只列出 20 项; 重放不受此限制(按原因整批)
+        </div>
+      </div>
+    </div>
+
     <!-- 批量操作栏: 勾选后出现 -->
     <div class="bulk-bar" v-if="selectedCount > 0">
       <span class="sel-count">已选 <b>{{ selectedCount }}</b> 项</span>
@@ -622,6 +776,7 @@ onMounted(() => {
           <div class="nm" :title="r.local_path">{{ baseName(r.local_path) }}</div>
           <div class="sub">
             <span class="alb" :title="r.task_name">{{ r.task_name || "—" }}</span>
+            <span class="dims" v-if="mediaMeta(r)">{{ mediaMeta(r) }}</span>
             <span class="size">{{ fmtSize(r.size) }}</span>
           </div>
           <div class="sub2">
@@ -700,6 +855,42 @@ onMounted(() => {
 .vb-reason { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vb-more { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .vb-note { margin: 8px 0 0; font-size: 11px; color: var(--muted); }
+/* 死信面板: 用 err 色系而不是 warn —— 校验发现的"文件不在"是环境问题, 而失败
+   资源是"该拿到却没拿到", 更接近错误。两者同时在场时颜色要能区分开。 */
+.fail-box {
+  margin-bottom: 12px; padding: 10px 12px; border-radius: 9px;
+  background: color-mix(in srgb, var(--err) 8%, var(--panel-2));
+  border: 1px solid color-mix(in srgb, var(--err) 32%, var(--border));
+}
+.fb-head { display: flex; align-items: baseline; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.fb-head .fb-sub { color: var(--muted); font-size: 12px; }
+.fb-head .grow { flex: 1; }
+.fb-gone { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+.fb-kinds { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.fb-kind {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.fb-lab { color: var(--text); }
+.fb-n { font-style: normal; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* "重放不了"必须看起来就是禁用的, 而不是一个点了没反应的按钮 */
+.fb-nr { font-size: 10px; color: var(--muted); opacity: 0.75; }
+.fb-note { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.fb-notes {
+  margin-top: 8px; padding: 6px 8px; border-radius: 7px;
+  background: var(--panel-2); max-height: 120px; overflow: auto;
+}
+.fb-nrow { font-size: 11px; color: var(--muted); }
+.fb-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow: auto; }
+.fb-row { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.fb-k {
+  font-style: normal; font-size: 10px; padding: 1px 6px; border-radius: 5px; flex: none;
+  background: color-mix(in srgb, var(--err) 72%, #000); color: #fff;
+}
+.fb-p { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.fb-t { flex: none; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-more { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .ktab:hover { color: var(--text); }
 .ktab.on { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .lib-bar { display: flex; gap: 8px; margin-bottom: 14px; }
@@ -869,6 +1060,12 @@ onMounted(() => {
 }
 .sub .alb { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .sub .size { flex: none; font-variant-numeric: tabular-nums; }
+/* 尺寸/时长用等宽数字: 一排卡片里 1920×1080 与 800×600 不跳动, 扫一眼就能比大小 */
+.sub .dims {
+  flex: none; font-variant-numeric: tabular-nums;
+  padding: 0 4px; border-radius: 4px;
+  background: color-mix(in srgb, var(--fg, #888) 10%, transparent);
+}
 .sub2 .refs { color: var(--accent); flex: none; }
 .lib-pager { display: flex; align-items: center; gap: 5px; margin-top: 18px; }
 .pnum.on { color: var(--accent); border-color: var(--accent); }

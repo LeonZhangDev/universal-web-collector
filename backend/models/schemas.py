@@ -53,6 +53,13 @@ class ResourceOut(BaseModel):
     # "内容为什么没更新 / 为什么走了 304"时要看得到, 所以随详情一并下发。
     etag: Optional[str] = None
     last_modified: Optional[str] = None
+    # 媒体元数据: 图片实测宽高 / 视频容器时长(秒)。
+    # ⚠️ 必须在这里显式声明 —— pydantic 只回传声明过的字段, 漏一个就静默消失
+    # (见 PITFALLS 第 5 条: "pydantic 吞字段")。视频那条在没装 ffprobe 时
+    # 就是 NULL, **不代表文件坏**, 前端不要显示成"0 秒"。
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration: Optional[float] = None
 
 
 class ResourceTimingItem(BaseModel):
@@ -159,6 +166,58 @@ class LibraryVerifyOut(BaseModel):
     items: List[LibraryVerifyItem] = []
 
 
+class FailureKindItem(BaseModel):
+    kind: str
+    #: 中文标签由**后端下发**(见 core/errors.KIND_LABELS)。界面不许硬编码 ——
+    #: 否则后端换个措辞, 前端那份就静默对不上, 又会有人回头去正则解析文案。
+    label: str = ""
+    #: 这个原因下有多少条。含 `corrupt` 那些 status='done' 的(文件在但解码器说坏)。
+    n: int = 0
+    #: 其中**重放真的能救**的条数。⚠️ 必须与 n 一起下发: 只有 n 的话, 界面会拿它
+    #: 当"即将重放多少条"来提示, 于是 `corrupt` 那一类"提示 12 条、起来 0 条",
+    #: 用户只会以为点了没生效。0 就是 0, 该灰掉就灰掉。
+    replayable: int = 0
+
+
+class LibraryFailuresOut(BaseModel):
+    """跨任务的"死信"视图: 失败资源按 `error_kind` 的分布 + 最近的一批明细。
+
+    `total` 与 `items` 的口径**不同源**: total 来自 `failure_kinds`(含 corrupt),
+    items 来自 `failure_refs`(只含可重放的那批)。前者是"出了什么问题", 后者是
+    "现在能做什么" —— 两个问题, 两个数字。
+    """
+
+    total: int = 0
+    kinds: List[FailureKindItem] = []
+    items: List[ResourceOut] = []
+    #: 当前库里能重放的条数(受 limit 限制前)。前端据此决定是否提示"还有更多"。
+    replayable: int = 0
+
+
+class LibraryReplayIn(BaseModel):
+    """按 `refs`(指定资源) 或 `kinds`(按失败原因整批) 重放死信。
+
+    ⚠️ 两个都给时取**交集**(refs 里 error_kind 属于 kinds 的那些), 而不是并集:
+    并集会让"我在这个原因里勾了几条"变成"整个原因全下", 一次点击就是几百个请求。
+    """
+
+    refs: Optional[List[int]] = None
+    kinds: Optional[List[str]] = None
+    #: `gone`(源站已删/下线)默认不重放 —— 自动重放它是纯空转。
+    include_gone: bool = False
+    #: 单次上限。这是保护: 死信往往是几百条, 一次全放出去会同时打死站点和本机。
+    limit: int = 200
+
+
+class LibraryReplayOut(BaseModel):
+    requested: int = 0
+    submitted: int = 0
+    skipped: int = 0
+    #: 人可读的跳过说明(如"任务 #12 正在运行")。**必须有** —— 用户点了"重放 30 条"
+    #: 却只起来 4 条, 不解释就等于让他以为程序吞了 26 条。
+    notes: List[str] = []
+
+
 class TaskListOut(BaseModel):
     """任务列表(分页)。
 
@@ -239,6 +298,14 @@ class TaskCreateIn(BaseModel):
     force_new: bool = False
     # Re-downloads may reuse successful resources from earlier tasks.
     incremental: Optional[bool] = None
+    # 下载优先级 —— 决定资源**提交给下载池的顺序**(固定大小线程池按提交序取任务,
+    # 所以提交顺序就是事实上的优先级)。取值见 task_manager.RESOURCE_ORDERS:
+    #   original    采集原序(默认, 与历史行为一致)
+    #   video_first 视频先行(它最慢、最容易被限速拖成长尾)
+    #   small_first 已知体积的从小到大(只有视频会自报体积, 图片要下完才知道)
+    # ⚠️ 必须在这里声明: 本模型没有 extra="allow", 不声明的键会被 pydantic 静默
+    # 丢掉 —— 界面上选了"视频优先"却毫无效果, 且不报错(第 5 条静默坑)。
+    resource_order: Optional[str] = None
 
 
 class TaskCreateOut(BaseModel):
@@ -273,6 +340,9 @@ class BatchTaskIn(BaseModel):
     max_items: Optional[int] = None
     aggregate_depth: Optional[int] = None
     proxy: Optional[str] = None
+    # 下载优先级(提交顺序)。取值同 TaskCreateIn.resource_order ——
+    # 批量创建与单条创建共用 `_gallery_options` 的校验, 选项语义必须一致。
+    resource_order: Optional[str] = None
     # 已存在相同 URL 的任务时是否仍然创建。默认否 —— 批量粘贴最常见的失误就是
     # 同一批粘了两次, 默认重下会把几百张图再下一遍。前端要能显式打开它,
     # 因为"上次失败了想重下"是合理诉求。

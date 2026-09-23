@@ -14,13 +14,16 @@ r"""新站点探针 —— 把「接入新站点」的第一步变成一份可�
     ③ 要不要登录 / 浏览器?     裸 HTTP 能不能直接拿到资源
     ④ 有没有下载点变体?        尺寸/格式档, 天然的 mirrors
     ⑤ 用户会拿哪几种 URL 进来? 每种形态都能解析出**同一个** ID 吗
+       (还包括: 文件名里除了序号, 是不是还跟着一段**内容哈希**?
+        跟着就说明它**不是**序号枚举型 —— 见 `suffix_is_opaque`)
 
 这五件事**猜错的代价是不对称的**, 而这正是本项目反复吃过的亏:
 
 - ① 猜错是**静默**的 —— 站点对不存在的图集照样答 `200 text/html`, 于是枚举
   "正常地"采到 0 个资源, 任务还报 success(2026-09-18 真实事故)。
 - ② 猜错的表现是"**浏览器能看, 代码全 403**", 极易被误判成防盗链或需要登录。
-- ⑤ 猜错会把**页码**当 ID, 去枚举一个不存在的图集 —— 又是"成功但 0 资源"。
+- ⑤ 猜错有两种, 症状一样是"**成功但 0 资源**": 一种是把**页码**当 ID(去枚举一个
+  不存在的图集), 另一种是**序号后面跟着内容哈希**(每一页拼出来的 URL 都不存在)。
 
 而 `scripts/probe.py` 是**浏览器探针**(跑 `BrowserCollector` 看四种解析器发现了
 什么), 服务的是通用采集器, 与上面五项无关。这五项此前只能手搓 curl 挨个试。
@@ -29,11 +32,26 @@ r"""新站点探针 —— 把「接入新站点」的第一步变成一份可�
 
 它自己怎么被验证
 ================
-**拿已知站点当回归靶子。** `collectors/xchina/gallery.py` 的模块文档里那五项结论
+**① 拿已知站点当回归靶子。** `collectors/xchina/gallery.py` 的模块文档里那五项结论
 是钉死的(越界返回 `200 text/html` / `Accept` 必须显式带 `image/*` / HEAD 可靠 /
 资源按相册分到 `photos`、`photos2` / 7 种 URL 形态), 而且每条都写明了日期。
 探针跑不出同样的结论, 说明**探针写错了**, 而不是站点变了 ——
 这是验证探针自身的唯一办法, 也是本脚本存在的第二个理由。
+
+**② 再拿真实站点当靶子。** (2026-09-24) 本地假站点只能验"我**想到**的行为";
+真实站点的 URL 形态是**想不出来**的。拿几个形态不同的真实站点跑一遍, 探针当场暴露
+出五处"看着能用、其实 0 资源"的产出错误 —— 详见 `tests/test_probe_site.py` 末尾
+那一节。它们**都不是崩溃**, 所以"跑得通"根本发现不了:
+
+    · 序号之后的高熵内容哈希被当成"画质后缀"(MangaDex: `/data/<hash>/1-<sha256>.png`)
+    · `id_samples` 给自检**没通过**的 URL 编了一个期望 gid
+    · 末尾整段是数字的路径(`/id/1040`)被当成"相册桶号" -> 展开上千候选
+    · 多段 base_path 去数字后留尾随斜杠 -> 生成 `/id//(...)` 这种正则
+    · 命中 0 个序号时照样打印一份没有证据支持的草稿
+
+**结论: 靶子要定期换真实站点, 优先挑形态怪的。** 顺手还能记下哪些站根本不可达
+(本轮: 漫画柜连接超时; Lorem Picsum 的直链要 hmac 签名; Internet Archive 的页图
+是 `.php?file=...` 形态, 连"这是资源直链"都判不出来)。
 
 用法
 ====
@@ -157,6 +175,35 @@ def classify(urls):
 # --------------------------------------------------------------------------
 
 
+#: 序号之后那段残留多长 / 含多长的 hex 串, 就不再可能是"画质后缀"。
+_OPAQUE_MIN_LEN = 40
+_OPAQUE_HEX = re.compile(r"[0-9a-fA-F]{16,}")
+
+#: 相册桶号(`photos2`)的最大值 —— 超过这个数就不像桶号, 更像路径里的一个 ID。
+_MAX_BUCKET_DIGITS = 99
+
+
+def suffix_is_opaque(rest):
+    """序号之后的残留是**画质后缀**还是**不透明串(内容哈希)**?
+
+    这一条决定站点到底是不是"序号枚举型", 而它**不是**"文件名以数字开头"就能判的:
+
+        MangaDex(真实站点, 2026-09-24 实测)的直链是
+        `/data/<图集hash32>/1-<该页内容的sha256>.png`
+
+    文件名以 `1` 开头、看着像序号, 但**改序号毫无用处** —— 第 2 页的哈希与第 1 页
+    完全不同, 照那个模板拼出来的 URL 必然 404(实测 seq 2..6 全 404)。这类站点的
+    文件名由 API 下发, 属于"资源来自页面/API 解析", 与 pexels 同类。
+
+    判据刻意取**很宽**的下界(≥40 字符 或 含 ≥16 位连续 hex): 漏判成"不透明"最多
+    让人多看一眼; 判反了则会生成一份"看着能用、实际 0 资源"的声明。
+    """
+    body = rest.rsplit(".", 1)[0] if "." in rest else rest
+    if len(rest) >= _OPAQUE_MIN_LEN:
+        return True
+    return bool(_OPAQUE_HEX.search(body))
+
+
 def infer_from_link(url):
     """从一条资源直链里读出 基址 / gid / 序号宽度 / 后缀。
 
@@ -166,6 +213,9 @@ def infer_from_link(url):
     返回的 `seq_format` 为 None 表示**文件名不以数字序号开头** —— 那说明这个站
     根本不是"序号枚举型", `SequenceGallerySpider` 处理不了它(如 pexels 一个 ID
     只有一张图)。这时必须明说, 不能硬套一个模板进去。
+
+    另一种同样不能硬套的是 `opaque_suffix`: 文件名以数字开头, 但序号之后是**内容
+    哈希**(见 `suffix_is_opaque`)。两者判反的后果一样 —— 一份永远采不到的声明。
     """
     p = urlparse(url)
     segs = [s for s in p.path.split("/") if s]
@@ -186,6 +236,7 @@ def infer_from_link(url):
         "width": 0,
         "seq_format": None,
         "suffix": ext,
+        "opaque_suffix": False,
     }
     m = re.match(r"^(\d+)", stem)
     if m:
@@ -196,6 +247,7 @@ def infer_from_link(url):
             seq_format="{seq:0%dd}" % len(digits),
             suffix=stem[len(digits):] + ext,
         )
+        info["opaque_suffix"] = suffix_is_opaque(info["suffix"])
     return info
 
 
@@ -206,11 +258,23 @@ def split_digit_base(base):
     `base=".../photos"` + `base_candidate_digits=N`, 让 `_base_candidates` 自动
     展开候选。写成 `base=".../photos2"` 的话, 别的相册一律判空 —— 而用户只看到
     "任务失败", 完全看不出是路径不对。所以这里主动拆。
+
+    ⚠️ 但"基址以数字结尾"**不等于**"那个数字是桶号"。picsum 的
+    `https://fastly.picsum.photos/id/1040/200/300.jpg` 推出 base 到 `/id/1040`,
+    这里的 `1040` 是**图集 ID 本身**; 按桶拆会把基址砍成 `/id/` 并写出
+    `base_candidate_digits=1040`, 让基类去展开一千多个候选(2026-09-24 实测)。
+    两条判据挡掉它: 数字前面紧跟 `/`(说明是**整段**路径而不是 `photos2` 这种后缀),
+    或桶号大得不像桶号。
     """
     m = re.search(r"(\D)(\d+)$", base or "")
     if not m:
         return base, 0
-    return base[: m.start(2)], int(m.group(2))
+    if m.group(1) == "/":
+        return base, 0
+    n = int(m.group(2))
+    if n > _MAX_BUCKET_DIGITS:
+        return base, 0
+    return base[: m.start(2)], n
 
 
 def gid_regex(gid):
@@ -246,7 +310,10 @@ def link_pattern(base_path, gid_re):
     if not base_path:
         seg = r"[^/?#]*"
     else:
-        root = re.sub(r"\d+$", "", base_path)
+        # `rstrip("/")` 不能省: base_path 是 `id/1040` 这种多段时, 去掉末尾数字会
+        # 留下尾随斜杠, 拼进模板就变成 `/id//(...)` —— 一条几乎不可能匹配上的正则
+        # (2026-09-24 在 picsum 上实测到)。
+        root = re.sub(r"\d+$", "", base_path).rstrip("/")
         seg = re.escape(root) + (r"\d*" if re.search(r"[A-Za-z]$", root) else "")
     exts = "jpe?g|png|webp|avif|gif|bmp|mp4|m4v|mov|webm|mkv|m3u8|mpd|ts"
     return r"/%s/(%s)/[^/?#]+\.(?:%s)(?:[?#]|$)" % (seg, gid_re, exts)
@@ -380,6 +447,17 @@ def probe_existence(session, info, scan, over, timeout):
               "此时**绝不能**启用指数探上界: 它假定序号连续, 会把上界定在缺口之前, "
               "结果是静默少采。用线性扫描。" % holes)
     print("  => 本次命中 %d/%d" % (len(hits), scan))
+    if len(hits) == 1 and hits[0][0] == 1 and scan > 1:
+        # 「只命中第一个」是**歧义**, 不是结论。光看这一条分不清是哪一个:
+        #   ① 图集本来就只有 1 张;
+        #   ② 每页的文件名各不相同(序号后面还跟着内容哈希), 改序号拼不出下一页
+        #      —— 那这个站根本**不是**序号枚举型, 草稿一个字都不该抄;
+        #   ③ 序号不是从 1 开始。
+        # 当成"站点正常"的代价: 照 ② 那份草稿下单 = 任务 success 但 0 个资源。
+        print("  => !! 只命中第 1 个序号 —— 这是**歧义, 不是结论**: "
+              "①图集本来就只有 1 张; ②每页文件名各不相同(改序号拼不出下一页, 例如 "
+              "`/data/<图集hash>/1-<该页内容哈希>.png`); ③序号不从 1 开始。"
+              "再给一条**不同序号**的直链就能当场分辨, 别急着照抄草稿。")
     return verdict, rows
 
 
@@ -564,7 +642,7 @@ def probe_url_forms(all_urls, media, pages, info):
         print("     => 必须声明 page_tail=r\"^\\d+$\"。否则解析失败时会退回"
               "“取路径末段”, 把页码当 ID -> 枚举不存在的图集 -> 成功但 0 资源。")
 
-    ok, fails = 0, []
+    ok, fails, resolution = 0, [], {}
     for u in all_urls:
         got = None
         for _kind, pat in patterns:
@@ -572,6 +650,7 @@ def probe_url_forms(all_urls, media, pages, info):
             if m and m.group(1):
                 got = m.group(1)
                 break
+        resolution[u] = got
         if got == gid:
             ok += 1
         else:
@@ -591,7 +670,7 @@ def probe_url_forms(all_urls, media, pages, info):
             if m and m.group(1) and m.group(1) != gid:
                 print("  !! `%s` 正则单独匹配 %s 得到 %r, 与期望冲突 —— 应修正则, "
                       "而不是靠 pattern 顺序。" % (kind, short(u, 46), m.group(1)))
-    return patterns, gid_re, bad_tail
+    return patterns, gid_re, bad_tail, resolution
 
 
 # --------------------------------------------------------------------------
@@ -624,10 +703,18 @@ def quality_key(suffix, i):
     return "original" if i == 0 else ("alt%d" % i)
 
 
-def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases):
-    """拼一份 `GallerySite` 草稿。带 `# TODO` 的地方是**必须人工确认**的。"""
+def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases,
+                resolution=None, seq_hits=None):
+    """拼一份 `GallerySite` 草稿。带 `# TODO` 的地方是**必须人工确认**的。
+
+    `resolution` 是 ⑤ 逐条 URL 的解析结果。**只有自检通过的 URL 才写进
+    `id_samples`** —— 期望值必须是"正则真的从这条 URL 里抽出来的那个", 不能一律
+    填采信直链的 gid。填错了不会报错, 只会让 `check_site()` 拿着假证据空转
+    (2026-09-24 用 MangaDex 实测到: 页面 URL 明明报 `-> None`, 草稿却给它配了 gid)。
+    """
     name = site_name(info["host"])
     base, digits = split_digit_base(info["base"])
+    resolution = resolution or {}
     others = [h["suffix"] for h in hits if h["suffix"] != info["suffix"]]
     variants = ([info["suffix"]] if any(h["suffix"] == info["suffix"] for h in hits)
                 else []) + others
@@ -643,9 +730,25 @@ def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases
             digits = max(digits, d)
 
     L = ["# 由 scripts/probe_site.py 生成 —— 每条都对应报告里的一条实测证据。",
-         "# 标 TODO 的地方必须人工确认, 不要直接提交。", "",
-         "from .. import register",
-         "from ..gallery_base import GallerySite, SequenceGallerySpider", ""]
+         "# 标 TODO 的地方必须人工确认, 不要直接提交。", ""]
+    if seq_hits == 0:
+        # 命中 0 时, 下面每一条都是"按样本形态猜的", 没有一条有实测支持 —— 而报告里
+        # ① 已经说了"判定规则还没验出来"。此时最危险的是用户只翻到草稿这一段。
+        L.extend([
+            "# !!!! 实测: --scan 范围内**一个存在的序号都没探到** —— 这份声明**没有**",
+            "#      任何证据支持, 下面每一条都是按 URL 形态猜的, **不要用**。",
+            "#      先让报告 ① 里那几条 HEAD 真的返回 200 + 媒体类型, 再回来重跑。",
+            "",
+        ])
+    elif seq_hits == 1:
+        L.extend([
+            "# !! 实测: --scan 范围内只探到 **1 个**存在的序号 —— 这份声明可能根本",
+            "#    不成立。先按报告 ① 的歧义提示补一条**不同序号**的直链复核, 再决定用不用。",
+            "",
+        ])
+    L.extend([
+        "from .. import register",
+        "from ..gallery_base import GallerySite, SequenceGallerySpider", ""])
     L.append("%s = GallerySite(" % name.upper())
     L.append('    name="%s",' % name)
     L.append('    base="%s",' % base)
@@ -668,14 +771,24 @@ def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases
     for kind, pat in patterns:
         L.append('        r"%s",   # %s' % (pat, kind))
     L.append("    ],")
+    # ⚠️ 期望值必须是"正则真的从这条 URL 里抽出来的", 不能一律填采信直链的 gid。
+    good = [u for u in (media + pages) if resolution.get(u) == info["gid"]]
+    missed = [u for u in (media + pages) if resolution.get(u) != info["gid"]]
     L.append("    id_samples=[")
     L.append('        ("%s", "%s"),' % (info["gid"], info["gid"]))
-    for u in media[:3]:
-        L.append('        ("%s", "%s"),   # 直链' % (u, info["gid"]))
-    for u in pages[:3]:
-        L.append('        ("%s", "%s"),   # 相册页' % (u, info["gid"]))
+    for u in good[:4]:
+        kind = "直链" if u in media else "相册页"
+        L.append('        ("%s", "%s"),   # %s' % (u, info["gid"], kind))
+    if not good:
+        L.append("        # !! **没有一条**输入通过自检 —— 上面的 id_patterns 目前抽不出任何 gid,")
+        L.append("        #    先修正则(或换一条更有代表性的直链), 再回来补这一节。")
     L.append("        # TODO 每种输入形态都要有一条: 直链 / 相册页 / 分页 / 老式 query / 裸 ID")
     L.append("    ],")
+    if missed:
+        L.append("    # !! 以下输入**没通过自检**, 因此**没有**写进 id_samples ——")
+        L.append("    #    给它们编一个期望值, 只会让 check_site() 拿着假证据空转:")
+        for u in missed[:3]:
+            L.append("    #      %s  -> %r" % (short(u, 56), resolution.get(u)))
     L.append("    input_forms=[")
     for kind, _pat in patterns:
         L.append('        "%s",   # TODO 补成用户看得懂的说明' % kind)
@@ -745,13 +858,40 @@ def main():
           % (info["base"], info["gid"], info["seq_format"], info["suffix"]))
     print()
 
-    probe_existence(session, info, args.scan, args.over, args.timeout)
+    _verdict, ex_rows = probe_existence(session, info, args.scan, args.over, args.timeout)
+    seq_hits = sum(1 for r in ex_rows if r[4])
     probe_accept(session, info, args.timeout)
     page_bases, page_suffixes = probe_page(session, pages, args.timeout)
     hits = probe_variants(session, info, args.timeout, page_suffixes)
-    patterns, gid_re, bad_tail = probe_url_forms(args.urls, media, pages, info)
+    patterns, gid_re, bad_tail, resolution = probe_url_forms(args.urls, media, pages, info)
 
-    draft = build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases)
+    if info["opaque_suffix"]:
+        # 文件名以数字开头、但序号之后是内容哈希 —— 与 pexels 同类, 只是更隐蔽。
+        # 这里**断言地**拒绝出草稿: 那份草稿的每一条 URL 都会 404, 而失败方式是
+        # "任务 success 但 0 个资源"(本项目最贵的一种错)。
+        print("\n" + "=" * 74)
+        print("!! 不生成草稿: 这不是「序号枚举型」站点")
+        print("=" * 74)
+        print("序号之后那一段是**不透明串(内容哈希)**, 不是画质后缀:")
+        print("    后缀 = %r" % short(info["suffix"], 70))
+        print()
+        print("含义: 每一页的文件名都不相同(第 2 页的哈希与第 1 页无关), **改序号**")
+        print("拼不出下一页 —— 上面 ① 的实测若也显示「命中 1/N」, 那就更确定了。")
+        print("这类站点的资源清单由**页面或 API** 下发(与 pexels 同类), 得走")
+        print("`SequenceGallerySpider` 之外的路子; 硬写一份 `seq_format + suffix` 的")
+        print("声明, 结果只会是「任务 success 但 0 个资源」。")
+        print()
+        print("⚠️ 判据是启发式的(长度 ≥%d 或含 ≥16 位连续 hex)。若你确认这真的是"
+              % _OPAQUE_MIN_LEN)
+        print("   画质后缀, 把直链与站点说明发出来改判据 —— 但**不要**先照抄草稿。")
+        try:
+            session.close()
+        except Exception:
+            pass
+        sys.exit(2)
+
+    draft = build_draft(info, media, pages, hits, patterns, gid_re, bad_tail,
+                        page_bases, resolution, seq_hits)
 
     print("\n" + "=" * 74)
     print("GallerySite 草稿")

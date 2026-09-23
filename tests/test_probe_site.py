@@ -14,13 +14,18 @@
 把环境问题当成回归。所以把那五条行为做进一个本地 HTTP 服务, 结论就与网络无关了:
 探针跑不出它们, 就真的是探针的 bug。
 
-钉住的三件事
+钉住的四件事
 ============
 1. **输出口径**: ①越界 200+text/html 必须判成"只能用 Content-Type 判定";
    ②Accept 被校验必须报出来; ④线路条数; ⑤自检合计与页码识别。
 2. **不要编结论**: 一个存在的序号都没探到时, 必须明说"判定规则还没验出来",
    而不是把 403 当成"状态码可用"照抄一个结论下来(这是最容易误导人的一种输出)。
 3. **草稿要能用**: 至少是合法 Python; 而"正则按路径段对齐"这类细节由针对性用例守。
+4. **看着能用 ≠ 能用**(2026-09-24 拿真实站点实测补的一节): MangaDex 与
+   Lorem Picsum 上暴露的四处缺陷都不是崩溃, 而是**生成一份必然 0 资源的声明**——
+   不透明后缀被当成画质后缀 / `id_samples` 里编期望值 / 纯数字路径段被当成桶号 /
+   多段 base_path 切出 `//`。所以凡是"输出"的地方, 判据都要问一句
+   **"这条期望值/结论, 是从哪一条实测里抽出来的?"**
 """
 
 import ast
@@ -52,6 +57,9 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
     total = 5                      # 存在的序号: 1..5
     hole = 0                       # 让某个序号"缺一张"(0 = 不制造空洞)
     always_403 = False             # 整站不可达(用来验"不要编结论"那条守卫)
+    #: 非空则启用车名形态 `/hashes/<gid>/<seq>-<内容哈希>.png`(MangaDex 那种)——
+    #: 只有 `1-<该哈希>` 存在。用来验"不透明后缀 -> 拒绝出草稿"。
+    opaque_hash = ""
     #: 真实存在的档位 —— 只有这三个算"这张图存在"
     suffix_ext = {
         ".jpg": "image/jpeg",
@@ -81,6 +89,14 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
             self._send(403, "text/plain; charset=UTF-8", b"blocked", body)
             return
         path = self.path.split("?")[0]
+        if self.opaque_hash and re.match(r"^/hashes/[0-9a-f]+/(.+)\.png$", path):
+            stem = re.sub(r"\.png$", "", path.rsplit("/", 1)[1])
+            if stem == "1-" + self.opaque_hash:
+                self._send(200, "image/png", b"\x89PNG\r\n\x1a\n" + b"0" * 64, body)
+            else:
+                # 刻意仍返回 200(与 xchina 同样的"不返 404"行为), 类型却不是 image/*
+                self._send(200, "text/html; charset=utf-8", b"<html>x</html>", body)
+            return
         if path.endswith(".html"):
             port = self.server.server_address[1]
             # 一条绝对 URL(资源在别的 host 的形态) + 一条根相对路径
@@ -116,8 +132,17 @@ def fake_site():
     """起一个本地假站点; 用完关掉。端口由系统分配, 不占固定端口。"""
     servers = []
 
-    def start(always_403=False, hole=0):
-        cls = type("_S", (_FakeSite,), {"always_403": always_403, "hole": hole})
+    def start(always_403=False, hole=0, total=None, opaque_hash=""):
+        over = {}
+        if always_403:
+            over["always_403"] = True
+        if hole:
+            over["hole"] = hole
+        if total is not None:
+            over["total"] = total
+        if opaque_hash:
+            over["opaque_hash"] = opaque_hash
+        cls = type("_S", (_FakeSite,), over)
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         servers.append(srv)
@@ -129,10 +154,10 @@ def fake_site():
         s.server_close()
 
 
-def _run(port, page_paths, extra=()):
-    """跑一遍探针脚本; 直链固定用 `/photos2/...`(顺带验基址分桶的拆分)。"""
+def _run(port, page_paths, extra=(), dlink=None):
+    """跑一遍探针脚本; 默认直链用 `/photos2/...`(顺带验基址分桶的拆分)。"""
     base = "http://127.0.0.1:%d" % port
-    urls = ["%s/photos2/%s/0001.jpg" % (base, GID)]
+    urls = [dlink or ("%s/photos2/%s/0001.jpg" % (base, GID))]
     urls += [base + p for p in page_paths]
     cmd = [sys.executable, "-u", str(SCRIPT)] + urls + [
         "--scan", "6", "--timeout", "10"] + list(extra)
@@ -312,3 +337,123 @@ def test_probe_rejects_a_site_that_is_not_sequence_based():
         cwd=str(ROOT), capture_output=True, text=True, timeout=60)
     assert p.returncode == 2
     assert "不是「序号枚举型」" in p.stdout
+
+
+# ------------------------------------------------- 真实站点暴露出来的四条
+#
+# 2026-09-24 拿真实站点跑探针(用户要求"自行找站点测"), 探针在 MangaDex 与
+# Lorem Picsum 上暴露了四处真缺陷。它们的共同点: **都不是崩溃**, 而是生成一份
+# "看着能用、其实 0 资源"的声明 —— 按本项目的经验, 这种错会在生产里活很久。
+
+
+def test_infer_from_link_flags_an_opaque_suffix():
+    """文件名以数字开头 + 序号之后是**内容哈希** -> 同样不是序号枚举型。
+
+    MangaDex 的直链是 `/data/<图集hash32>/1-<该页内容的sha256>.png`: 看着像
+    序号枚举(以 `1` 开头), 但改序号拼出来的 URL 必然 404 —— 每一页的哈希都不同。
+    光靠"以数字开头"判不出来, 所以要多这一条判据。
+    """
+    h = "a" * 64
+    info = probe_site.infer_from_link(
+        "https://cdn.x/data/7c07a7fecb2fe3868aa22aae2edf0e5a/1-%s.png" % h)
+    assert info["seq_format"] == "{seq:01d}"       # 确实"看着像"序号枚举
+    assert info["opaque_suffix"] is True           # 但后缀是内容哈希
+
+    # 反向: 正常的画质后缀不能被误判(误判会把好站点挡在门外)
+    ok = probe_site.infer_from_link(
+        "https://img.x/photos/%s/0001_1200x0.webp" % GID)
+    assert ok["suffix"] == "_1200x0.webp"
+    assert ok["opaque_suffix"] is False
+    assert probe_site.infer_from_link(
+        "https://img.x/photos/%s/0001.jpg" % GID)["opaque_suffix"] is False
+
+
+def test_split_digit_base_ignores_a_numeric_path_segment():
+    """基址以数字结尾 **不等于** 那个数字是桶号。
+
+    picsum 的直链 `https://fastly.picsum.photos/id/1040/200/300.jpg` 会把 base 推到
+    `/id/1040`, 那里的 `1040` 是**图集 ID**。按桶拆会写出
+    `base_candidate_digits=1040`, 让基类去展开一千多个候选 —— 而且是静默的。
+    """
+    assert probe_site.split_digit_base("https://p.x/id/1040") == ("https://p.x/id/1040", 0)
+    assert probe_site.split_digit_base("https://img.x/photos2024") == (
+        "https://img.x/photos2024", 0)             # 数字太大, 不像桶号
+    assert probe_site.split_digit_base("https://img.x/photos2") == (
+        "https://img.x/photos", 2)                 # 这条才是真桶号
+
+
+def test_link_pattern_never_emits_a_double_slash():
+    """base_path 是多段(`id/1040`)时, 去掉末尾数字会留下尾随斜杠 -> `/id//(...)`。
+
+    那条正则几乎匹配不上任何真实 URL, 而且看着"像是写好了"。
+    """
+    pat = probe_site.link_pattern("id/1040", r"\d{4,}")
+    assert "//" not in pat
+    # 契约没变: gid 后面**紧跟**带媒体扩展名的文件名才算命中
+    assert re.search(pat, "https://p.x/id/1040/0001.jpg")
+    # gid 后面还夹着一层(picsum 的 `/id/1040/200/300.jpg`)**不该**匹配 ——
+    # 探针在那种形态上会报「命中 0/N」并把 gid 推断错误暴露出来, 而不是硬凑一条正则
+    assert re.search(pat, "https://p.x/id/1040/200/300.jpg") is None
+
+
+def test_draft_omits_samples_that_failed_selfcheck():
+    """`id_samples` 的期望值必须是正则**真的抽出来的**那个, 抽不出来就别写。
+
+    踩过(MangaDex): ⑤ 明确报告页面 URL `-> None`, 草稿却照样给它配了采信直链的
+    gid —— 那是**编证据**, `check_site()` 会拿着它空转, 而人看不出哪里不对。
+    """
+    media = ["https://img.x/photos/%s/0001.jpg" % GID]
+    pages = ["https://x.site/chapter/0aaf8b27-0013-4ae0-8935-91a089466874"]
+    info = probe_site.infer_from_link(media[0])
+    pat = probe_site.link_pattern(info["base_path"], probe_site.gid_regex(info["gid"]))
+    draft = probe_site.build_draft(
+        info, media, pages, [], [("直链", pat)], r"[0-9a-f]{8,}", [], [],
+        {media[0]: GID, pages[0]: None}, seq_hits=1)
+
+    seg = draft.split("id_samples=[", 1)[1].split("],", 1)[0]
+    assert media[0] in seg                 # 通过自检的那条照写
+    assert pages[0] not in seg             # 没通过的那条**不写**
+    assert "没通过自检" in draft            # 但要留下来, 提示人去补正则
+    assert "只探到 **1 个**存在的序号" in draft   # 命中率过低 -> 草稿顶部带横幅
+
+
+def test_probe_refuses_to_draft_an_opaque_suffix_site(fake_site):
+    """不透明后缀的站要**拒绝出草稿**(exit 2), 而不是给一份必然 0 资源的声明。"""
+    h = "a" * 64
+    srv = fake_site(opaque_hash=h)
+    port = srv.server_address[1]
+    dlink = "http://127.0.0.1:%d/hashes/7c07a7fecb2fe3868aa22aae2edf0e5a/1-%s.png" % (port, h)
+    out, rc = _run(port, [], dlink=dlink)
+    assert rc == 2, out
+    assert "不生成草稿" in out
+    assert "不透明串" in out
+    assert "GallerySite 草稿" not in out      # 一个字都不给, 免得被照抄
+
+
+def test_probe_calls_a_single_hit_an_ambiguity(fake_site):
+    """只命中第 1 个序号 = **歧义**, 不是"站点正常"。
+
+    "图集只有 1 张"与"每页文件名各不相同"在报告里长得一样, 光看一条直链分不出来。
+    把它当结论的代价就是照抄一份 0 资源的声明, 所以必须明说是歧义。
+    """
+    srv = fake_site(total=1)
+    out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID])
+    assert rc == 0, out
+    assert "本次命中 1/6" in out
+    assert "只命中第 1 个序号" in out
+    assert "歧义" in out
+    assert "只探到 **1 个**存在的序号" in out      # 草稿顶部横幅
+
+
+def test_probe_marks_a_draft_with_no_evidence(fake_site):
+    """一个存在的序号都没探到时, 草稿顶部必须有"没有任何证据支持"的醒目横幅。
+
+    报告 ① 已经说了"判定规则还没验出来", 但人很可能只翻到"GallerySite 草稿"那一段
+    —— 所以那一段得自己把话说清楚。(picsum 实测: gid 被推错, 于是 6 次全 400。)
+    """
+    srv = fake_site(total=0)
+    out, rc = _run(srv.server_address[1], [])
+    assert rc == 0, out
+    assert "本次命中 0/6" in out
+    assert "任何证据支持" in out           # 横幅里这个词组跨了行, 只断言单行片段
+    assert "不要用" in out

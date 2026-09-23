@@ -19,9 +19,9 @@
 `core/partials.py`(续传暂存区：**按 URL 寻址**) · `downloaders/dash.py`(MPD 解析，纯函数不碰网络) · `downloaders/video.py`(**HEAD 是 CRLF**)
 `collectors/gallery_base.py` · `collectors/hls.py` · `downloaders/base.py` · `downloaders/ratelimit.py`(请求桶 + **全局字节桶**) · `main.py`(lifespan)
 `tests/isolation.py`(隔离清单 + 真实库即时守卫) · `tests/conftest.py`
-`scripts/probe_site.py`(**新站点五项探针** + `GallerySite` 草稿；靶子是 `tests/test_probe_site.py` 里的本地假站点) · `scripts/probe.py`(浏览器探针，两码事)
+`scripts/probe_site.py`(**新站点五项探针** + `GallerySite` 草稿；**回归**靶子=本地假站点、**找 bug** 靶子=真实站点) · `scripts/probe.py`(浏览器探针，两码事)
 
-## ⚠️ 静默坑索引（1–16 + 同族 A–G；细节见 `PITFALLS.md`）
+## ⚠️ 静默坑索引（1–17 + 同族 A–G；细节见 `PITFALLS.md`）
 **共同特征：不报错，只是结果错 —— 所以会在真实使用中活很久。**
 
 | # | 一句话 | 判据 / 触发器 |
@@ -42,6 +42,7 @@
 | 14 | 测试里"顺手调真实入口" | `POST /tasks/create` → 全局 `task_manager.submit()` 起**真 worker**；用例结束后它给**下一个用例的库**写心跳（id 都从 1 开始） |
 | 15 | 登记成"已处理"又拿"未处理"去筛它 | 直播 `absorb()` 把 init 的 key 塞进 `seen`，而 `seen` 就是"没见过的才下"的过滤器 → init 永远不下（字节数正常、播放器判损坏） |
 | 16 | 从**一条**样本生成规则 | 生成层要比样本**宽**（`photos` → `photos\d*`）；但**形状**判据要比样本更宽的**下界**（13 位 hex → `[0-9a-f]{8,}`）。窄了 = 静默 0 资源 |
+| 17 | 序号后跟**内容哈希** ≠ 序号枚举型 | `/data/<hash>/1-<sha256>.png` **看着就是**序号枚举，改序号却必然 404。判据看残留熵（≥40 字符 / ≥16 位连续 hex），**不看**"是否以数字开头" |
 | A | 条件请求 ⊥ 续传 | 有 `Range` 不能带 `If-None-Match`（回 304 而非 206，收尾路径永远走不到） |
 | B | 隔离的窗口期 | `monkeypatch.undo()` 还原 `DB_PATH` → 谁在那时碰库就写**用户真库** |
 | C | 素材/断言的前提会失效 | 产品加了校验或能力 → 回头问 fixture 与旧断言（**也包括文档声称**） |
@@ -70,7 +71,7 @@ cancel 留文件；pause 在资源边界退出；resume 不重采不重下。看
 `~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；
 curl 对 127.0.0.1 加 `--noproxy '*'`；起服务用 `run_in_background`。
 ⚠️ 别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）；同一文件多处 Edit **不要并行发**。
-⚠️ 本机 venv 已补装 `curl-cffi`（项目主依赖）→ 此前那 4 条红已转绿；全量 **1075 条全绿**。
+⚠️ 本机 venv 已补装 `curl-cffi`（项目主依赖）→ 此前那 4 条红已转绿；全量 **1082 条全绿**（1076 passed / 6 skipped）。
 ⚠️ **`img.xchina.io` 从本机整段 403**（`text/plain`，不是 CF 挑战页；裸 curl 带浏览器 UA + `image/*`、`curl-cffi impersonate=chrome` 都一样）→ 是这条网络的问题，**不是站点改版、更不是回归**。别拿它当靶子。
 ⚠️ **别前置 `export PATH="/usr/bin:/bin:$PATH"`** —— 会把裸 `python` 换成交管版 3.13.12（没 pytest）。coreutils 全无（`cat`/`grep`/`tail`/`dirname`），但 `echo`、`git`、`python` 可用。
 ⚠️ 宿主包装器 `windows-child-process-containment.cjs` 偶发缺失 → 跑得久的命令直接 `MODULE_NOT_FOUND`（**压根没跑**）；**加 `run_in_background=true` 绕过**。
@@ -113,5 +114,6 @@ python scripts/probe_site.py <资源直链> [相册页URL]   # 新站点五项�
 - **V37**：三条**被静默丢掉的建议**（既不在 backlog 也没实现，靠逐条读代码才发现）——① 媒体元数据落库（宽高/时长；**复用已有探测**，不新增 ffprobe；"没测量"≠0）；② 下载顺序（`order_resources` 纯函数重排**提交序**；**排序不是过滤**）；③ 跨任务死信重放（`_failure_where` 单一定义 + 两数字 `n`/`replayable`；复用 `submit_resource` 唯一入口）。**顺带抓出**第 14 条（测试点火真 worker）。
 - **V38**：收掉最后两条标"低"的候选 —— ① 嵌套 `sidx`（`parse_sidx_refs` 分 `media`/`index`，`_expand_sidx` **原地 DFS**；层数/条数上限**报错不截断**）；② 直播录制（窗口 `[now - tsbd, now]`，**显式列出的分片不按时钟裁**，只下没见过的**且只往前**，多时段**各段各记窗口**，上限 `UWC_LIVE_MAX_SECONDS`=300s）。⚠️ 取消时**仍封文件**（与点播故意相反）；漏录片数必须进日志。**顺带抓出**第 15 条（`seen` 把 init 自己过滤掉）。测试 1063。
   复核要点：那两条当初写的拒绝理由（"真实站点几乎不出现 / 与产物模型冲突"）**站不住** —— 一个只是"再解一层"，一个缺的是**结束条件**（产品决策）。**"暂时不做"不许写成"不该做"。**
-- **V39**：新站点探针 `scripts/probe_site.py` + `tests/test_probe_site.py`（12 项，本地假站点当靶子）。先算成本才发现：**加站的成本在探测不在写声明**（声明本体约 70 行、基类零改动）。**顺带抓出**第 16 条（从一条样本生成规则）与两条输出口径守卫（无证据不下结论 / 空洞 ≠ 末尾缺失）。测试 **1075 全绿**（1075 = 原 1063 + 12；此前 4 条 curl-cffi 环境红也转绿）。
-- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：更多站点插件（**按需求，先跑 `probe_site.py`**）/ HLS 直播（`EVENT` 或无 `ENDLIST`，可复用 `_record_live` 骨架，缺真站样本）/ 直播断点续录（低）。
+- **V39**：新站点探针 `scripts/probe_site.py` + `tests/test_probe_site.py`（12 项 → **19 项**）。先算成本才发现：**加站的成本在探测不在写声明**（声明本体约 70 行、基类零改动）。**顺带抓出**第 16 条（从一条样本生成规则）与两条输出口径守卫（无证据不下结论 / 空洞 ≠ 末尾缺失）。测试 1075 全绿。
+  **09-24 续**：拿**真实站点**再当一次靶子（MangaDex / Lorem Picsum / xkcd / Internet Archive）—— 假站点只能验「我想到的行为」，真实站点的 URL 形态想不出来。当场抓出并修掉**五处「看着能用、其实 0 资源」的产出错误**（第 17 条 + 编 `id_samples` 期望值 + 纯数字路径段当桶号 + `/id//` 正则 + 命中 0 也照出草稿）。**两类靶子各有各的用处**：假站点当回归靶子、真实站点当找 bug 靶子。测试 **1082 全绿**。
+- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：更多站点插件（**按需求，先跑 `probe_site.py`**；09-24 实测：真实可达的**序号枚举型合法站点很不好找** —— 漫画柜连接超时、picsum 要 hmac 签名，图集/漫画站多在 CF 后面，所以"加站"多数时候得先解决可达性）/ HLS 直播（`EVENT` 或无 `ENDLIST`，可复用 `_record_live` 骨架，缺真站样本）/ 直播断点续录（低）。

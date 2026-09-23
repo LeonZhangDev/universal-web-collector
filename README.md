@@ -367,6 +367,38 @@ python scripts/selfcheck.py --reset-profile
 首个命中, 新加一条正则时若不慎也能匹配旧 URL, 行为就**静默**变了 —— 某个相册
 突然采空, 而日志里一切正常。测试里 `selfcheck_all()` 对全部已注册站点断言为空。
 
+### 接入新站点: 先探测, 再写声明
+
+加一个站的**成本不在写声明** —— `collectors/xchina/gallery.py` 去掉文档注释后
+声明本体约 70 行, 而接入 pexels(第二个实例)时**没有改动 `gallery_base` 任何逻辑**。
+成本在"写声明之前必须知道的那五件事":
+
+| # | 要探什么 | 猜错的症状 |
+| --- | --- | --- |
+| ① | 存不存在怎么判定(站点返回不返回 404) | **静默**采到 0 个资源, 任务还报 success |
+| ② | 请求头(尤其 `Accept`)有没有被校验 | "浏览器能看, 代码全 403", 易误判成防盗链 |
+| ③ | 要不要浏览器 / 代理 | 白白把采集器搬到浏览器上, 慢一个数量级 |
+| ④ | 有没有尺寸/格式变体 | 多花 85% 带宽与磁盘(且丢了天然的 mirrors) |
+| ⑤ | 用户会拿哪几种 URL 进来 | 把**页码**当 ID, 去枚举不存在的图集 -> 又是"成功但 0 资源" |
+
+```bash
+# 至少给一条**资源直链**(右键复制到的那条): 它把基址与序号宽度直接写在 URL 里
+python scripts/probe_site.py \
+    https://img.example.com/photos2/69ad45698f836/0001.jpg \
+    https://example.com/photo/id-69ad45698f836.html
+```
+
+输出是五项**实测报告** + 一份可直接填的 `GallerySite` 草稿(`--out draft.py` 落盘)。
+它只发 HEAD(必要时一次流式 GET 只读响应头), 不落盘任何资源。**全站不可达时它拒绝
+下结论** —— 明说"判定规则还没验出来", 而不是把 403 当成"状态码可用"照抄一个结论
+(那会把一个完全不可达的站点写成"判定规则已确认")。
+
+探针自身的正确性由 `tests/test_probe_site.py` 守: 一个**本地假站点**复现那五条行为,
+结论因此与网络无关。**不拿真实站点当靶子**, 因为它会过期 —— 2026-09-23 复测
+`img.xchina.io` 从这台机器整段 403(裸 curl 带浏览器 UA + `image/*` 也一样, 且是
+`text/plain` 而非 CF 挑战页), 拿它当靶子只会得到"探针坏了"的**假警报**, 而那正是
+最容易把环境问题误判成回归的地方。
+
 **CDN 画像** (`backend/core/cdn_profile.py` → `data/cdn_profile.json`): 记住每条
 基址的命中次数与序号格式, 用来给候选探测排序。实测价值:
 
@@ -848,11 +880,12 @@ HLS/DASH 的分片缓存原来只躺在**目标路径旁边**(`.<stem>.parts/`)�
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (1063 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制)
+make test           # pytest (1075 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
 python scripts/preview_probe.py <相册页URL或图集ID>   # 真实站点创建前预告
+python scripts/probe_site.py <资源直链> [相册页URL]  # 新站点五项探测 + 声明草稿
 python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 ```
 
@@ -860,7 +893,8 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 `UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_CDN_PROFILE` / `UWC_FFMPEG` /
 `UWC_LIVE_MAX_SECONDS`(DASH 直播录制上限) /
 `PEXELS_API_KEY`(仅 Pexels 关键词/集合采集需要) 优先。
-站点解析探针: `uv run python scripts/probe.py <url>`。
+站点解析探针: `uv run python scripts/probe.py <url>`(**浏览器**探针, 跑四种解析器看
+通用采集器能发现什么); 接入新站点用 `scripts/probe_site.py`(纯 HTTP, 见上)。
 感知去重依赖 ffmpeg(与视频 remux 共用同一套探测, 见 `core/ffmpeg.py`) ——
 探测不到时自动降级为"不算指纹", 不影响任何下载。
 

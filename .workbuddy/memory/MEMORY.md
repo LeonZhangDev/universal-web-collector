@@ -112,7 +112,6 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
   **顺带修掉**：`_download_m3u8` 的 `info` 形参被局部变量遮蔽（HLS `resolved_url` 恒空）、
   `park` 失败无痕 → `stats()['last_error']`。测试 **997**（991 passed / 6 skipped）；
   前端 90 modules / 216.05 kB。
+- **V35**：最后三项 —— 断点续传持久化（`core/partials.py`，**按 URL 寻址** + TTL/预算 + 启动清扫）/ DASH(.mpd)（`downloaders/dash.py`，纯解析 + 初始化段顺序 + DRM 明确报错）/ 资源库标签与收藏（`resource_tags` FK 级联 + `favorite` 独立维度）。**顺带修掉一个真缺陷**：`_fetch_segments` 不关响应 → 404 漏连接 → 池(10)漏满后任务卡死（第 12 条静默坑）。**文档复核又抓出 3 处谎报**（站点并发配额 / 巡检落库 / 熔断"只在内存"；GUIDE 甚至同文件自相矛盾）。测试 **942**（936 passed / 6 skipped）；前端 90 modules / 213.75 kB。
 - **V37 候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：更多站点插件（按需求）/
   `sidx` 嵌套索引 / 直播（`type="dynamic"`）—— 后两条都标了"低"。
-- **V35**：最后三项 —— 断点续传持久化（`core/partials.py`，**按 URL 寻址** + TTL/预算 + 启动清扫）/ DASH(.mpd)（`downloaders/dash.py`，纯解析 + 初始化段顺序 + DRM 明确报错）/ 资源库标签与收藏（`resource_tags` FK 级联 + `favorite` 独立维度）。**顺带修掉一个真缺陷**：`_fetch_segments` 不关响应 → 404 漏连接 → 池(10)漏满后任务卡死（第 12 条静默坑）。**文档复核又抓出 3 处谎报**（站点并发配额 / 巡检落库 / 熔断"只在内存"；GUIDE 甚至同文件自相矛盾）。测试 **942**（936 passed / 6 skipped）；前端 90 modules / 213.75 kB。
-- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：标签层级/颜色 / DASH 的 `SegmentBase`+多 Period / 分片级断点续传的跨任务复用（`.<stem>.parts/` 仍在目标路径旁，是单文件 `.part` 的同一个问题）。

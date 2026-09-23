@@ -151,6 +151,12 @@ V33 给直链加内容终检后，`verify_output.py` 的"假 mp4"被**正确地*
   `frontend`(`npm install` + `build`) / `docker`(`docker build`，`needs: [backend, frontend]`)。
   首次在 `f389338` 上跑绿（run 35717962425）。
 - 看 job 日志：`GET /repos/{o}/{r}/actions/jobs/{job_id}/logs` —— **带 token 时返回纯文本不是 zip**。
+- ⚠️ **`git push` 会挂**: 本机走沙箱代理 `127.0.0.1:5513`（`http_proxy`/`https_proxy` 环境变量），
+  而它到 **github.com:443 会返回 `CONNECT tunnel failed, response 502` 或 `000`**（直连则完全不通，
+  中国网络），**但 `api.github.com` 是通的（200）**。
+  症状：`git push`/`git ls-remote` 报 502/`Empty reply`/`schannel: server closed abruptly`。
+  解法（已跑通，远端 sha 与本地**完全一致**）：用 Git Data API 自己拼 blob→tree→commit→ref，
+  详见 skill `git-push-via-rest-api`。⚠️ 别在没核对的情况下 `--force`。
 - ⚠️ 依赖声明别漏：`curl-cffi`（xchina TLS 伪装，主依赖）与 `httpx2`（`starlette.testclient` 必需，dev 组）。
   漏了不会在导入期报错，而是**测试 collection 阶段整片红**（5 个 import TestClient 的文件）。
 

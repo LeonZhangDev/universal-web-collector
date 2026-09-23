@@ -330,6 +330,80 @@ ffmpeg 解成 9x8 灰度 → 64 位 dHash，**零新增依赖**。
     + 清 `.part` 半成品 + `_meta/<任务ID>/` 整棵删。旧注释里把这件事写成"去重的固有代价、
     所以默认不删文件"，现在是显式处理。
 
+## V33 / V34 新增：三条"静默"坑 + 三条同族教训
+
+这一轮的共同特征不是"报错"，而是**不报错、只是结果错** —— 所以在真实使用中会活很久。
+
+### 第 9 条 ⚠️ 界面把"人看的文案"当数据用
+
+`TaskDetail.vue` 原来用**正则解析 note 字符串**来归类失败原因（`/\b403\b|forbidden/`、`/timeout/`）。
+后果：措辞一改归类就静默失效，换语言全落"其他"，而且没法支持"按原因筛选/批量重试"。
+
+修法：`resources.error_kind`（8 个固定取值，由 `core/errors.classify()` 给出）+ 中文标签由**后端下发**
+（`KIND_LABELS`），前端那份只是兼容旧后端的兜底。三个易错点：
+
+1. `classify` 按**类名**识别 `RateLimited` / `HTTPError` —— 直接 import 会与 `downloaders/base.py` 循环依赖。
+2. `db.error_kinds()` **不能按 status 过滤**：`corrupt` 落在 `done` 上，按 `failed` 过滤恰好漏掉最该看的那类。
+3. **加一个资源状态就有多处口径必须同步** —— `_final_status` / `summarize_resources` / 前端计数。
+   漏一处的症状是"摘要说 0 失败、任务状态却是 failed"。
+
+### 第 10 条 ⚠️ `except OSError: pass` 盖在一个"本来就会失败"的写入上
+
+等于把**数据丢失改装成静默**。判据两问：失败会发生吗？失败之后有人知道吗？
+两个都答"否"的地方，至少要加一次重试，或者留一条可观测痕迹。
+
+实例 `core/cdn_profile.py`：读者不走锁，写者用 `tmp.replace(p)` 换文件 —— 而 Windows 上只要目标
+还有别的句柄开着（**哪怕只是只读**）`os.replace` 就抛 `PermissionError`，被 `except OSError: pass` 吞掉。
+实测"一个只读线程 + 一个写线程"：**写 300 次只记下 150 次，丢一半且毫无声响**。
+它也正是测试套件偶发变红的根源（每次红的用例不同）。
+
+修法：`RLock` + 读者进临界区 + `replace` 退避重试（外部占用锁挡不住）。
+⚠️ **必须 `RLock`**：`record_hit` 要在同一次"读-改-写"里调 `_read`/`_write`，普通 `Lock` 直接自锁死。
+⚠️ 这套纪律现在收在 **`core/jsonstore.py`**（`cdn_profile` / `proxy_health` 共用）——
+**别为新状态文件手写第二遍**，手写一遍 = 少一条纪律 = 又是静默丢一半。
+
+### 第 11 条 ⚠️ 前端引用了一个**从来不存在**的接口
+
+资源库网格一直引用 `/files/raw` —— 这个接口**从来没实现过**（V32 加资源库时写的）。
+图片全是 404，但走 `<img onerror>` 把失败的图藏起来，**界面看起来只是"没有缩略图"而不是报错**。
+静默失败的新变体：**请求根本没成功，却没有任何信号**。
+
+通用教训：`<img>/<video>` 的 `onerror` 只该用于"这一项没有"，不该用于掩盖"整个功能没接上" ——
+后者必须有一条能看见的痕迹（至少 console 一次）。**接线新前端功能时，接口存在性当场验一次。**
+
+### 同族：条件请求与断点续传**互斥**
+
+有 `Range` 时**不能**再带 `If-None-Match` —— 本地那份恰是最新时，服务器对带 `Range` 的请求会答
+**304 而不是 206**，于是"416 = 本地已完整"那条收尾路径**永远走不到**，`.part` 再也收不了尾。
+让位规则写死在 `_stream_one`（有 `offset` 就不加条件头）。
+
+### 同族：测试隔离的"窗口期"
+
+`tests/isolation.py` 的隔离靠 `monkeypatch.setattr`，于是 teardown 的 `undo()` 之后、下一个用例
+setup 之前有一段窗口 —— 谁在这段里访问数据库，就写到**用户的真库**上。能干这活儿的：
+看门狗心跳线程、没 `close()` 的 `TestClient` portal 线程、别处 fixture 的终结器。
+
+⚠️ **指纹守卫不够**：① 只能事后发现"变了"，且 `_migrate()` 幂等 → **同一次变更只能逮到一次**；
+② 报错只有"db 变了"，**没有是谁改的**。
+修法：`isolation.install_real_db_guard()` 包装 `db.get_conn`，在**打开的那一刻**判路径并带调用栈失败。
+两道闸各管一段：即时守卫抓"谁干的"，指纹守卫兜"清单漏登记"。
+
+### 同族：旧断言 / fixture 的前提会失效（文档也会说谎）
+
+产品加了校验或新能力，回头问 fixture 与旧断言还成立吗。三处真实记录：
+
+- V33 给直链加内容终检后，`verify_output.py` 的**假 mp4** 被**正确地**判成坏文件删掉，
+  而红的却是"视频任务应当成功" —— 根因在 fixture 说谎。
+- `verify_hls.py` 必须显式 `-hls_playlist_type vod`：不写时 ffmpeg **6 次里约 1 次**产出只列 11 片、
+  无 `#EXT-X-ENDLIST` 的中间态播放列表，被伪装成"站点播放列表不合格"。现已加**素材自检**。
+- V34 实现了 Pexels 集合页，而 `test_features_v32.py::test_pexels_collections_unsupported`
+  断言的正是"集合页报不支持" —— 说谎的是**断言**。
+- `docs/PROJECT_OVERVIEW.md` 的"后续可做"曾把**已实现**的能力（站点级并发配额
+  `DomainLimiter` 的 `BoundedSemaphore`、巡检结果落库 `/library/verify`）列为缺失。
+
+不诚实的素材会把**产品缺陷与测试缺陷混成同一条红**。看到"新功能做完，旧的某条测试红了"
+先想这个，别急着改产品去迁就它；也**定期复核文档声称**。
+
 ## 接入新站点
 
 新建 `collectors/<site>/spider.py` → `@register("<name>")` → 在 `collectors/__init__.py` import

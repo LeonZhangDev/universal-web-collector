@@ -171,11 +171,15 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 
 | 优先级 | 建议 | 价值与范围 |
 | --- | --- | --- |
-| P1 | 断点续传的持久化 | 现在 `.part` 只活在当次任务里，任务删除即清；跨任务复用同一 URL 的半成品还做不到 |
-| P2 | 站点级并发配额 | 现在靠 `domain_min_interval` 单点控速，多任务同站会互相排队而没有"这个站最多几个在跑"的显式约束 |
-| P2 | 资源库标签/收藏 | 资源库已是全局视图，但只能按相册/类型筛；打标签后能支持"我要的那批" |
-| P3 | 巡检结果落库 | `/library/verify` 目前是即时返回，刷新即丢；可把结论写 `error_kind='missing'` 持久化 |
+| P1 | 断点续传的持久化 | `.part` 会被取消/满盘/损坏三条路径**主动清掉**（那是刻意的：半截媒体留下没价值）。于是一个 400MB 的视频被中断后再建任务，只要它落在同一个目标路径就能接上（`_prepare_resume` 用 `.partsrc` 校验来源 URL），但换路径/换相册名就从头再来。要真正可靠，得把半成品挪到 `_meta/partial/{url_sha}` 并给 TTL |
+| P2 | 资源库标签/收藏 | `library_filters` 目前只有 `q`/`kind`/`album`/`task_id`/`status` 五个维度，打标签后才能表达"我要的那一批" |
+| P3 | DASH（`.mpd`）支持 | `downloaders/video.py` 现在显式 `RuntimeError("暂不支持 DASH(.mpd)")`。HLS 那套分片/限速/续传逻辑可复用大半，缺的是多轨（音视频分离）的合并步骤 |
 | 按需求 | 更多站点插件 | 契约已稳定（`GallerySite` + `@register`），新增站点只需声明 + `match_score` 把关 |
+
+> 曾有两条列在这里，复核时发现**已经实现**，属文档过期（声称缺失的能力其实在）：站点级
+> 并发配额（`DomainLimiter` 按 `site_key` 持有 `BoundedSemaphore(domain_concurrency)`，
+> 默认 3）与巡检结果落库（`/library/verify` 会把 `error_kind` + `note` 写回
+> `resources`，持久化从 V34 起就有）。
 
 > ⚠️ 新增站点时注意：纯 ID 样本存在跨站歧义，`match_score` 必须用自己的 `gid_shape`
 > 对纯 ID 二次把关，否则会静默抢走别的站点的输入（详见 `AGENT_DEVELOPMENT_GUIDE.md` 第 11 节）。

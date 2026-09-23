@@ -93,8 +93,14 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 ⚠️ 本机 Bash 极简：无 `cat`/heredoc，`git -C <绝对路径>` 解析失败 → 用 Bash 默认 cwd，提交用多个 `-m`。
 ⚠️ **有"自动提交"机制会在会话之间提交并移动 HEAD** → 每轮开始先 `git rev-parse HEAD` + `git ls-remote origin refs/heads/main`，别拿上轮记的 SHA 当事实。
 ⚠️ **CI 跑的是 `origin/main`，不是本地 HEAD**；"本地全绿 / CI 全红"第一条命令是 `git log --oneline origin/main..HEAD`。
-⚠️ **`git push` 会挂**：本机走沙箱代理 `127.0.0.1:5513`，它到 **github.com:443 返 `CONNECT tunnel failed, response 502` 或 `000`**（直连则完全不通），**但 `api.github.com` 通（200）**。
-解法（跑通过，远端 sha 与本地**完全一致**）：用 Git Data API 自己拼 blob→tree→commit→ref，见 skill `git-push-via-rest-api`。**别在没核对的情况下 `--force`**。
+⚠️ **`git push` 时而通时而挂**（同一天两种都见过）：走沙箱代理 `127.0.0.1:5513` 时，
+到 **github.com:443 会返 `CONNECT tunnel failed, response 502` 或 `000`**（直连则完全不通）；
+**`api.github.com` 一直通（200）**。
+- **先试一次 `git push origin main`**（2026-09-23 起能通，`7c8e1d0..838e148` 一次成功）——
+  别因为本条就默认去走 REST，那要拼 blob→tree→commit→ref，麻烦得多。
+- 只在 push 真的报 502/000 时再降级：用 Git Data API 自己拼，见 skill `git-push-via-rest-api`
+  （跑通过，远端 sha 与本地**完全一致**）。**两种方式都别在没核对的情况下 `--force`**。
+- 无论哪种，推完都要 `git ls-remote origin refs/heads/main` 与本地 `rev-parse HEAD` 对一次。
 - 远端 <https://github.com/LeonZhangDev/universal-web-collector>；本机**无 `gh` CLI** → `printf "protocol=https\nhost=github.com\n\n" | git credential fill` 取 `gho_` token 调 REST。
 - CI `.github/workflows/ci.yml` 三 job：`backend`(`uv sync --group dev`+`pytest`) / `frontend`(`npm install`+`build`) / `docker`。看日志 `GET /repos/{o}/{r}/actions/jobs/{id}/logs`（带 token 返回**纯文本不是 zip**）。
 - 依赖别漏：`curl-cffi`（xchina TLS 伪装，主依赖）、`httpx2`（`starlette.testclient` 必需，dev 组）。漏了不是导入期报错，而是**测试 collection 阶段整片红**。

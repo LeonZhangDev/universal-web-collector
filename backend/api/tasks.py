@@ -24,11 +24,12 @@ from core import database as db
 from core import events
 from core import layout
 from core import mediacheck
+from core import partials
 from core import thumbs
 from core.config import settings
 from core.content_identity import canonical_content_key
 from core.errors import KIND_CORRUPT, KIND_LABELS, KIND_MISSING
-from core.filters import parse_size
+from core.filters import fmt_size, parse_size
 from core.manifest import read_manifest
 from core.task_dedup import create_or_dispose
 from core.task_manager import (
@@ -48,6 +49,10 @@ from models.schemas import (
     BulkActionOut,
     LibraryBulkDeleteIn,
     LibraryBulkOut,
+    LibraryFavoriteIn,
+    LibraryFavoriteOut,
+    LibraryTagsIn,
+    LibraryTagsOut,
     LibraryVerifyIn,
     LibraryVerifyItem,
     LibraryVerifyOut,
@@ -758,26 +763,35 @@ def resource_library(
     kind: Optional[str] = Query(None, description="按类型筛选: image / video / text"),
     album: Optional[str] = Query(None, description="按相册名精确筛选"),
     task_id: Optional[int] = Query(None, description="只看某个任务的产出"),
+    tag: Optional[str] = Query(None, description="只看带这个标签的资源(大小写不敏感)"),
+    favorite: bool = Query(False, description="只看收藏"),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ):
-    """跨任务资源库: 按相册 / 类型 / 关键词浏览**已落盘**的产物。
+    """跨任务资源库: 按相册 / 类型 / 标签 / 关键词浏览**已落盘**的产物。
 
     与 `/tasks/{id}/resources` 的区别: 那个是"这个任务采到了什么", 这个是
     "我手上有什么"。同一张图片被 sha256 去重复用过时会同时出现在两个任务下,
     资源库会**各列一条**并给出 `refs`(被几个任务引用) —— 这是有意的: 用户
     想删的是"某个任务的那条记录", 而真删文件与否由 refs 决定(见 DELETE 端点)。
     """
-    total = db.library_count(q=q, kind=kind, task_id=task_id, album=album)
+    total = db.library_count(q=q, kind=kind, task_id=task_id, album=album,
+                             tag=tag, favorite=favorite)
     offset = (page - 1) * page_size
     rows = db.library_list(
         q=q, kind=kind, task_id=task_id, album=album,
-        limit=page_size, offset=offset,
+        limit=page_size, offset=offset, tag=tag, favorite=favorite,
     )
+    # ⚠️ refs 与 tags 都**批量取**。逐行查的话一页 40 条就是 80 次往返, 而这是
+    # 最高频的接口 —— 列表页的"N+1"是最容易被写出来、也最难被察觉的一类慢。
+    refs = db.resource_refs_many([r["local_path"] for r in rows])
+    tagmap = db.tags_of([r["id"] for r in rows])
     items = []
     for r in rows:
         d = dict(r)
-        d["refs"] = db.resource_refs(d.get("local_path"))
+        d["refs"] = refs.get(d.get("local_path"), 0)
+        d["tags"] = tagmap.get(d["id"], [])
+        d["favorite"] = bool(d.get("favorite"))
         items.append(d)
     return {
         "items": items,
@@ -787,6 +801,56 @@ def resource_library(
         "pages": (total + page_size - 1) // page_size,
         "stats": db.library_stats(),
     }
+
+
+@router.get("/library/tags")
+def library_tag_list(limit: int = Query(200, ge=1, le=1000)):
+    """标签清单(带资源数), 供筛选下拉与自动补全。"""
+    items = [dict(r) for r in db.all_tags(limit)]
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/library/tags", response_model=LibraryTagsOut)
+def library_tag_edit(payload: LibraryTagsIn):
+    """批量打标签 / 去标签。
+
+    ⚠️ 校验失败(标签超长、超过每资源上限)时**整个请求失败**并说清是哪一条,
+    而不是"能加的加上、剩下的悄悄丢掉" —— 后者会让用户以为标签打上了。
+    """
+    ids = _unique_ids(payload.ids)
+    if not ids:
+        return LibraryTagsOut(added=0, removed=0, touched=0)
+    try:
+        # clear 先执行: "清空再加"与"加了再清空"是两种完全不同的意图,
+        # 而用户勾了"清空"又填了新标签时, 想要的显然是后者(清空是起点不是终点)。
+        removed = db.remove_tags(ids, []) if payload.clear else \
+            db.remove_tags(ids, payload.remove)
+        added = db.add_tags(ids, payload.add)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return LibraryTagsOut(added=added, removed=removed, touched=len(ids))
+
+
+@router.post("/library/favorite", response_model=LibraryFavoriteOut)
+def library_set_favorite(payload: LibraryFavoriteIn):
+    """批量收藏 / 取消收藏。"""
+    ids = _unique_ids(payload.ids)
+    n = db.set_favorite(ids, payload.value)
+    return LibraryFavoriteOut(updated=n, value=bool(payload.value))
+
+
+def _unique_ids(raw):
+    """去重并保序地把入参转成 int 列表(非法值直接 400, 不静默跳过)。"""
+    out, seen = [], set()
+    for x in raw or []:
+        try:
+            i = int(x)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"非法资源 id: {x!r}")
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
 
 
 @router.get("/library/albums")
@@ -995,6 +1059,35 @@ def library_verify(payload: LibraryVerifyIn):
             # 标记失败不影响这次巡检的结论 —— 报告本身仍然有效
             pass
     return out
+
+
+@router.get("/library/partials")
+def library_partials():
+    """断点续传暂存区现状(见 core/partials.py)。
+
+    没有它, 这块磁盘占用就是**隐形的**: 用户看到"下载目录 8GB", 但里面只有 6GB
+    是看得见的产物, 那 2GB 是几个没下完的大视频躺在 `_meta/partial/` 里等着续传。
+    隐形的占用会被当成"程序在偷偷吃盘", 所以这里连 TTL/预算一起下发 ——
+    让人知道它**会自己过期**, 而不是无限涨。
+
+    `bytes_h` / `max_bytes_h` 由后端算好: 单位换算只有一个实现(`core/filters.fmt_size`),
+    前端各写一套迟早对不上(界面显示 "1.0 GB" 而实际是 GiB 这类问题没人会去查)。
+    """
+    st = partials.stats()
+    st["bytes_h"] = fmt_size(st.get("bytes") or 0)
+    st["max_bytes_h"] = fmt_size(st.get("max_bytes") or 0)
+    return st
+
+
+@router.delete("/library/partials")
+def library_partials_clear():
+    """清空暂存区, 立刻还磁盘。
+
+    ⚠️ 代价只是"下次从头下", 不会下出坏文件 —— 所以这个按钮可以放心给用户。
+    手动清空后 `park` 照旧工作, 暂存区会重新攒起来。
+    """
+    n, freed = partials.clear()
+    return {"cleared": n, "bytes": freed, "bytes_h": fmt_size(freed)}
 
 
 @router.get("/tasks/storage")

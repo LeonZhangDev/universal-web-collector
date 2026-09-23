@@ -1,4 +1,4 @@
-"""视频下载: mp4 直链 + m3u8。
+"""视频下载: mp4 直链 + m3u8(HLS) + mpd(DASH)。
 
 引擎选择 (settings.video_engine)
 ================================
@@ -26,13 +26,28 @@ ffmpeg 路径由 `core/ffmpeg.py` 探测(显式配置 -> PATH -> 常见安装位
   分片是同一个视频的连续片段, 播放器本来就连续拉取; 按"每张图 3~10 秒"
   节流会让一段 10 秒的视频下成十分钟(100 片 x 6.5s ≈ 11 分钟)。
 * 每个分片独立重试(`settings.segment_retries`), 单片失败不再连累整个视频
-* 断点续传: 分片落在 `.<stem>.parts/`, 重跑只补缺失的
+* 断点续传: 分片落在 `.<stem>.parts/`(HLS) 或 `.<stem>.dash/`(DASH),
+  重跑只补缺失的
 * 分片先写 `.tmp` 再原子替换, 中断不会留下被误认为完整的半成品
 * 按序字节拼接为 `.ts`; 若 ffmpeg 可用再 remux 成 `.mp4`(换容器, 不重编码)
+
+三种形态的**结构差别**(决定了合并步骤完全不同)
+==============================================
+
+| 形态 | 分片清单 | 合并 |
+| --- | --- | --- |
+| mp4 直链 | 无 | 无需合并, 直接写盘 |
+| HLS (m3u8) | 一份清单里就是完整节目 | 按序拼成 `.ts` |
+| **DASH (mpd)** | **音视频是两条独立的轨**, 各自一份分片清单 | 各自拼全后再 `-c copy` mux |
+
+⚠️ 所以 DASH 少了 ffmpeg 就**只能明确失败**: 只把视频轨落盘会得到一个没有声音的
+文件, 而界面上它显示"下载成功" —— 那是假成功, 比失败更糟。`.mpd` 的解析(含
+"哪些形态必须拒绝")见 `downloaders/dash.py`。
 
 本模块只负责"给定 URL 把字节取下来", 站点规则一律留在采集器里。
 """
 
+import os
 import shutil
 import subprocess
 import threading
@@ -59,7 +74,8 @@ from .base import (
     validators_for,
 )
 from .browser_session import browser_session_for
-from .ratelimit import DomainLimiter
+from .dash import parse_mpd
+from .ratelimit import DomainLimiter, domain_slot
 
 # 视频 CDN 常返回 application/octet-stream, 像图片那样用白名单会误杀真实视频;
 # 这里只挡 HTML —— 那一定是错误页而不是媒体。
@@ -169,17 +185,24 @@ def _probe_media_duration(path, ff, progress_cb=None):
 
 def _validate_hls_duration(path, info, ff, progress_cb=None):
     """拒绝 ffmpeg 退出码为 0、但只封装了播放列表前一小段的假成功。"""
-    expected = float((info or {}).get("duration") or 0)
-    actual = (
-        _probe_media_duration(path, ff, progress_cb=progress_cb)
-        if progress_cb is not None
-        else _probe_media_duration(path, ff)
-    )
+    return _check_duration(path, float((info or {}).get("duration") or 0), ff,
+                           progress_cb=progress_cb, what="播放列表")
+
+
+def _check_duration(path, expected, ff, progress_cb=None, what="清单"):
+    """把实测时长与清单**自报**的时长对一遍, 返回实测值(或 None)。
+
+    两个调用方(HLS 与 DASH)共用这一份 —— 容差、缺 ffprobe 怎么办、报错措辞
+    都是同一套判据, 分开写第二遍必然有一份先漂移。
+    """
+    actual = _probe_media_duration(path, ff, progress_cb=progress_cb)
     if expected <= 0:
+        # 清单没声明时长 -> 没有可比对的基线, 不下结论(只回报实测值)
         return actual
     if actual is None:
         raise RuntimeError(
-            "ffmpeg 产物无法验证时长: ffprobe 缺失、超时或返回无效结果"
+            f"产物无法验证时长: ffprobe 缺失、超时或返回无效结果"
+            f"(清单声明 {expected:.1f}s)"
         )
     # For normal/long videos this is exactly the 99% gate. Very short
     # containers can differ by a few hundred milliseconds due to timestamp
@@ -187,8 +210,8 @@ def _validate_hls_duration(path, info, ff, progress_cb=None):
     tolerance = max(expected * (1.0 - MIN_HLS_DURATION_RATIO), 0.5)
     if expected - actual > tolerance:
         raise RuntimeError(
-            "ffmpeg 产物疑似截断: "
-            f"实际 {actual:.1f}s / 播放列表 {expected:.1f}s "
+            "产物疑似截断: "
+            f"实际 {actual:.1f}s / {what} {expected:.1f}s "
             f"(允许误差 {tolerance:.1f}s)"
         )
     return actual
@@ -282,7 +305,8 @@ class VideoDownloader:
         try:
             h = build_headers(referer, headers)
             if _is_dash(url):
-                raise RuntimeError("暂不支持 DASH(.mpd), 请改用 ffmpeg 手工下载")
+                return self._download_mpd(url, h, save_dir, progress_cb, log, mirrors,
+                                          filename, info)
             if _is_hls(url):
                 return self._download_m3u8(url, h, save_dir, progress_cb, log, mirrors,
                                            filename, info)
@@ -459,24 +483,7 @@ class VideoDownloader:
         )
 
         # 4) 按序合并; 合并成功后才清掉分片缓存
-        merged = out / f"{stem}.ts"
-        try:
-            with open(merged, "wb") as dst:
-                for p in parts:
-                    with open(p, "rb") as src:
-                        while True:
-                            chunk = src.read(CHUNK)
-                            if not chunk:
-                                break
-                            dst.write(chunk)
-                            if progress_cb:
-                                progress_cb()
-                    # 长视频几百片, 合并阶段也要能响应"停止"
-                    if progress_cb:
-                        _notify_bytes(progress_cb, p)
-        except TaskCancelled:
-            merged.unlink(missing_ok=True)
-            raise
+        merged = self._concat_parts(parts, out / f"{stem}.ts", progress_cb)
         shutil.rmtree(parts_dir, ignore_errors=True)
         if log:
             log(f"分片合并完成: {merged.name} ({len(parts)} 片)")
@@ -501,6 +508,153 @@ class VideoDownloader:
 
         fill_info(info, base, "video/mp2t")
         return merged, sha256_file(merged, progress_cb=progress_cb)
+
+    # ---- DASH (.mpd) ----
+
+    def _fetch_mpd(self, url, headers, log, progress_cb=None):
+        """取 MPD 本体并解析。返回 `(清单 URL, 规格 dict)`。
+
+        与 HLS 的 `_preflight_hls` 同一个思路: **先读清单再开工**。区别是 DASH 的
+        拒绝理由更多(DRM / 多时段 / 字节区间), 而那些理由必须原样带到用户面前 ——
+        它们不是我们的 bug, 是"这份清单不能这么下", 用户看到才知道下一步做什么。
+        """
+        with domain_slot(url, progress_cb=progress_cb):
+            resp = self.session.get(url, headers=headers, timeout=SHUTDOWN_IO_TIMEOUT)
+        try:
+            resp.raise_for_status()
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "html" in ctype:
+                # ⚠️ 不能让它落进 XML 解析: 有些错误页恰好是良构 XML, 会被解析成
+                # "没有 Representation 的 MPD", 报错离真相很远(用户看到的是
+                # "MPD 里没有可下载的轨", 而真正的问题是没带 Referer)。
+                raise ValueError(
+                    f"源站返回的是 HTML(Content-Type: {ctype}), 不是 MPD ——"
+                    f" 多半是错误页, 或清单需要登录态/Referer。"
+                )
+            return url, parse_mpd(resp.text, url)
+        finally:
+            resp.close()
+
+    def _download_mpd(self, murl, headers, save_dir, progress_cb, log, mirrors=None,
+                      filename=None, info=None):
+        """DASH: 视频轨与音频轨分别下全, 再用 ffmpeg 合并。
+
+        ⚠️ 与 HLS 最大的结构差别 —— HLS 是"一条分片清单里就是完整节目", 而 DASH
+        通常是**音视频两条独立的轨**(各自一个 fMP4 序列)。所以:
+
+        * 没有"只下一份清单"这回事, 必须按轨分别下全再 mux;
+        * 也因此**没装 ffmpeg 时只能明确失败**: 只把视频轨落盘会得到一个没有声音
+          的文件, 而它在界面上显示"下载成功" —— 那是假成功, 比失败更糟。
+          (只有视频轨、没有音频轨的 MPD 除外, 那种情况不需要 mux。)
+        """
+        out = Path(save_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        if filename:
+            stem = Path(filename).stem
+            out = (out / filename).parent
+        else:
+            stem = safe_filename(murl, "").rsplit(".", 1)[0]
+        if not stem:
+            stem = "video"
+        out.mkdir(parents=True, exist_ok=True)
+
+        # 0) 清单: 主 URL 失败就依次试镜像(与 m3u8 同一套语义)
+        leaf, spec, last_err = murl, None, None
+        for cand in [murl] + [m for m in (mirrors or []) if m and m != murl]:
+            try:
+                leaf, spec = self._fetch_mpd(cand, headers, log, progress_cb)
+                break
+            except TaskCancelled:
+                raise
+            except Exception as e:
+                last_err = e
+                if log:
+                    log(f"MPD 解析失败 {cand.split('/')[-1]}: {_short(e, 100)}")
+        if spec is None:
+            # ⚠️ 把原始原因带出去: "DRM 加密""只有字幕轨""多时段"这类结论是用户
+            # 唯一能照做的事情, 吞掉它就变成"任务失败但不知道为什么"。
+            raise RuntimeError(f"MPD 不可用: {_short(last_err or '空响应', 260)}")
+
+        for note in spec.get("notes") or []:
+            if log:
+                log(f"DASH {note}")
+        if log:
+            log(f"清单来源 {leaf.split('/')[-1] or leaf}")
+
+        ff = find_ffmpeg()
+        if spec.get("audio") and not ff:
+            raise RuntimeError(
+                "这段 DASH 的音视频分成两条轨, 合并需要 ffmpeg, 但现在没找到它。"
+                " 请安装 ffmpeg 或用 UWC_FFMPEG 指定路径 ——"
+                " 只下视频轨会得到一个没有声音的文件, 那不是成品。"
+            )
+
+        limiter = DomainLimiter(
+            settings.segment_concurrency,
+            settings.segment_min_interval,
+            settings.segment_max_interval,
+        )
+        # 分片缓存目录沿用 HLS 那套命名: 中断后重跑能续传已下好的分片
+        work = out / f".{stem}.dash"
+        parts = {}
+        done = False
+        ctype = "video/mp4"
+        try:
+            for kind in ("video", "audio"):
+                track = spec.get(kind)
+                if not track:
+                    continue
+                # 初始化段必须排在分片前面: 它是 fMP4 的轨道元数据(moov)。
+                # 少了它, 拼出来的文件播放器直接判为损坏 —— 而字节数是"够"的。
+                segs = ([track["init"]] if track.get("init") else []) + list(
+                    track["segments"]
+                )
+                if log:
+                    log(f"{kind} 轨: {len(segs)} 个文件"
+                        + ("(含初始化段)" if track.get("init") else ""))
+                got = self._fetch_segments(segs, headers, work / kind, limiter,
+                                           progress_cb, log)
+                ext = ".ts" if "mp2t" in (track.get("mime") or "") else ".mp4"
+                parts[kind] = self._concat_parts(
+                    got, work / f"{kind}{ext}", progress_cb
+                )
+
+            video = parts.get("video")
+            audio = parts.get("audio")
+            if video is None:
+                # 纯音频的 MPD: 它本身就是成品, 直接按容器后缀落盘
+                final = out / f"{stem}.m4a"
+                os.replace(audio, final)
+                ctype = "audio/mp4"
+                if log:
+                    log(f"这段 MPD 只有音频轨, 直接作为 {final.name} 落盘")
+            elif audio is None:
+                if video.suffix == ".ts" and ff:
+                    final = out / f"{stem}.mp4"
+                    self._ffmpeg_remux(video, final, ff, progress_cb=progress_cb)
+                else:
+                    final = out / f"{stem}{video.suffix}"
+                    os.replace(video, final)
+                if log:
+                    log("该 MPD 只有视频轨, 无需合并音轨")
+            else:
+                final = out / f"{stem}.mp4"
+                self._ffmpeg_mux(video, audio, final, ff, progress_cb=progress_cb)
+
+            # 落盘后终检: 拿 MPD **自报**的时长对一遍。ffmpeg 退出码 0 但只封了
+            # 前一小段的情况是真实存在的(与 HLS 同一种假成功)。
+            _check_duration(final, float(spec.get("duration") or 0), ff,
+                            progress_cb=progress_cb, what="MPD")
+            if progress_cb:
+                _notify_bytes(progress_cb, final)
+            fill_info(info, leaf, ctype)
+            done = True
+            return final, sha256_file(final, progress_cb=progress_cb)
+        finally:
+            # ⚠️ 只有**成功**才清分片缓存。失败/取消时原样留着 —— 那是续传的资本
+            # (与 `_fetch_segments` 的"已下好的分片保留在 parts_dir"是同一套语义)。
+            if done:
+                shutil.rmtree(work, ignore_errors=True)
 
     def _preflight_hls(self, murl, headers, log, progress_cb=None):
         """下载前预检播放列表, 返回 (leaf_url, info)。
@@ -562,6 +716,7 @@ class VideoDownloader:
             last = None
             for attempt in range(1, settings.segment_retries + 1):
                 tmp = part.with_name(part.name + ".tmp")
+                resp = None
                 try:
                     with limiter.slot():
                         resp = self.session.get(
@@ -589,6 +744,20 @@ class VideoDownloader:
                         self._interruptible_sleep(
                             min(2 ** attempt, 5), progress_cb
                         )
+                finally:
+                    # ⚠️ **必须关**。会走到这里的失败路径(404 → raise_for_status、
+                    # 读中断、取消)都没把响应体读完, 连接不会被自动归还; 而会话是
+                    # `pool_block=True` 的 —— 泄漏够多之后后面的分片会**永久阻塞在
+                    # `_get_conn`**, 症状是"任务卡死"而不是报错, 与真实原因(某个 URL
+                    # 404)看起来毫无关系。实测: 10 个分片全 404, 池一满整个下载就不动了。
+                    # 池大小 = `max(10, domain_concurrency*2)`(见 base._build_session)。
+                    # 读完的路径 close() 是幂等的, 顺带把连接还回池子。
+                    # (与 base.py `_stream_one` 里那条纪律同一型 —— 这是第二处。)
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
             raise RuntimeError(f"分片 {i + 1}/{total} 失败: {_short(last)}")
 
         errors = []
@@ -665,6 +834,48 @@ class VideoDownloader:
             [ff, "-y", "-nostats", "-i", str(src), "-c", "copy", str(dst)],
             progress_cb=progress_cb,
         )
+
+    def _ffmpeg_mux(self, video, audio, dst, ff, progress_cb=None):
+        """把分开的视频轨与音频轨合进一个容器(`-c copy`, 不重编码)。
+
+        `-map` 显式指定取哪条流: 不写的话 ffmpeg 的默认流选择规则会随输入而变
+        (比如它可能挑到 fMP4 里的时间码轨), 选错的表现是"合并成功但没有声音",
+        而且退出码是 0。显式写死 `0:v:0` + `1:a:0` 让结果可预测。
+        """
+        self._run_ffmpeg(
+            [ff, "-y", "-nostats",
+             "-i", str(video), "-i", str(audio),
+             "-map", "0:v:0", "-map", "1:a:0",
+             "-c", "copy", str(dst)],
+            progress_cb=progress_cb,
+        )
+
+    @staticmethod
+    def _concat_parts(parts, dst, progress_cb=None):
+        """按序把分片拼成一个文件。取消时删掉半截产物再上抛。
+
+        HLS 与 DASH 共用这一份 —— 拼接顺序错了(HLS 那层是静默缺陷的高发区)
+        只在一个地方需要修。
+        """
+        dst = Path(dst)
+        try:
+            with open(dst, "wb") as out:
+                for p in parts:
+                    with open(p, "rb") as src:
+                        while True:
+                            chunk = src.read(CHUNK)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            if progress_cb:
+                                progress_cb()
+                    # 长视频几百片, 合并阶段也要能响应"停止"
+                    if progress_cb:
+                        _notify_bytes(progress_cb, p)
+        except TaskCancelled:
+            dst.unlink(missing_ok=True)
+            raise
+        return dst
 
     @staticmethod
     def _run_ffmpeg(cmd, progress_cb=None):

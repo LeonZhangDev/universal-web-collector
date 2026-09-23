@@ -73,6 +73,18 @@ class Config:
     # 却把带宽占满; 一个大视频则相反。想"边下边看视频"要压住的正是这一项。
     # 进程内全局共享一个桶 —— 按站点分会让"3 个任务 = 3 倍带宽", 那就不叫上限了。
     max_download_bytes_per_sec: int = 0
+    # ---- 断点续传的暂存区(core/partials.py) ----
+    # 中断(取消)留下的半成品挪到 `_meta/partial/` 按 URL 寻址保管, 下次任何任务
+    # 再遇到这个 URL 都能接着下 —— 而不是从 0 重来。关掉就退回"半成品只活在
+    # 目标路径旁边", 取消即丢弃。
+    partial_staging: bool = True
+    #: 暂存区保质期(小时)。到期按"最久没用"清掉 —— 清掉只是回到"从头下",
+    #: 不会下出坏文件, 所以这里宁可短一点, 免得占着磁盘不还。
+    partial_ttl_hours: int = 72
+    #: 暂存区总量预算。超出就按最久没用淘汰。0 = 不限(不建议)。
+    partial_max_bytes: int = 2 * 1024 ** 3
+    #: 小于这个体积的半成品不值得进暂存区: 为几 KB 维护一条索引, 收益是负的。
+    partial_min_bytes: int = 256 * 1024
     # 主 URL 失败后是否自动切换到备用下载点(mirrors)
     mirror_fallback: bool = True
     # 枚举探测(HEAD)的间隔: 探测是轻量请求, 不必套用下载级的慢速节奏。
@@ -164,6 +176,16 @@ def parse_bytes_per_sec(value):
         return 0
 
 
+def parse_bytes(value):
+    """体积解析: 与 `parse_bytes_per_sec` 同一个实现。
+
+    ⚠️ 两个名字指向**同一个解析器**, 不是两份代码 —— 单位换算表只有一份, 分开写
+    第二遍迟早会漏掉一种后缀(`3.5MB` 这种小数写法最容易被漏), 而表现是"预算设了
+    等于没设"。
+    """
+    return parse_bytes_per_sec(value)
+
+
 def load(path: Path = None) -> Config:
     cfg = Config()
     data = {}
@@ -202,6 +224,19 @@ def load(path: Path = None) -> Config:
     if cfg.ffmpeg_path:
         fp = Path(cfg.ffmpeg_path)
         cfg.ffmpeg_path = str(fp if fp.is_absolute() else ROOT / fp)
+    # 暂存区: 预算与门槛也用同一套"人话"解析(5MB / 3.5gb)
+    if os.environ.get("UWC_PARTIAL_MAX_BYTES"):
+        cfg.partial_max_bytes = parse_bytes(os.environ["UWC_PARTIAL_MAX_BYTES"])
+    if os.environ.get("UWC_PARTIAL_MIN_BYTES"):
+        cfg.partial_min_bytes = parse_bytes(os.environ["UWC_PARTIAL_MIN_BYTES"])
+    if os.environ.get("UWC_PARTIAL_TTL_HOURS"):
+        try:
+            cfg.partial_ttl_hours = max(0, int(os.environ["UWC_PARTIAL_TTL_HOURS"]))
+        except ValueError:
+            pass        # 写错就沿用默认值: 这条不该有能力让服务起不来
+    if os.environ.get("UWC_PARTIAL_STAGING") is not None:
+        cfg.partial_staging = os.environ["UWC_PARTIAL_STAGING"].strip().lower() \
+            not in ("", "0", "off", "no", "false", "none", "disable", "disabled")
     return cfg
 
 

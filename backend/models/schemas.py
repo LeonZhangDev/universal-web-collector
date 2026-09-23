@@ -294,6 +294,40 @@ class BatchTaskItemOut(BaseModel):
     existing_task_id: Optional[int] = None
 
 
+class LibraryTagsIn(BaseModel):
+    """批量打标签 / 去标签(可同时进行)。
+
+    `add` 与 `remove` 放在**同一个请求**里而不是拆成两个接口: 前端"改标签"这个
+    动作天然是一次编辑 —— 拆开会让"加了新的、去掉旧的"出现中间态, 中途失败就
+    留下一个用户没要过的组合。校验不过时整个请求失败, 不做"能加的加上"。
+
+    空 `remove` 且 `add` 非空 = 只加; 空 `add` 且 `remove` 非空 = 只删;
+    **两者都空 = 什么都不做**(不是"清空标签" —— 清空要显式传 `clear=True`,
+    免得一个笔误把标签全抹掉)。
+    """
+
+    ids: List[int]
+    add: List[str] = []
+    remove: List[str] = []
+    clear: bool = False           # True 时先清空这些资源的全部标签
+
+
+class LibraryTagsOut(BaseModel):
+    added: int = 0
+    removed: int = 0
+    touched: int = 0              # 涉及的资源条数
+
+
+class LibraryFavoriteIn(BaseModel):
+    ids: List[int]
+    value: bool = True            # False = 取消收藏
+
+
+class LibraryFavoriteOut(BaseModel):
+    updated: int = 0
+    value: bool = True
+
+
 class BulkActionIn(BaseModel):
     """批量操作: 对一组 task_id 执行同一个动作。
 

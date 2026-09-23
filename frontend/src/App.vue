@@ -11,6 +11,8 @@ import NotificationCenter from "./components/NotificationCenter.vue";
 import ToastHost from "./components/ToastHost.vue";
 import {
   bulkDeleteTasks,
+  cancelTask,
+  clearPartials,
   createWatch,
   deleteSession,
   deleteTask,
@@ -18,6 +20,7 @@ import {
   getConfig,
   getCollectors,
   getLoginJob,
+  getPartials,
   getStorageOverview,
   listSessions,
   listTasks,
@@ -214,12 +217,37 @@ async function doResume(id) {
 const pending = ref(null);
 const busy = ref(false);
 const storage = ref(null);
+const partials = ref(null);
 const FINISHED = ["success", "partial", "failed", "cancelled"];
 
 async function refreshStorage() {
   try {
     storage.value = await getStorageOverview();
   } catch (e) {}
+  // ⚠️ 暂存区单独拉, 且**失败不影响 storage**: 它是补充信息(磁盘上那块
+  // 看不见的占用), 拉不到只是不显示那一行, 不该连任务概览一起空掉。
+  try {
+    partials.value = await getPartials();
+  } catch (e) {
+    partials.value = null;
+  }
+}
+
+// 清空暂存区: 代价只是"下次从头下", 不会下出坏文件, 所以不做二次确认。
+// 反过来说要如实回报"释放了多少" —— 用户点它就是为了还磁盘。
+async function doClearPartials() {
+  try {
+    const r = await clearPartials();
+    toast(
+      r.cleared
+        ? `已释放暂存 ${r.bytes_h}, 这些资源下次将从头下载`
+        : "暂存区本来就是空的",
+      "ok"
+    );
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+  await refreshStorage();
 }
 function askRemove(id) {
   pending.value = { mode: "one", id };
@@ -410,6 +438,26 @@ onUnmounted(() => {
       <span class="summary muted" v-if="storage">
         共 {{ storage.tasks }} 个 · 已下载资源 {{ storage.done_resources }} 个 · 记录体积 {{ storage.recorded_bytes }} B
       </span>
+      <!--
+        断点续传暂存区: 中断过的下载按 URL 留在 _meta/partial/ 里等着续传。
+        ⚠️ 这块占用在磁盘上**看不见**(不在相册目录里), 不显示出来就会被当成
+        "程序在偷偷吃盘"。所以连"会自己过期"一起说明。
+      -->
+      <span
+        v-if="partials && partials.count"
+        class="summary muted"
+        :title="`${partials.dir}\n保留 ${partials.ttl_hours} 小时 · 上限 ${partials.max_bytes_h}`"
+      >
+        · 待续传 {{ partials.count }} 份 / {{ partials.bytes_h }}
+      </span>
+      <button
+        v-if="partials && partials.count"
+        type="button"
+        class="ghost"
+        @click="doClearPartials"
+      >
+        清空暂存
+      </button>
       <span class="grow"></span>
       <button
         type="button"

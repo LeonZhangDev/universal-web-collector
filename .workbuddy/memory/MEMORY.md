@@ -16,10 +16,11 @@
 `core/filters.py`(`match_resource` = "有效资源"唯一定义) · `core/errors.py`(`classify`/`KIND_*`) · `core/layout.py` · `core/disk.py`
 `core/phash.py`(只标记不删) · `core/mediacheck.py`(容器完整性**算术**判据) · `core/manifest.py` · `core/thumbs.py`(按 **sha** 不按路径)
 **`core/jsonstore.py` = JSON 状态存储唯一实现**（`cdn_profile`/`proxy_health` 共用四条并发纪律，**别手写第二遍**）
+`core/partials.py`(断点续传暂存区：**按 URL 寻址**，不是按路径) · `downloaders/dash.py`(MPD 解析，纯函数不碰网络)
 `collectors/gallery_base.py` · `collectors/hls.py` · `downloaders/base.py` · `downloaders/ratelimit.py`(请求桶 + **全局字节桶**) · `main.py`(lifespan)
 `tests/isolation.py`(隔离清单 + 真实库即时守卫) · `tests/conftest.py`
 
-## ⚠️ 静默坑索引（11 条 + 同族 4 条；细节见 `PITFALLS.md`）
+## ⚠️ 静默坑索引（12 条 + 同族 5 条；细节见 `PITFALLS.md`）
 **共同特征：不报错，只是结果错 —— 所以会在真实使用中活很久。**
 
 | # | 一句话 | 判据 / 触发器 |
@@ -35,16 +36,19 @@
 | 9 | 把"人看的文案"当数据 | 界面曾正则解析 `note` 归类失败 → 改用 `error_kind`。⚠️ 中文标签由后端下发 |
 | 10 | `except OSError: pass` | 盖在"本来就会失败"的写入上 = 把丢数据改装成静默（两问：会发生吗？有人知道吗？） |
 | 11 | 引用不存在的接口 | 前端引用 `/files/raw` 而它**从没实现过** → 404 被 `onerror` 藏掉，"只是没缩略图" |
+| 12 | 流式响应不关 = 连接泄漏 | `_fetch_segments` 一条 404 漏一个连接（池 `max(10, domain_concurrency*2)`，`pool_block=True`）→ 漏满后所有 worker 阻塞在 `urllib3._get_conn`，表现为**任务卡死不报错** |
 | A | 条件请求 ⊥ 续传 | 有 `Range` 时不能带 `If-None-Match`（服务器会答 **304 而非 206**，收尾路径永远走不到） |
 | B | 隔离的窗口期 | `monkeypatch.undo()` 把 `DB_PATH` 还原成真路径 → 谁在那时碰库就写**用户真库** |
 | C | 素材/断言的前提会失效 | 产品加了校验或能力，回头问 fixture 与旧断言还成立吗（**也包括文档声称**） |
 | D | 测试基线会漂 | 会话间有"自动提交"合并别处的分支 → 别拿旧用例数当事实 |
+| E | 测试替身写死签名 | 抽出通用函数时旧的 `lambda *a:` 会立刻炸 —— **那正是它在尽职**，是替身不诚实，不是回归 |
 
 **四条通用心法**（比记具体条目重要）：
 ① 加一个状态，就有多处**口径**要同步（`_final_status`/`summarize_resources`/前端计数；漏一处症状是"摘要说 0 失败、任务却 failed"）。
 ② 凡"静默"的地方都要问：**失败会发生吗？失败之后有人知道吗？** 两个都"否"就必须加重试或留痕。
 ③ **误报的代价**决定判据松紧：只下"能被证明"的结论（`mediacheck` 认不出的容器一律放行，因为误报会删掉好文件）。
-④ **新功能接完，回头验旧的前提**（fixture / 断言 / 文档声称），别急着改产品去迁就旧的。
+④ **新功能接完，回头验旧的前提**（fixture / 断言 / **文档声称**），别急着改产品去迁就旧的。
+⑤ **卡死类问题的第一动作是打调用栈，不是猜** —— `faulthandler.dump_traceback_later(N, exit=True)`。
 
 ## 状态机 / 速度 / 去重
 `pending→running→extracting→downloading→success/partial/failed`，可 paused/cancelled。采集器返回空 → failed。
@@ -68,14 +72,18 @@ python scripts/verify_hls.py      # 18 项
 python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 ```
 环境变量：`UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` / `UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_FFMPEG` /
-`UWC_CDN_PROFILE` / `UWC_PROXY_HEALTH` / `UWC_MAX_BPS`（全局字节速率上限，`5MB`/`512k` 写法）
+`UWC_CDN_PROFILE` / `UWC_PROXY_HEALTH` / `UWC_MAX_BPS`（全局字节速率上限，`5MB`/`512k` 写法） /
+`UWC_PARTIAL_STAGING`(off 可关) / `UWC_PARTIAL_TTL_HOURS` / `UWC_PARTIAL_MAX_BYTES` / `UWC_PARTIAL_MIN_BYTES`
 
 ⚠️ **行尾**：`Path.write_text()` 在 Windows 上默认把 `\n` 翻成 `\r\n`；本仓库 `core.autocrlf=false` 且无
 `.gitattributes` → 被 Python 改写过的文件会**整份变 CRLF**（diff 71 行炸到 415 行）。提交前必查；
 用 Python 改文件带 `newline=""` 或直接 `write_bytes`。
 ⚠️ `downloaders/video.py` 与 `scripts/verify_output.py` 的 **HEAD 本来就是 CRLF**，别去"统一"。
-⚠️ `verify_output.py` 开头 `rmtree(data/_verify_output)` 会被宿主 safe-delete 守卫拦下（>50 文件）
-→ exit 1 但**没有任何 FAIL 行**。看到"exit=1 且输出只有 `[safe-delete]`"就往环境上想，别查代码；需绕沙箱跑。
+⚠️ **宿主 safe-delete 守卫会拦下"清空大目录"**（阈值 50 文件），症状是 **exit 1 但没有 FAIL 行**：
+- `verify_output.py` 开头 `rmtree(data/_verify_output)`
+- `vite build` 的 `emptyDir(dist/assets)` ← 更迷惑：上面已经打了 `✓ 90 modules transformed`
+
+看到 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]` 就往环境上想，别查代码；需绕沙箱跑。
 
 ## Git / 远端
 独立建仓（toplevel = 项目目录），分支 `main`。**上级 `C:\Users\admin` 那个仓库绝不能碰**。
@@ -94,4 +102,5 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 - **V32**：代理熔断 / 字节级进度 / 跨任务资源库 / Pexels 采集器；首次配远端并推送成功。测试 587。
 - **V33**：下载层四缺陷 —— 4xx 分流（`PERMANENT_STATUS`→`GoneError`，新资源状态 `gone`）/ `mediacheck` 算术判据 / `decode_gray_ex` 分开"缺解码器"与"解码失败" / `cdn_profile` 并发丢更新。测试 819。
 - **V34**：八项 backlog —— 资源遥测 / 缩略图 + `/files/raw` / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 熔断持久化 / Pexels 集合页；顺带修掉"接口从不存在"与隔离窗口期。测试 **880**（874 passed / 6 skipped）；前端 90 modules / 209.35 kB。
-- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：断点续传持久化（`_meta/partial/{url_sha}` + TTL）/ 资源库标签 / DASH(.mpd) 支持。
+- **V35**：最后三项 —— 断点续传持久化（`core/partials.py`，**按 URL 寻址** + TTL/预算 + 启动清扫）/ DASH(.mpd)（`downloaders/dash.py`，纯解析 + 初始化段顺序 + DRM 明确报错）/ 资源库标签与收藏（`resource_tags` FK 级联 + `favorite` 独立维度）。**顺带修掉一个真缺陷**：`_fetch_segments` 不关响应 → 404 漏连接 → 池(8)漏满后任务卡死（第 12 条静默坑）。**文档复核又抓出 3 处谎报**（站点并发配额 / 巡检落库 / 熔断"只在内存"；GUIDE 甚至同文件自相矛盾）。测试 **942**（936 passed / 6 skipped）；前端 90 modules / 213.75 kB。
+- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：标签层级/颜色 / DASH 的 `SegmentBase`+多 Period / 分片级断点续传的跨任务复用（`.<stem>.parts/` 仍在目标路径旁，是单文件 `.part` 的同一个问题）。

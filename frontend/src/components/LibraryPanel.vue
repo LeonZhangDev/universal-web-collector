@@ -8,9 +8,12 @@ import { computed, onMounted, ref } from "vue";
 import {
   libraryArchiveUrl,
   libraryBulkDelete,
+  libraryEditTags,
+  librarySetFavorite,
   libraryVerify,
   listLibrary,
   listLibraryAlbums,
+  listLibraryTags,
   thumbUrl,
 } from "../api";
 import { toast } from "../toast";
@@ -20,9 +23,18 @@ const total = ref(0);
 const pages = ref(1);
 const stats = ref(null);
 const albums = ref([]);
+const tags = ref([]);
 const loading = ref(false);
 
-const query = ref({ q: "", kind: "all", album: "", page: 1, page_size: 40 });
+const query = ref({
+  q: "",
+  kind: "all",
+  album: "",
+  tag: "",
+  favorite: false,
+  page: 1,
+  page_size: 40,
+});
 const KINDS = [
   { key: "all", label: "全部" },
   { key: "image", label: "图片" },
@@ -66,6 +78,93 @@ function clearSel() {
   selected.value.clear();
   syncCount();
 }
+
+// ---- 标签 / 收藏 ----
+// 标签是"我自己定的分类", 收藏是"我要的那一批"。两者都不改文件、不改任务,
+// 只是资源库这一层的附加信息 —— 所以它们永远不该让采集失败或数据丢失。
+const tagDraft = ref("");        // 批量打标签的输入框
+const busyTag = ref(false);
+
+function pickTag(t) {
+  // 再点一次同一个标签 = 取消筛选(比"再去找清空按钮"顺手)
+  query.value.tag = query.value.tag === t ? "" : t;
+  search();
+}
+function toggleFavoriteOnly() {
+  query.value.favorite = !query.value.favorite;
+  search();
+}
+
+// 逗号/顿号/空格都当分隔符: 中文输入法下用户会自然地打顿号
+function parseDraft(s) {
+  return String(s || "")
+    .split(/[,，、\s]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+async function applyTags(ids, { add = [], remove = [], clear = false } = {}) {
+  if (!ids.length) {
+    toast("先勾选要操作的资源", "warn");
+    return false;
+  }
+  busyTag.value = true;
+  try {
+    const r = await libraryEditTags(ids, { add, remove, clear });
+    const parts = [];
+    if (r.added) parts.push(`新增 ${r.added} 个标签`);
+    if (r.removed) parts.push(`去掉 ${r.removed} 个标签`);
+    toast(parts.length ? parts.join(", ") : "没有变化", "ok");
+    await load();
+    await loadTags();
+    return true;
+  } catch (e) {
+    // 后端在标签超长/超上限时返回 400 并说清是哪一条 —— 原样透出,
+    // 换成"操作失败"用户就不知道该改什么了。
+    toast(e.response?.data?.detail || String(e), "err");
+    return false;
+  } finally {
+    busyTag.value = false;
+  }
+}
+
+async function addDraftToSelected() {
+  const ts = parseDraft(tagDraft.value);
+  if (!ts.length) {
+    toast("先输入要打的标签", "warn");
+    return;
+  }
+  if (await applyTags([...selected.value], { add: ts })) tagDraft.value = "";
+}
+
+async function removeTagFromSelected(t) {
+  await applyTags([...selected.value], { remove: [t] });
+}
+
+async function toggleFavorite(ids, value) {
+  if (!ids.length) return;
+  try {
+    const r = await librarySetFavorite(ids, value);
+    toast(`${value ? "已收藏" : "已取消收藏"} ${r.updated} 项`, "ok");
+    await load();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+
+// 卡片上的星标: 只作用于这一条, 点完立刻反映在卡片上(load 会刷新整页)
+function starOne(r) {
+  toggleFavorite([r.id], !r.favorite);
+}
+
+// 批量栏里的"收藏/取消": 看**本页被选中的那些**的状态决定动作 ——
+// 全是已收藏就取消, 否则一律收藏。这比固定两颗按钮少一次判断。
+// ⚠️ 只看本页: 选中项可能都在别的页, 那时 `every()` 会在空数组上恒真,
+// 于是按钮永远显示"取消收藏" —— 一个看起来能用、实则反着的开关。
+const selAllFav = computed(() => {
+  const onPage = items.value.filter((r) => selected.value.has(r.id));
+  return onPage.length > 0 && onPage.every((r) => r.favorite);
+});
 
 // 巡检结果。null = 还没跑过; 跑过但零问题则展示"全部完好"。
 const verifyResult = ref(null);
@@ -132,6 +231,7 @@ async function removeSelected(withFiles) {
     clearSel();
     load();
     loadAlbums();
+    loadTags();
   } catch (e) {
     toast(e.response?.data?.detail || String(e), "err");
   }
@@ -164,6 +264,8 @@ async function load() {
       q: query.value.q || undefined,
       kind: query.value.kind,
       album: query.value.album || undefined,
+      tag: query.value.tag || undefined,
+      favorite: query.value.favorite || undefined,
       page: query.value.page,
       page_size: query.value.page_size,
     });
@@ -184,6 +286,16 @@ async function loadAlbums() {
     albums.value = r.items || [];
   } catch (e) {
     albums.value = [];
+  }
+}
+
+async function loadTags() {
+  try {
+    const r = await listLibraryTags();
+    tags.value = r.items || [];
+  } catch (e) {
+    // 标签是附加信息, 拉不到就让筛选区空着 —— 不该因此挡住整个资源库
+    tags.value = [];
   }
 }
 
@@ -220,6 +332,7 @@ const pageList = computed(() => {
 onMounted(() => {
   load();
   loadAlbums();
+  loadTags();
 });
 </script>
 
@@ -258,10 +371,41 @@ onMounted(() => {
           {{ a.album }} ({{ a.n }})
         </option>
       </select>
+      <!-- 收藏筛选: 独立于标签, 可叠加 -->
+      <button
+        class="ghost fav-btn"
+        :class="{ on: query.favorite }"
+        :title="query.favorite ? '取消只看收藏' : '只看收藏'"
+        @click="toggleFavoriteOnly"
+      >
+        {{ query.favorite ? "★" : "☆" }} 收藏<span v-if="stats?.favorites"> {{ stats.favorites }}</span>
+      </button>
       <button class="ghost" @click="search">搜索</button>
       <button class="ghost" @click="togglePage">
         {{ pageAllOn ? "取消本页" : "全选本页" }}
       </button>
+    </div>
+
+    <!-- 标签条: 点一下筛, 再点一下取消。只在真有标签时占版面 -->
+    <div class="tag-bar" v-if="tags.length || query.tag">
+      <span class="tb-label">标签</span>
+      <button
+        v-for="t in tags.slice(0, 24)"
+        :key="t.tag"
+        class="chip"
+        :class="{ on: query.tag === t.tag }"
+        :title="`${t.n} 项`"
+        @click="pickTag(t.tag)"
+      >{{ t.tag }} <em>{{ t.n }}</em></button>
+      <!-- 被筛的标签如果不在前 24 个里, 上面那行就看不到它 —— 补一颗,
+           否则用户会看到一个"筛选生效了但标签条里没有高亮项"的困惑状态 -->
+      <button
+        v-if="query.tag && !tags.slice(0, 24).some((t) => t.tag === query.tag)"
+        class="chip on"
+        @click="pickTag(query.tag)"
+      >{{ query.tag }} ✕</button>
+      <span v-if="tags.length > 24" class="tb-more">还有 {{ tags.length - 24 }} 个</span>
+      <button v-if="query.tag" class="ghost mini" @click="pickTag(query.tag)">清除筛选</button>
     </div>
 
     <!-- 巡检结果: 只在有问题时占版面, 全部完好就一句话 -->
@@ -296,6 +440,24 @@ onMounted(() => {
       <button class="ghost mini" @click="downloadSelected">打包下载</button>
       <button class="ghost mini" @click="removeSelected(false)">删除记录</button>
       <button class="ghost mini danger" @click="removeSelected(true)">删除记录与文件</button>
+      <span class="sep"></span>
+      <!-- 打标签: 逗号/顿号/空格分隔, 可一次打多个 -->
+      <input
+        v-model="tagDraft"
+        class="tag-input"
+        :disabled="busyTag"
+        placeholder="打标签, 逗号分隔…"
+        @keyup.enter="addDraftToSelected"
+      />
+      <button class="ghost mini" :disabled="busyTag || !tagDraft.trim()" @click="addDraftToSelected">
+        打标签
+      </button>
+      <button
+        class="ghost mini"
+        :disabled="busyTag"
+        :title="selAllFav ? '取消收藏所选' : '收藏所选'"
+        @click="toggleFavorite([...selected], !selAllFav)"
+      >{{ selAllFav ? "★ 取消收藏" : "☆ 收藏" }}</button>
       <span class="grow"></span>
       <span class="hint">选择跨翻页保留</span>
       <button class="ghost mini" @click="clearSel">清空</button>
@@ -339,6 +501,13 @@ onMounted(() => {
           <label class="pick" :title="isSel(r.id) ? '取消选择' : '选择'">
             <input type="checkbox" :checked="isSel(r.id)" @change="toggleRow(r.id)" />
           </label>
+          <!-- 星标: 单击只作用于这一条 -->
+          <button
+            class="star"
+            :class="{ on: r.favorite }"
+            :title="r.favorite ? '取消收藏' : '收藏'"
+            @click.stop="starOne(r)"
+          >{{ r.favorite ? "★" : "☆" }}</button>
         </div>
         <div class="meta">
           <div class="nm" :title="r.local_path">{{ baseName(r.local_path) }}</div>
@@ -351,6 +520,17 @@ onMounted(() => {
             <span v-if="r.refs > 1" class="refs" title="该文件被多个任务共用, 删任务不会删文件">
               共用 ×{{ r.refs }}
             </span>
+          </div>
+          <!-- 标签: 点一下就地筛选。标签是用户自己定的, 所以顺序按存储顺序(字母序)即可,
+               不做"重要度排序" —— 那需要用户去维护优先级, 是另一种负担。 -->
+          <div class="card-tags" v-if="(r.tags || []).length">
+            <button
+              v-for="t in r.tags"
+              :key="t"
+              class="minichip"
+              :class="{ on: query.tag === t }"
+              @click.stop="pickTag(t)"
+            >{{ t }}</button>
           </div>
         </div>
       </div>
@@ -417,6 +597,61 @@ onMounted(() => {
   background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
   padding: 7px 10px; color: var(--text); font-size: 13px; max-width: 220px;
 }
+/* 收藏筛选: 打开时用暖色, 与"收藏"的心理预期一致(不要用蓝色 accent,
+   那会与"类型筛选"看起来是同一类开关) */
+.fav-btn.on {
+  color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+/* 标签条 */
+.tag-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin: -6px 0 14px;
+}
+.tb-label { color: var(--muted); font-size: 12px; flex: none; }
+.tb-more { color: var(--muted); font-size: 11px; }
+.chip {
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+  border-radius: 20px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.chip em { font-style: normal; opacity: .55; margin-left: 3px; font-size: 11px; }
+.chip:hover { color: var(--text); }
+.chip.on {
+  color: var(--accent); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+/* 批量栏里的标签输入 */
+.bulk-bar .sep {
+  width: 1px; height: 18px; background: var(--border); flex: none; margin: 0 2px;
+}
+.tag-input {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px;
+  padding: 3px 8px; color: var(--text); font-size: 12px; width: 170px;
+}
+.tag-input:focus { outline: none; border-color: var(--accent); }
+.tag-input:disabled { opacity: .5; }
+/* 卡片上的星标: 平时淡, hover 才亮 —— 否则一页 40 颗空心星会很吵。
+   ⚠️ 位置必须避开 `.pick`(右下角的选择框): 两者都放 `right: 6px` 会叠在一起,
+   表现为"星标点不到" —— 而用户只会觉得"这个按钮坏了"。往左让开 26px。 */
+.star {
+  position: absolute; right: 32px; bottom: 6px; z-index: 2;
+  background: rgba(0, 0, 0, .42); border: none; border-radius: 6px;
+  color: #d7dde5; font-size: 13px; line-height: 1; padding: 3px 6px;
+  cursor: pointer; opacity: 0; transition: opacity .15s, color .15s;
+}
+.card:hover .star, .star.on { opacity: 1; }
+.star.on { color: var(--warn); }
+/* 卡片上的标签小片 */
+.card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.minichip {
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel-2));
+  color: var(--muted); border: 1px solid transparent; border-radius: 5px;
+  padding: 0 6px; font-size: 10px; line-height: 16px; cursor: pointer;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.minichip:hover { color: var(--text); border-color: var(--border); }
+.minichip.on { color: var(--accent); border-color: var(--accent); }
 .lib-empty {
   display: flex; flex-direction: column; align-items: center; gap: 10px;
   padding: 56px 0; color: var(--muted); font-size: 13px;

@@ -60,21 +60,50 @@ export function bulkDeleteTasks(statuses, withFiles = false) {
 export function getStorageOverview() {
   return api.get("/tasks/storage").then((r) => r.data);
 }
+// 断点续传暂存区: 中断过的下载按 URL 留在 downloads/_meta/partial/ 里等着续传。
+// ⚠️ 这块占用在磁盘上**看不见**(不在相册目录里), 不做成界面就等于"程序在偷偷吃盘"。
+export function getPartials() {
+  return api.get("/library/partials").then((r) => r.data);
+}
+// 清空暂存: 代价只是"下次从头下", 不会下出坏文件 —— 所以不需要二次确认。
+export function clearPartials() {
+  return api.delete("/library/partials").then((r) => r.data);
+}
 
 // ---- 跨任务资源库 ----
-// 浏览"手上已经有什么": 支持关键词 / 类型 / 相册 / 单任务 四种筛选。
+// 浏览"手上已经有什么": 支持关键词 / 类型 / 相册 / 单任务 / 标签 / 收藏 六种筛选。
 export function listLibrary(opts = {}) {
   const params = {};
   if (opts.q) params.q = opts.q;
   if (opts.kind && opts.kind !== "all") params.kind = opts.kind;
   if (opts.album) params.album = opts.album;
   if (opts.task_id) params.task_id = opts.task_id;
+  if (opts.tag) params.tag = opts.tag;
+  if (opts.favorite) params.favorite = "true";
   if (opts.page) params.page = opts.page;
   if (opts.page_size) params.page_size = opts.page_size;
   return api.get("/library", { params }).then((r) => r.data);
 }
 export function listLibraryAlbums() {
   return api.get("/library/albums").then((r) => r.data);
+}
+// 标签清单(带资源数)。只统计已落盘资源上的标签 —— 否则会出现"点进去空的标签"。
+export function listLibraryTags() {
+  return api.get("/library/tags").then((r) => r.data);
+}
+// 批量改标签。add / remove 一次请求内完成, clear 表示先清空再 add。
+// ⚠️ 校验不过会整个失败(400)而不是"能加的加上" —— 静默部分成功会让用户以为
+// 标签打上了, 下次找不到却不知道为什么。
+export function libraryEditTags(ids, { add = [], remove = [], clear = false } = {}) {
+  return api
+    .post("/library/tags", { ids, add, remove, clear })
+    .then((r) => r.data);
+}
+// 批量收藏 / 取消收藏。
+export function librarySetFavorite(ids, value = true) {
+  return api
+    .post("/library/favorite", { ids, value })
+    .then((r) => r.data);
 }
 // 资源库批量删除。⚠️ withFiles 默认 false = 只删记录、不动文件:
 // 资源库里同一张图可能被多个任务 sha256 去重复用, 真删文件是不可逆的,

@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
+from core import partials
 from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
 from core.errors import DiskFullError, GoneError
@@ -80,15 +81,39 @@ def _write_src(sidecar, url):
         pass  # 记不下来就记不下来: 最坏结果是下次从头重下, 不会下出坏文件
 
 
+def _park_orphan(part, url):
+    """把一份"不属于本次下载"的 `.part` 收进暂存区。
+
+    它一定是**别的 URL** 留下的(通常是同名的另一个来源, 或者换过相册名之后的
+    旧目标路径)。它对本 URL 没用, 但对它自己那个 URL 仍是有效的续传资本 ——
+    所以是"收起来"而不是"删掉"。
+
+    ⚠️ 收不下时**不能顺手删**: 见 `park_partial` 的方向性说明。url 都读不出来
+    (sidecar 缺失/损坏)时才是真的无从安置, 那种情况删掉 —— 留着只会误导下一次。
+    """
+    if not url:
+        Path(part).unlink(missing_ok=True)
+        return 0
+    return partials.park(Path(part), url)
+
+
 def _prepare_resume(path, url):
-    """把"上次留下的内容"搬到 .part, 返回可以接着写的字节数(0 = 从头下)。"""
+    """把"上次留下的内容"搬到 .part, 返回可以接着写的字节数(0 = 从头下)。
+
+    来源按优先级:
+      ① 旁边的 `.part` 且来源就是本 URL —— 同一次任务里的重试, 最快;
+      ② **暂存区**(`core/partials.py`, 按 URL 寻址) —— 上一次任务取消/失败留下的,
+         或者目标路径已经换了地方的那一份;
+      ③ 已存在的完整文件 —— 当作"半成品"搬进 `.part`, 让 416 分支原样换回去。
+    """
     part = _part_path(path)
     src = _part_src(path)
     if part.exists():
         if _read_src(src) == url:
             return part.stat().st_size
         # ⚠️ 残留是另一个 URL 写的: 接着它续就是在拼接两个不同的文件。
-        part.unlink(missing_ok=True)
+        # 但它对**它自己的** URL 仍然有效 —— 收进暂存区(见 _park_orphan)。
+        _park_orphan(part, _read_src(src))
         src.unlink(missing_ok=True)
         return 0
     if path.exists() and path.stat().st_size > 0:
@@ -97,6 +122,14 @@ def _prepare_resume(path, url):
         path.rename(part)
         _write_src(src, url)
         return part.stat().st_size
+    # 旁边没有可用的 —— 问暂存区要。这条路径接住的正是"取消/失败之后隔一会儿
+    # 再跑一次", 也是引入暂存区的全部意义(否则那几百 MB 就白下了)。
+    got = partials.take(url, part)
+    if got:
+        # 取回的字节同样要写来源记录: 续传前的 `.partsrc` 比对不能因为
+        # "这份字节是从暂存区来的"就少一道(见 _part_src 的说明)。
+        _write_src(src, url)
+        return got
     return 0
 
 
@@ -128,6 +161,9 @@ def discard_partial(path):
     用在取消/中止时。⚠️ 只删最终文件是不够的 —— 中断时内容在 .part 里,
     目标位置反而是干净的; 漏删 .part 会在用户目录里留下一堆 `xxx.jpg.part`,
     而且下次续传会接着这些残片继续写。
+
+    ⚠️ **结论已定**的场合才用它(判成坏文件/磁盘满/用户删了任务)。只是"这次没下
+    成、还想再试"请用 `park_partial` —— 见那里的方向性说明。
     """
     p = Path(path)
     for f in (p, _part_path(p), _part_src(p)):
@@ -135,6 +171,26 @@ def discard_partial(path):
             f.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def park_partial(path, url):
+    """把 `<path>.part` 收进暂存区(`core/partials.py`), 返回收下的字节数。
+
+    与 `discard_partial` 语义**相反**, 选错的方向性后果不对等:
+
+    | 选错 | 代价 |
+    | --- | --- |
+    | 该 park 的删掉了 | 白下一次(几百 MB) |
+    | 该删的 park 了 | 下次取回一份**已知的坏字节**继续拼, 而且会一路绿灯 |
+
+    所以: "还想再试"(取消 / 重试链走完仍失败 / 网络中断) -> park;
+    "结论是坏的或不要了"(校验失败 / 满盘 / 删任务) -> discard。
+
+    收不下(体积太小 / 暂存被关掉 / 搬不动)时**原地那份保持不动** ——
+    原地还在, 下次同名同源照样能续上。
+    """
+    p = Path(path)
+    return partials.park(_part_path(p), url, sidecar=_part_src(p))
 
 
 def _expected_size(resp, offset):

@@ -44,11 +44,16 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | GET | /collectors/resolve | **URL -> 采集器**(纯字符串判定, 不打网络请求), 用于"已识别为 X"回显 |
 | GET | /tasks | 任务列表, 支持 `q`(搜索) / `status`(可重复, 兼容组代号) / `collector` / `page` / `page_size`, 返回 `{items,total,page,page_size,pages}` |
 | GET | /tasks/stats | 采集统计: 总量 / 按状态 / 按采集器 / 近 30 天日期序列 / 失败原因聚合 / 去重报表 |
-| GET | /library | **跨任务资源库**: `q`(搜索) / `kind`(image,text) / `album`(相册名精确匹配) / `task_id` / `page` / `page_size`; 默认只列 `done` 资源, 每条带 `refs`(被多少任务共用) |
+| GET | /library | **跨任务资源库**: `q`(搜索) / `kind`(image,text) / `album`(相册名精确匹配) / `task_id` / `tag` / `favorite` / `page` / `page_size`; 默认只列 `done` 资源, 每条带 `refs`(被多少任务共用) 与 `tags` |
 | GET | /library/albums | 资源库内出现过的相册名(仅含有已完成资源的相册) |
+| GET | /library/tags | 已用标签 + 每个标签的资源数(供筛选下拉/chip) |
+| POST | /library/tags | **批量打/删标签** `{"ids":[...],"add":[...],"remove":[...]}`; 标签大小写归一、单资源上限 20 个 |
+| POST | /library/favorite | **批量收藏/取消** `{"ids":[...],"favorite":true}`; 收藏是独立维度, 不是标签 |
 | POST | /library/bulk-delete | **资源库批量删除** `{"ids":[...]}`; `refs > 1` 时只删记录、**保留文件**并如实回报 |
 | GET | /library/archive | 把选中的资源打成 ZIP 流(`ids` 逗号分隔), 不落临时文件 |
 | POST | /library/verify | **落盘后完整性巡检**: 用 `mediacheck` 判缺失/截断, **只标记不删**; 可按 `task_id` 限定范围 |
+| GET | /library/partials | **断点续传暂存区**现状: 件数/占用/TTL/预算上限, 附 `bytes_h` 等人类可读值 |
+| DELETE | /library/partials | 清空暂存区立刻还盘; 代价只是"下次从头下", **不会下出坏文件** |
 | GET | /tasks/{id}/proxy | 该任务代理池状态: 脱敏 spec + 每线路 `{proxy,fails,blocked,blocked_for}` |
 | GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
 | GET | /env/diagnose | 环境诊断: Python / 浏览器 / ffmpeg / 磁盘 / 下载目录 五项 ok/warn/fail + 修复提示 |
@@ -121,7 +126,9 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 会跳过它选下一条; 冷却到期自动半开放出(保留失败计数, 再失败一次立刻重新熔断)。
 成功的下载会清零该线路的失败计数。冷却中**不再需要健康检查线程** —— 到期即放行,
 下一次真实请求本身就是探针。全池都在冷却时退化为按序号返回(故障多半不在代理上,
-直接返回 `None` 会让任务彻底停摆)。熔断状态只放内存不落库: 进程重启即重算, 更符合直觉。
+直接返回 `None` 会让任务彻底停摆)。熔断状态**会落盘**(V34 起): 写 `_meta/` 下的
+`proxy_health.json`, 进程重启后仍然记得"哪条线不稳" —— 否则每次重启都从零重算,
+一段坏线要在新进程里重新踩三次才发现。落盘失败不影响采集(线路健康只是线索)。
 运行时可用 `GET /tasks/{id}/proxy` 看到每条线路的 `fails` / `blocked` / `blocked_for`。
 
 ### 采集器自动识别
@@ -609,10 +616,73 @@ teardown 之后、下一个用例 setup 之前"那段窗口里, 任何数据库�
 真实库就永久"正确"了, 再犯同样的错也看不出来。所以 V34 把判据下沉到**打开的那一刻**
 (`isolation.install_real_db_guard()`), 带调用栈失败。
 
+## 断点续传 / DASH / 标签(V35)
+
+### 断点续传持久化: 半成品不再白下
+
+V34 之前, `.part` 只活在**当次任务**里: 取消、满盘、判成坏文件三条路径都会主动清掉它。
+于是一个 400MB 的视频下到 90% 被叫停, 用户重新建任务 —— 只要目标路径没变, 还能接上;
+**换了相册名/换了下载目录就从头再来**。
+
+新增 `core/partials.py`: 半成品按 **URL 寻址**挪进 `_meta/partial/{sha1(url)[:2]}/{sha1(url)}.part`,
+附一份 `index.json` 记 `{url, size, saved_at, from}`。判据只有一条 —— **能不能取回**:
+下次同一个 URL 再来, 直接命中暂存区接着写。
+
+| 时机 | 行为 | 为什么 |
+| --- | --- | --- |
+| 取消 (TaskCancelled) | **park**(存进暂存区) | 用户只是不想现在下, 不是不要了 |
+| 判成坏文件 (CorruptMediaError) | **删** | 字节已经证明是坏的, 存起来只会污染下次 |
+| 磁盘满 (DiskFullError) | **删** | 都快满盘了还留半成品说不通 |
+| 小于 `partial_min_bytes` (默认 256KB) | 不 park | 几 KB 的残片重建成本比索引还低 |
+
+**TTL + 总量预算**按"最久未用"淘汰: 默认 72 小时 / 2GB。启动时(`lifespan`)扫一次。
+`GET /library/partials` 让这块**隐形的磁盘占用**可见 —— 没有它, 用户看到"下载目录 8GB"
+但里面只有 6GB 是看得见的产物, 剩下 2GB 会被当成"程序在偷偷吃盘"。
+
+### DASH(`.mpd`)支持
+
+`downloaders/video.py` 原来显式 `RuntimeError("暂不支持 DASH")` —— 这是代码里唯一一处
+显式拒绝的媒体形态。新增 `downloaders/dash.py`(纯解析, 不碰网络) + 下载方法, 复用既有的
+分片限速/重试/可取消/续传。
+
+支持 `SegmentTemplate`(`$Number$` / `$Time$` + `SegmentTimeline`)与 `SegmentList`;
+视频取**最高档**, 音频单独一轨, 下完 `ffmpeg -c copy` 合并(不重编码)。
+
+⚠️ 三个必须守住的点:
+
+* **初始化段必须排在分片前面** —— 它是 fMP4 的轨道元数据(`moov`)。少了它, 拼出来的
+  文件字节数"够"但播放器直接判损坏。
+* **DRM(`ContentProtection`)必须明确报错**。硬下会得到一堆加密分片拼成的"成功"文件,
+  用户打开才发现不能播 —— 比直接失败更糟。
+* **落盘后仍要过时长终检**(复用 HLS 那条 `_check_duration`): ffmpeg 退出码 0 但只封装了
+  前一小段, 是真实存在的假成功。
+
+### 资源库标签 / 收藏
+
+`library_filters` 原来只有 `q`/`kind`/`album`/`task_id`/`status` 五个维度。新增独立
+`resource_tags` 表(FK 级联删除)+ `resources.favorite` 列:
+
+* 标签**大小写无关归一**(`Sunset` 与 `sunset` 是同一个), 单资源上限 20 个、单个标签 ≤ 24 字
+* 收藏是**独立维度**, 不是"打一个叫 favorite 的标签" —— 混在一起之后"按标签筛"会莫名多出
+  一堆收藏项
+* 删除资源时标签**靠 FK 级联**清掉, 不靠应用层记得清
+
+`GET /library?tag=&favorite=` 消费这两个维度; `GET /library/tags` 给 chip 用(带计数)。
+
+### 顺带修掉: 分片下载的连接泄漏(真缺陷)
+
+`_fetch_segments`(HLS 与 DASH 共用)在 `raise_for_status()` 失败时**没有关闭响应**。
+一条 404 就漏一个连接, 而共享会话是 `pool_block=True`、池大小 `max(10, domain_concurrency*2)`
+(`base._build_session`), 漏满之后所有 worker 线程都阻塞在 `urllib3._get_conn` 上,
+表现为**整个任务卡死不报错**。
+
+这个缺陷是查 DASH 端到端为什么会卡时才暴露的: 素材没生成到清单旁边导致全量 404,
+而"素材问题"和"下载器卡死"看起来毫无关系。修法是把响应放进 `with` 或 `finally: close()`。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (880 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检)
+make test           # pytest (942 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)

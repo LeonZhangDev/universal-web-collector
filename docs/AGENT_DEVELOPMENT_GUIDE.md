@@ -2058,7 +2058,16 @@ collectors/stockphotos/
 `variants=[...]` 四档、`quality_map={...}`、`video_variants=[]`。
 
 关键词搜索走 `GET api.pexels.com/v1/search`，需 `PEXELS_API_KEY`；缺 key 时**明确
-报错并说清怎么配**，不静默返回空。集合页明确报"暂不支持"（比假装成功好）。
+报错并说清怎么配**，不静默返回空。
+
+> 🔁 **更正（V34 复核时发现）**：本节末句"集合页明确报'暂不支持'"**已经过期**，
+> V34 用 `/v1/collections/{id}` 把集合页实现了（见 12.7）。当时的取舍本身仍然成立
+> —— 把集合 slug 硬当成搜索词会搜出一批无关结果，那才是真正的坑；只是那条路径如今
+> 存在了。本节其余结论（声明式契约够用、`match_score` 必须复用 `gallery_base`
+> 的判据）未变。
+>
+> 教训记在这里：**"暂不支持"是一句有保质期的话**。功能一旦补上，散落在历史章节里的
+> 这句声明就会变成假话，而它比新文档更有说服力 —— 读的人会以为是最新的。
 
 > 注意：`check_site` / `selfcheck_all()` 会把新站点纳入断言。新加站点后
 > `python scripts/selfcheck.py` 必须仍然输出 `ok` —— 这也是它抓到 11.3 两个缺陷的原因。
@@ -2527,4 +2536,138 @@ isolation.install_real_db_guard()   # 由 conftest 的会话夹具调用一次
 | `tests/conftest.py` | 改：代理健康隔离 + 接入即时守卫 |
 | `tests/test_features_v34.py` | **新增**：59 项 |
 | `tests/test_features_v32.py` | 改：集合页断言（前提已失效） |
+
+## 14. V35 — 断点续传 / DASH / 标签，以及一次文档复核
+
+V34 收尾时列的三项 backlog 本轮做完。另有一次**文档复核**，发现项目文档自己在撒谎。
+
+### 14.1 断点续传持久化（`core/partials.py`）
+
+V34 之前 `.part` 只活在**当次任务**里：取消、满盘、判成坏文件三条路径都会主动清掉它。
+后果是"下到 90% 被叫停 → 重新建任务 → 只要目标路径没变还能接上，**换路径就从头再来**"。
+
+新模块按 **URL 寻址**（不是按路径）把半成品挪进 `_meta/partial/{sha1(url)[:2]}/{sha1(url)}.part`，
+附 `index.json` 记 `{url, size, saved_at, from}`。判据只有一条：**下次同一个 URL 再来，能不能取回**。
+
+| 时机 | 行为 | 理由 |
+| --- | --- | --- |
+| `TaskCancelled` | **park** | 用户只是不想现在下，不是不要了 |
+| `CorruptMediaError` | **删** | 字节已证明是坏的，存起来只会污染下次 |
+| `DiskFullError` | **删** | 快满盘了还留半成品说不通 |
+| 小于 `partial_min_bytes`（默认 256KB） | 不 park | 几 KB 的残片重建成本比索引还低 |
+
+TTL（默认 72h）+ 总量预算（默认 2GB）按"最久未用"淘汰，启动时（`lifespan`）扫一次。
+
+⚠️ **隐性磁盘占用必须可见**。这块占用不显示在"下载目录"里，用户会算不平账
+（"目录 8GB，可见产物只有 6GB"）→ 当成"程序在偷偷吃盘"。所以配了
+`GET/DELETE /library/partials`，并在前端概览条上显示。
+
+⚠️ `park_partial` 在**没有 URL** 时退化为就地删除 —— 没有 URL 就取不回，留在相册目录里
+只会在用户目录里堆 `xxx.jpg.part`，而且下次续传会接着这些残片继续写（第 6 条静默坑）。
+
+### 14.2 DASH（`.mpd`）支持（`downloaders/dash.py`）
+
+`video.py` 原来显式 `RuntimeError("暂不支持 DASH")` —— 全项目唯一一处显式拒绝的媒体形态。
+新增纯解析模块（**不碰网络**，便于单测）+ 下载方法，复用既有的分片限速/重试/可取消/续传。
+
+支持 `SegmentTemplate`（`$Number$` / `$Time$` + `SegmentTimeline`）与 `SegmentList`；
+视频取**最高档**，音频单独一轨，下完 `ffmpeg -c copy` 合并（不重编码）。
+
+⚠️ **三个必须守住的点**：
+
+1. **初始化段必须排在分片前面**。它是 fMP4 的轨道元数据（`moov`）。少了它，拼出来的文件
+   字节数"够"但播放器直接判损坏 —— 又一个"长度对得上 ≠ 内容可用"。
+2. **DRM（`ContentProtection`）必须明确报错**。硬下会得到一堆加密分片拼成的"成功"文件，
+   用户打开才发现不能播，**比直接失败更糟**。
+3. **落盘后仍要过时长终检**（复用 HLS 那条 `_check_duration`）。ffmpeg 退出码 0 但只封装了
+   前一小段是真实存在的假成功，DASH 这条路径同样会中。
+
+⚠️ **`_check_duration` 的 `what` 参数**：HLS 与 DASH 共用它，靠 `what` 区分报错文案。
+把原来 HLS 专用的 `_validate_hls_duration` 抽成通用函数时，测试里用 `lambda *a:` 写的替身
+会立刻炸 —— **那正是它们在尽职**：一个不能接受真实签名的替身，是"fixture 在说谎"
+（见 §12.5）。7 条测试都需要同步改成 `lambda *a, **kw: ...`。
+
+### 14.3 资源库标签 / 收藏
+
+`library_filters` 原来只有 `q`/`kind`/`album`/`task_id`/`status` 五个维度。新增独立
+`resource_tags` 表（**FK 级联删除**）+ `resources.favorite` 列。
+
+* 标签**大小写无关归一**（`Sunset` 与 `sunset` 是同一个），单资源上限 20 个、单个标签 ≤ 24 字。
+  用 `COLLATE NOCASE` 的唯一索引实现，而不是在应用层 `lower()` 两遍 —— 后者迟早漏一处。
+* 收藏是**独立维度**，不是"打一个叫 favorite 的标签"。混在一起之后"按标签筛"会莫名多出
+  一堆收藏项，而用户根本没法只筛收藏。
+* 删除资源时标签**靠 FK 级联**清掉，不靠应用层记得清（第 4 条铁律：加一个状态就有多处
+  口径要同步，能交给数据库的就别交给记性）。
+
+### 14.4 ⚠️ 顺带修掉：分片下载的连接泄漏（真缺陷）
+
+`_fetch_segments`（HLS 与 DASH **共用**）在 `raise_for_status()` 失败时**没有关闭响应**。
+一条 404 漏一个连接，而共享会话是 `pool_block=True`、池大小 `max(10, domain_concurrency*2)`
+（`base._build_session`，默认 10）—— 漏满之后所有 worker 线程都阻塞在
+`urllib3._get_conn` 上，表现为**整个任务卡死不报错**。
+
+这个缺陷是查"DASH 端到端为什么卡"时才暴露的：素材没生成到清单旁边 → 全量 404 →
+连接漏光。**"素材问题"和"下载器卡死"看起来毫无关系**，这是本轮最贵的一课：
+
+> 卡死类问题的第一诊断动作是**打调用栈**（`faulthandler.dump_traceback_later`），
+> 不是猜。我先后猜了"服务器单线程""限速死锁""ffmpeg 参数"，全错；栈打出来一眼就看到了
+> `_get_conn`。
+
+修法：响应放进 `with` 或 `finally: resp.close()`。
+
+### 14.5 ⚠️ 文档复核：两处声称缺失的能力其实早就有了
+
+复核 backlog 时逐条去代码里核，发现 `docs/PROJECT_OVERVIEW.md` 的「后续可做」把两个
+**已经实现**的能力列为缺失：
+
+| 文档声称缺失 | 实际 |
+| --- | --- |
+| 站点级并发配额 —— "没有'这个站最多几个在跑'的显式约束" | `DomainLimiter` 按 `site_key` 持有 `BoundedSemaphore(settings.domain_concurrency)`，默认 3，`slot()` 确实 `acquire` |
+| 巡检结果落库 —— "即时返回，刷新即丢" | `/library/verify` 直接把 `error_kind` + `note` 写回 `resources` |
+
+同型问题在 README 上也有一处：`熔断状态只放内存不落库: 进程重启即重算` —— 而 V34
+正好把它落盘了。
+
+> **这与"fixture 不诚实""旧断言前提失效"是同一型：声称某能力不在，其实早有。**
+> 唯一可靠的防法是**逐条去代码里核**，而不是读着文档改文档。
+
+### 14.6 验证（2026-09-23）
+
+| 项目 | 结果 |
+| --- | --- |
+| 新增 `tests/test_features_v35.py` | 60 项 |
+| 全量 pytest（CI 等价环境：`uv sync --group dev`，含 `curl-cffi`） | **936 passed / 6 skipped**（共 942 用例） |
+| `verify_output.py` / `verify_hls.py` | 40 项 / 18 项断言 |
+| `selfcheck.py` | 站点声明自洽 |
+| 前端 `vite build` | 90 modules / 213.75 kB |
+| DASH 端到端 | 对真实 ffmpeg 生成的 DASH 流下载 + 合并，产物含音视频双轨、时长精确匹配 |
+
+⚠️ **`vite build` 会被宿主的 safe-delete 守卫拦下**（`emptyDir(dist/assets)` 命中 597 个文件
+的批量删除阈值），报错长得像构建失败，但上面已经打印了 `✓ 90 modules transformed`。
+**看到 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]` 就往环境上想，别查代码。**
+`verify_output.py` 开头的 `rmtree(data/_verify_output)` 是同一个坑。
+
+⚠️ **V35 改了 `tests/test_ffmpeg.py` 的 7 处替身签名**：`_validate_hls_duration` 抽成通用的
+`_check_duration` 后多了 `what` 参数，原来用 `lambda *a:` 写的替身接不住。这不是回归，
+是替身本来就写死了签名。
+
+### 14.7 新增/改动文件（V35）
+
+| 文件 | 性质 |
+| --- | --- |
+| `backend/core/partials.py` | **新增**：断点续传暂存区（URL 寻址 + TTL/预算 + 启动清扫） |
+| `backend/downloaders/dash.py` | **新增**：MPD 解析（纯函数，不碰网络） |
+| `backend/core/config.py` | 改：`partial_staging` / `partial_ttl_hours` / `partial_max_bytes` / `partial_min_bytes` + env |
+| `backend/core/database.py` | 改：`resource_tags` 表 + `favorite` 列 + 标签增删查 + `library_filters` 扩两个维度 |
+| `backend/downloaders/base.py` | 改：`park_partial` / `_prepare_resume` 接暂存区 / `discard_partial` 语义分叉 |
+| `backend/downloaders/video.py` | 改：DASH 下载方法、`_fetch_segments` **关响应**（修连接泄漏）、`_check_duration` 通用化 |
+| `backend/core/task_manager.py` | 改：取消时 park、坏文件/满盘时删 |
+| `backend/api/tasks.py` | 改：`/library/partials`（GET/DELETE）、`/library/tags`、`/library/favorite`、`/library` 扩参 |
+| `backend/models/schemas.py` | 改：`LibraryTagsIn/Out`、`LibraryFavoriteIn/Out` |
+| `backend/main.py` | 改：`lifespan` 启动时清扫暂存区 |
+| `frontend/src/api.js` | 改：标签/收藏/暂存区六个接口 |
+| `frontend/src/components/LibraryPanel.vue` | 改：标签 chip、星标、批量打标签栏 |
+| `frontend/src/App.vue` | 改：概览条显示暂存区占用 + 一键清理 |
+| `tests/test_features_v35.py` | **新增**：60 项 |
+| `tests/test_ffmpeg.py` | 改：7 处替身签名（`what` 参数） |
 

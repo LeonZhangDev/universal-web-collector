@@ -13,6 +13,7 @@ from collectors import get_collector
 from core import events
 from core import layout
 from core import mediacheck
+from core import partials
 from core.cancel import TaskCancelled  # noqa: F401  (下载层要识别它, 在这里重导出)
 from core.config import settings
 from core.disk import ensure_free
@@ -486,15 +487,31 @@ class TaskManager:
             # 取消/失败时内容可能还留在 .part 里, 只删最终文件会漏
             discard_partial(p)
 
+        urls = []
         for r in db.get_resources(task_id):
             rel = self._row_field(r, "filename")
             local = self._row_field(r, "local_path")
+            url = self._row_field(r, "url")
+            if url:
+                urls.append(url)
             if db.count_place_refs(rel, local, exclude_task=task_id):
                 continue  # 还有别的任务指向这一格, 不能删
             if local:
                 _drop(local)
             if rel:
                 _drop(base / rel)
+
+        # 暂存区里属于这些 URL 的半成品也要清: 用户说"带文件删"就是要磁盘空间,
+        # 而暂存区里可能正躺着这个任务没下完的那几百 MB。
+        # ⚠️ 清掉只是"下次从头下", 不会下出坏文件 —— 所以这里不必纠结
+        # "这个 URL 还被别的任务用着"。反过来留着才是违背用户意图。
+        try:
+            n, freed = partials.clear_urls(urls)
+            count += n
+            total += freed
+        except Exception:
+            logger.debug("clear staged partials failed for task %s", task_id,
+                         exc_info=True)
 
         # 清单目录: 只认 `<下载根>/_meta/<本任务ID>`, 多一层都不碰
         meta = layout.meta_dir(base, task_id)
@@ -1463,6 +1480,9 @@ class TaskManager:
         except CollectorError as e:
             # 外部世界的问题(站点/URL/环境): 消息本身就是写给用户看的,
             # 不打堆栈 —— 堆栈会把"接下来怎么办"挤到屏幕外。
+            # 半成品收进暂存区: 这一类的失败多数是**暂时**的(超时/网络/5xx),
+            # 而且 `submit_resource` 允许手动重试, 重试时正好从暂存区接着下。
+            self._park_partial(out_dir, r)
             db.update_resource(rid, status="failed", note=str(e)[:500],
                                error_kind=classify(e))
             self._publish_resource(task_id, rid, "failed")
@@ -1472,8 +1492,10 @@ class TaskManager:
             # 只在**真的走完重试链仍失败**时记账 —— 中间某次重试失败不代表线不好。
             if proxy_pool is not None and picked:
                 proxy_pool.note_failure(picked)
-            # error_kind: 分类之外的多半是我们自己的 bug(unknown), 但网络/5xx
+            # 分类之外的多半是我们自己的 bug(unknown), 但网络/5xx
             # 这类没被包装的异常也常落在这里, 所以还是要过一遍 classify。
+            # 半成品同样收进暂存区: 未知原因里"暂时性"的占多数, 而丢掉就是白下。
+            self._park_partial(out_dir, r)
             db.update_resource(rid, status="failed", error_kind=classify(e))
             self._publish_resource(task_id, rid, "failed")
             self._safe_log(task_id, f"fail {r['url']}: {describe(e)}", "error")
@@ -1626,6 +1648,35 @@ class TaskManager:
         # 中断时目标位置反而是干净的 —— 所以必须连同 .part 一起清, 否则用户
         # 目录里会留下一堆 xxx.jpg.part, 下次续传还会接着这些残片继续写。
         discard_partial(Path(out_dir) / name)
+
+    @staticmethod
+    def _park_partial(out_dir, r):
+        """把这次没下完的半成品收进暂存区(`core/partials.py`), 留着下次接着下。
+
+        ⚠️ 与 `_discard_partial` 是**两个意思**, 用错的方向性后果不对等:
+
+        | 场合 | 用哪个 | 为什么 |
+        | --- | --- | --- |
+        | 取消 / 重试链走完仍失败 / 网络中断 | **park** | "还想再试", 字节还有用 |
+        | 判成坏文件 (`CorruptMediaError`) | discard | 结论是坏的, park 会让它复活 |
+        | 磁盘满 | discard | 残片留着或挪走一样占空间, 删掉还磁盘 |
+        | 源站已无 (gone) | 不动 | URL 死了, 永远等不到续传 |
+
+        取消之前是直接删的 —— 一个 400MB 的视频下到 380MB 被取消, 那 380MB 就
+        没了, 用户再点一次从第 0 字节重来。park 之后它按 URL 存在
+        `_meta/partial/` 里, 换相册名/换任务也照样能续。
+        """
+        name = TaskManager._row_field(r, "filename")
+        url = TaskManager._row_field(r, "url")
+        if not name or not url:
+            return
+        try:
+            park_partial(Path(out_dir) / name, url)
+        except Exception:
+            # 暂存只是"顺手攒下来的资本", 不该有能力让任务失败。
+            # ⚠️ 但不静默假装成功: 收不下时原地那份保持不动(见 park_partial),
+            # 下次同名同源还能续 —— 最坏就是退回改动之前的行为。
+            logger.debug("park partial failed for %s", url, exc_info=True)
 
     def _transition(self, task_id, expected, new):
         self._check_cancel(task_id)

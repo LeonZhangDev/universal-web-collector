@@ -15,6 +15,28 @@ from core.task_manager import recover_orphans, task_manager
 logger = logging.getLogger("uwc")
 
 
+def _sweep_partials():
+    """启动时按 TTL/预算清理断点续传暂存区(见 core/partials.py)。
+
+    ⚠️ 放在 lifespan 里与 `recover_orphans()` 同理: 它**会删文件**, 不该在
+    `import main` 时就发生 —— 那会让"只读地导入一下"产生破坏性副作用。
+
+    失败只记日志: 暂存区是"顺手攒下的资本", 清理不掉最坏就是不还磁盘,
+    不能让服务起不来。
+    """
+    try:
+        from core import partials
+
+        n, freed = partials.sweep()
+        st = partials.stats()
+        logger.info(
+            "partials: %d 项 / %.1f MB (淘汰 %d 项, 释放 %.1f MB)",
+            st.get("count", 0), st.get("bytes", 0) / 1048576.0, n, freed / 1048576.0,
+        )
+    except Exception:
+        logger.debug("partials sweep failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
     """启动补偿放在 lifespan 而不是模块导入时。
@@ -24,6 +46,7 @@ async def lifespan(app):
     被导入方当时的 DB_PATH。挂到 lifespan 上, 只有真正起服务才执行。
     """
     recover_orphans()
+    _sweep_partials()
     try:
         yield
     finally:

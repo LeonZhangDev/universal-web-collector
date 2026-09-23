@@ -296,7 +296,12 @@ def test_hls_duration_validation_rejects_successful_but_truncated_output(
     """ffmpeg exit 0 也可能只产出前几分钟，必须与预检总时长交叉校验。"""
     path = tmp_path / "truncated.mp4"
     path.write_bytes(b"not-used")
-    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: 270.0)
+    # ⚠️ 替身必须**照抄真实签名**(收 `progress_cb`)。写成 `lambda *a: 270.0` 时
+    # 只接受位置参数 —— 一旦产品给这里加上关键字参数(如 DASH 复用改成
+    # `_check_duration(..., progress_cb=...)`), 这些用例会以 `TypeError` 变红,
+    # 而报错完全指不到"真正改了什么", 很像产品崩了。
+    monkeypatch.setattr(video_mod, "_probe_media_duration",
+                        lambda *a, **kw: 270.0)
 
     with pytest.raises(RuntimeError, match="截断"):
         _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
@@ -305,7 +310,8 @@ def test_hls_duration_validation_rejects_successful_but_truncated_output(
 def test_hls_duration_validation_fails_closed_without_probe(monkeypatch, tmp_path):
     path = tmp_path / "unverified.mp4"
     path.write_bytes(b"not-used")
-    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: None)
+    monkeypatch.setattr(video_mod, "_probe_media_duration",
+                        lambda *a, **kw: None)
 
     with pytest.raises(RuntimeError, match="无法验证"):
         _validate_hls_duration(path, {"duration": 5442.0}, "/usr/bin/ffmpeg")
@@ -337,7 +343,8 @@ def test_hls_duration_boundary_and_short_container_tolerance(
     expected = 100.0 if actual > 20 else 10.0
     path = tmp_path / "boundary.mp4"
     path.write_bytes(b"not-used")
-    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: actual)
+    monkeypatch.setattr(video_mod, "_probe_media_duration",
+                        lambda *a, **kw: actual)
 
     if accepted:
         assert _validate_hls_duration(
@@ -401,11 +408,47 @@ def test_direct_download_deletes_the_file_when_validation_fails(monkeypatch, tmp
 def test_hls_duration_validation_accepts_small_container_variance(monkeypatch, tmp_path):
     path = tmp_path / "complete.mp4"
     path.write_bytes(b"not-used")
-    monkeypatch.setattr(video_mod, "_probe_media_duration", lambda *a: 5400.0)
+    monkeypatch.setattr(video_mod, "_probe_media_duration",
+                        lambda *a, **kw: 5400.0)
 
     assert _validate_hls_duration(
         path, {"duration": 5442.0}, "/usr/bin/ffmpeg"
     ) == 5400.0
+
+
+def test_duration_truncation_message_names_the_source(monkeypatch, tmp_path):
+    """报错里必须说清是**哪份清单**自报的时长。
+
+    HLS 的基线来自播放列表, DASH 的来自 MPD —— 两者共用同一份校验, 而"实际
+    300s / 播放列表 5442s"与"实际 300s / MPD 5442s"指向的排查方向不同
+    (前者多半是分片清单不完整, 后者多半是 MPD 里的 Representation 选错了)。
+    所以 `what` 不是一个装饰性参数, 它决定了这句话有没有用。
+    """
+    path = tmp_path / "t.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration",
+                        lambda *a, **kw: 10.0)
+
+    with pytest.raises(RuntimeError, match="播放列表"):
+        video_mod._check_duration(path, 100.0, "/usr/bin/ffmpeg",
+                                  what="播放列表")
+    with pytest.raises(RuntimeError, match="MPD"):
+        video_mod._check_duration(path, 100.0, "/usr/bin/ffmpeg", what="MPD")
+
+
+def test_duration_check_returns_actual_when_manifest_declares_nothing(
+    monkeypatch, tmp_path
+):
+    """清单没声明时长 -> 没有可比对的基线, **不下结论**(只回报实测值)。
+
+    这与"探针拿不到结果"是两回事: 后者必须 fail-closed(否则截断会被放行),
+    前者本来就没有基线, 硬判等于凭猜。
+    """
+    path = tmp_path / "n.mp4"
+    path.write_bytes(b"not-used")
+    monkeypatch.setattr(video_mod, "_probe_media_duration",
+                        lambda *a, **kw: 42.5)
+    assert video_mod._check_duration(path, 0.0, "/usr/bin/ffmpeg") == 42.5
 
 
 # ---- URL 形态判定 ----

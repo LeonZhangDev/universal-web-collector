@@ -400,9 +400,68 @@ setup 之前有一段窗口 —— 谁在这段里访问数据库，就写到**�
   断言的正是"集合页报不支持" —— 说谎的是**断言**。
 - `docs/PROJECT_OVERVIEW.md` 的"后续可做"曾把**已实现**的能力（站点级并发配额
   `DomainLimiter` 的 `BoundedSemaphore`、巡检结果落库 `/library/verify`）列为缺失。
+- V35 抽出通用 `_check_duration`（多一个 `what` 参数后），`tests/test_ffmpeg.py` 里 7 处
+  用 `lambda *a:` 写的替身**立刻炸** —— 那是它们在尽职，**说谎的是替身的参数表**。
+- V35 复核又抓出三处文档谎报：`README.md` 说"熔断状态只放内存不落库"（V34 已落盘）、
+  `GUIDE.md:2061` 说集合页"暂不支持"（**同一份文件** 2499 行却写着已实现 —— 自相矛盾）。
 
 不诚实的素材会把**产品缺陷与测试缺陷混成同一条红**。看到"新功能做完，旧的某条测试红了"
-先想这个，别急着改产品去迁就它；也**定期复核文档声称**。
+先想这个，别急着改产品去迁就它；也**定期复核文档声称**（唯一可靠的办法是逐条去代码里核，
+读着文档改文档只会把谎越描越圆）。
+
+## V35 新增：一条真缺陷 + 两条教训
+
+### 第 12 条 ⚠️ 流式响应不关 = 连接泄漏，表现为"任务卡死不报错"
+
+`downloaders/video.py::_fetch_segments`（HLS 与 DASH **共用**）在 `raise_for_status()` 失败时
+**没有关闭响应**：
+
+```python
+resp = self.session.get(segments[i], headers=headers, stream=True, timeout=...)
+resp.raise_for_status()          # 404 抛异常前, resp 从未被关
+```
+
+`SESSION` 是共享连接池（`pool_block=True`，池大小 `max(10, domain_concurrency*2)`，
+见 `base._build_session`，默认 10）。一条 404 漏一个连接，**漏满之后所有
+worker 线程都永久阻塞在 `urllib3.connectionpool._get_conn`** —— 任务不报错、不打日志、
+CPU 为 0，看起来像死锁。
+
+**它为什么难发现**：触发条件与症状毫无表面关联。当时是 DASH 端到端卡死，而真实原因
+链是：ffmpeg 把分段写到了 CWD（不在 HTTP 根下）→ 100% 404 → 连接漏光。
+"素材没生成对"和"下载器卡死"隔了三层。
+
+**诊断路径（比修法更值钱）**：我先猜了三个方向 —— "测试服务器是单线程"（改成
+`ThreadingTCPServer`，还卡）、"DomainLimiter 与字节桶死锁"（读了半天，没问题）、
+"ffmpeg 参数不对"（改了也没用）。最后用一行拿到真相：
+
+```python
+faulthandler.dump_traceback_later(45, exit=True)   # 45 秒还没完就打印所有线程的栈
+```
+
+栈里一眼就是 `_get_conn`。**卡死类问题的第一动作是打调用栈，不是猜。**
+
+修法：`resp` 放进 `with`，或 `finally: resp.close()`。
+
+### 同族：隐性磁盘占用必须可见
+
+`core/partials.py` 把断点续传半成品挪进 `_meta/partial/`（按 URL 寻址，见 README V35 节）。
+这东西**不在下载目录里**，于是用户会算不平账 —— "目录 8GB，可见产物只有 6GB"，
+第一反应是"程序在偷偷吃盘"。
+
+留痕方式：`GET /library/partials` 给出件数/占用/TTL/预算，前端概览条上直接显示 + 一键清理。
+与第 10 条同一条心法（**失败之后有人知道吗**），只是这里的"失败"是**占用不解释**。
+
+### 同族：`park` 与 `discard` 的判据是"能不能取回"，不是"有没有用"
+
+半成品该留还是该删，**不能按"这文件有没有价值"判断**（那会变成口味问题），
+要按**下次能不能取回**：
+
+| 时机 | 行为 | 理由 |
+| --- | --- | --- |
+| `TaskCancelled` | park | URL 还在，下次同一个 URL 能命中 → **能取回** |
+| `CorruptMediaError` | 删 | 字节已证明是坏的，park 只会污染下次 → 取回的是垃圾 |
+| `DiskFullError` | 删 | 快满盘了还留半成品说不通 |
+| 没有 URL | 就地删 | **没有 URL 就取不回**，留在相册目录里只会在用户目录堆 `xxx.jpg.part` |
 
 ## 接入新站点
 

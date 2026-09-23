@@ -154,32 +154,39 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | 熔断状态持久化 | 已实现：`core/proxy_health.py`（跨任务全局、按代理 URL 分桶），与 CDN 画像共用 `core/jsonstore.py` 的并发纪律 |
 | 落盘后完整性巡检 | 已实现：`POST /library/verify` 用 `mediacheck` 巡检缺失/截断，只标记不删；新增 `missing` 分类 |
 | 测试隔离即时守卫 | 已实现：`isolation.install_real_db_guard()` 在**打开真实库的那一刻**带调用栈失败（指纹守卫只能事后发现，且 `_migrate` 幂等） |
+| 断点续传持久化 | 已实现：`core/partials.py` 按 **URL** 寻址的暂存区（`_meta/partial/{sha1(url)}.part` + `index.json`），取消/失败时 park、坏文件/满盘时 discard，TTL + 总量预算按「最久没用」淘汰；`GET/DELETE /library/partials` + 首页可见可清 |
+| DASH（`.mpd`） | 已实现：`downloaders/dash.py` 解析 `SegmentTemplate`（`$Number$` / `$Time$`+`SegmentTimeline`）与 `SegmentList`，视频取最高档、音频单独一轨，下载后 `-c copy` mux；DRM / `SegmentBase` / 直播 / 多 Period **明确拒绝**（那些会下出「成功但没用」的文件） |
+| 资源库标签与收藏 | 已实现：`resource_tags` 明细表（`COLLATE NOCASE`，级联删除）+ `resources.favorite`；`/library/tags`、`/library/favorite`、`GET /library?tag=&favorite=`；标签筛选用 `EXISTS` 而非 JOIN（JOIN 会让「一个资源 3 个标签」变成 3 行，分页口径全错） |
 
 ## 后续可做
 
-截至 V34，前面几轮列出的建议已**全部实施**，无遗留项。V34 把 V33 列出的
-八项 backlog **一次做完**（见上表后八行），并顺带修掉两个"看不见"的问题：
+截至 V35，前面几轮列出的建议已**全部实施**，无遗留项。
 
-- 前端资源库引用的 `/files/raw` **这个接口从来不存在** —— 图片网格全是 404，
-  但因为是 `<img>` 加载失败（onerror 把图藏掉），界面看起来只是"没有缩略图"。
-- 测试套件里存在一个**窗口期**：`monkeypatch.undo()` 会把 `DB_PATH` 还原成真实
-  路径，在那之后、下一个用例 setup 之前访问数据库，就会写到**用户的真库**上。
-  V34 加了即时守卫（带调用栈），因为 `_migrate` 是幂等的 —— 靠事后比对指纹，
-  同样的错只能被抓到一次。
+- V33 是四条**缺陷修复**（跑通了但结果是错的）。
+- V34 把 V33 列的八项 backlog 一次做完，并修掉两个"看不见"的问题（前端引用的
+  `/files/raw` **从来不存在**；测试隔离的**窗口期** —— `monkeypatch.undo()` 把
+  `DB_PATH` 还原成真实路径，那之后任何 DB 访问都落到用户的真库上）。
+- V35 收掉最后三项（断点续传持久化 / DASH / 标签收藏），并复核出项目文档本身在
+  **撒谎**：两处声称缺失的能力其实早就有了（见下）。
 
 若之后继续扩展，方向明确的有：
 
 | 优先级 | 建议 | 价值与范围 |
 | --- | --- | --- |
-| P1 | 断点续传的持久化 | `.part` 会被取消/满盘/损坏三条路径**主动清掉**（那是刻意的：半截媒体留下没价值）。于是一个 400MB 的视频被中断后再建任务，只要它落在同一个目标路径就能接上（`_prepare_resume` 用 `.partsrc` 校验来源 URL），但换路径/换相册名就从头再来。要真正可靠，得把半成品挪到 `_meta/partial/{url_sha}` 并给 TTL |
-| P2 | 资源库标签/收藏 | `library_filters` 目前只有 `q`/`kind`/`album`/`task_id`/`status` 五个维度，打标签后才能表达"我要的那一批" |
-| P3 | DASH（`.mpd`）支持 | `downloaders/video.py` 现在显式 `RuntimeError("暂不支持 DASH(.mpd)")`。HLS 那套分片/限速/续传逻辑可复用大半，缺的是多轨（音视频分离）的合并步骤 |
+| P2 | 资源库标签的层级/颜色 | 现在是扁平标签。数量上去之后（几十个）会难找；可加分组或颜色标记 |
+| P3 | DASH 的 `SegmentBase` / 多 Period | 目前明确拒绝。前者要支持字节区间请求（`Range` 已具备），后者要按时段分别拼接再合并 |
+| P3 | 分片级断点续传的跨任务复用 | HLS/DASH 的分片缓存目录（`.<stem>.parts/`）**留在目标路径旁边**，换路径就找不到 —— 与单文件 `.part` 是同一个问题，只是暂存区目前只收单文件 |
 | 按需求 | 更多站点插件 | 契约已稳定（`GallerySite` + `@register`），新增站点只需声明 + `match_score` 把关 |
 
-> 曾有两条列在这里，复核时发现**已经实现**，属文档过期（声称缺失的能力其实在）：站点级
-> 并发配额（`DomainLimiter` 按 `site_key` 持有 `BoundedSemaphore(domain_concurrency)`，
-> 默认 3）与巡检结果落库（`/library/verify` 会把 `error_kind` + `note` 写回
-> `resources`，持久化从 V34 起就有）。
+> **复核纠错记录（V35）**：曾有两条列在这里，去代码里核时发现**已经实现**，属文档
+> 过期（声称缺失的能力其实在）：
+> * 站点级并发配额 —— `DomainLimiter` 按 `site_key` 持有
+>   `BoundedSemaphore(settings.domain_concurrency)`，默认 3，`slot()` 确实 acquire。
+> * 巡检结果落库 —— `/library/verify` 会把 `error_kind` + `note` 写回 `resources`，
+>   持久化从 V34 起就有。
+>
+> 这与「fixture 不诚实」「旧测试断言的前提失效」是**同一型**：声称某能力不在，其实早有。
+> 区别只是这次说谎的是**文档**。**维护文档时要去代码里核，不能凭印象增删条目。**
 
 > ⚠️ 新增站点时注意：纯 ID 样本存在跨站歧义，`match_score` 必须用自己的 `gid_shape`
 > 对纯 ID 二次把关，否则会静默抢走别的站点的输入（详见 `AGENT_DEVELOPMENT_GUIDE.md` 第 11 节）。

@@ -79,7 +79,25 @@ CREATE TABLE IF NOT EXISTS resources(
     -- ② 全量重下后比对 etag, 能发现"同一个 URL 的内容被源站换掉了"
     -- —— 增量模式原来只按 URL 判断"下过就复用", 对此完全无感。
     etag TEXT,
-    last_modified TEXT
+    last_modified TEXT,
+    -- 收藏(0/1)。与"标签"分开是刻意的: 收藏是**一个布尔属性**(排序、计数、批量
+    -- 切换都很直接), 而标签是**多值**。把它也做成一个特殊标签的话, "星标"和
+    -- "标签"两套 UI 就得共用一条数据通路, 取值冲突时要额外规则去仲裁。
+    favorite INTEGER NOT NULL DEFAULT 0
+);
+
+-- 资源标签(多对多)。⚠️ 用**明细表**而不是 resources 里的一列:
+-- 一列只能靠分隔符拼串, 于是"按标签筛"退化成 LIKE '%x%' —— 既走不了索引,
+-- 又会把 "sunset" 命中 "sunset-beach", 而且要统计"有哪些标签"还得先全表扫一遍再拆串。
+CREATE TABLE IF NOT EXISTS resource_tags(
+    resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    -- COLLATE NOCASE: 让 "Sunset" 与 "sunset" 视为同一个标签。SQLite 的 NOCASE
+    -- 只折叠 ASCII —— 中文标签本来就没有大小写, 这个选择两边都合适。
+    -- 列上声明一次, 主键去重、筛选比较、GROUP BY 统计就全都跟着走, 不必每处
+    -- 手写 COLLATE(漏一处就会出现"统计里两个、筛出来一个")。
+    tag TEXT NOT NULL COLLATE NOCASE,
+    created_time TEXT NOT NULL,
+    PRIMARY KEY (resource_id, tag)
 );
 
 CREATE TABLE IF NOT EXISTS task_logs(
@@ -128,6 +146,9 @@ CREATE INDEX IF NOT EXISTS idx_resources_filename ON resources(filename);
 CREATE INDEX IF NOT EXISTS idx_logs_task ON task_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);
+-- 标签是"按标签找资源"的入口, 没有这条索引时每次筛选都是全表扫 tags
+CREATE INDEX IF NOT EXISTS idx_tags_tag ON resource_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_resources_favorite ON resources(favorite);
 """
 
 
@@ -166,6 +187,9 @@ _ADD_COLUMNS = [
     # 条件请求凭据(ETag / Last-Modified), 见 downloaders/base.py。
     ("resources", "etag", "TEXT"),
     ("resources", "last_modified", "TEXT"),
+    # 收藏(0/1)。标签另立 resource_tags 明细表(见 SCHEMA) —— 那是多值, 放列里
+    # 就只能拼串, 筛选和统计都会退化成全表扫 + 拆串。
+    ("resources", "favorite", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -834,7 +858,37 @@ def done_resources_for_scan(task_id=None, limit=None):
     return query(sql, tuple(args))
 
 
-def library_filters(q=None, kind=None, task_id=None, album=None, status="done"):
+#: 单个标签的长度上限。32 个字符远超任何"人真的会打"的标签, 存在的意义是挡住
+#: 误把整段文本贴进来的情况 —— 那会让标签列表彻底不可用。
+MAX_TAG_LEN = 32
+#: 一个资源最多带几个标签。同样是防呆: 没有上限时"全选 + 打标签"能瞬间造出
+#: 上万行明细, 而用户根本不会去用那么多标签。
+MAX_TAGS_PER_RESOURCE = 20
+
+
+def normalize_tag(tag):
+    """标签归一化: 去首尾空白 + 折叠内部空白 + 校验长度。
+
+    ⚠️ **不做小写化**: 那会把用户特意写成 "MacBook" 的标签变成 "macbook"。
+    大小写不敏感由列的 `COLLATE NOCASE` 负责(见 SCHEMA), 它管的是"比较时
+    等不等价", 与"存成什么样"是两件事 —— 保留原样用户才不会觉得被改了。
+    """
+    if tag is None:
+        return ""
+    s = " ".join(str(tag).split())
+    if not s:
+        return ""
+    if len(s) > MAX_TAG_LEN:
+        raise ValueError(
+            f"标签太长({len(s)} 字), 上限 {MAX_TAG_LEN} 字: {s[:MAX_TAG_LEN]}…"
+        )
+    if any(ord(c) < 32 for c in s):
+        raise ValueError("标签不能包含控制字符")
+    return s
+
+
+def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
+                    tag=None, favorite=None):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
     单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
@@ -843,6 +897,8 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done"):
 
     status 默认 "done": 资源库只该显示真正落盘的产物。把 failed/pending 也列
     出来会让"库"变成"所有见过的 URL", 那不是浏览而是调试。
+
+    tag / favorite 是**两个独立维度**, 可叠加(既筛标签又只看收藏)。
     """
     where = ["1=1"]
     args = []
@@ -868,6 +924,21 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done"):
         where.append("t.name=?")
         args.append(album)
 
+    if tag:
+        # EXISTS 子查询而不是 JOIN resource_tags: JOIN 会让"一个资源带 3 个标签"
+        # 变成 3 行, 于是分页数量与总数全错(除非再加 DISTINCT, 而那又会掩盖
+        # 真正的重复)。EXISTS 天然只判在不在, 配合 idx_tags_tag 是一次索引探测。
+        # ⚠️ 不要手写 `LOWER(tag)=LOWER(?)`: 列的 COLLATE NOCASE 已经在管这件事,
+        # 两套写法混用会让"能走索引"变成"函数包住列 → 走不了索引"。
+        where.append(
+            "EXISTS (SELECT 1 FROM resource_tags rt "
+            "WHERE rt.resource_id = r.id AND rt.tag = ?)"
+        )
+        args.append(normalize_tag(tag))
+
+    if favorite:
+        where.append("r.favorite=1")
+
     if q:
         # 同时搜本地路径与来源 URL: 用户有时记得文件名, 有时只记得站点。
         # ⚠️ `%` `_` 必须转义, 否则搜 "100%" 会变成"匹配任意串"。
@@ -878,9 +949,10 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done"):
     return " AND ".join(where), args
 
 
-def library_count(q=None, kind=None, task_id=None, album=None, status="done"):
+def library_count(q=None, kind=None, task_id=None, album=None, status="done",
+                  tag=None, favorite=None):
     """资源库总数(与 library_list 同一口径)。"""
-    where, args = library_filters(q, kind, task_id, album, status)
+    where, args = library_filters(q, kind, task_id, album, status, tag, favorite)
     row = query_one(
         f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
         f"WHERE {where}",
@@ -890,9 +962,9 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done"):
 
 
 def library_list(q=None, kind=None, task_id=None, album=None, status="done",
-                 limit=50, offset=0):
+                 limit=50, offset=0, tag=None, favorite=None):
     """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。"""
-    where, args = library_filters(q, kind, task_id, album, status)
+    where, args = library_filters(q, kind, task_id, album, status, tag, favorite)
     rows = query(
         f"""SELECT r.*, t.name AS task_name, t.collector AS collector,
                    t.created_time AS task_time
@@ -921,10 +993,11 @@ def library_albums(limit=200):
 
 
 def library_stats():
-    """资源库概览: 资源数 / 体积 / 相册数 / 类型分布。"""
+    """资源库概览: 资源数 / 体积 / 相册数 / 类型分布 / 收藏数 / 标签数。"""
     row = query_one(
         """SELECT COUNT(*) AS n, COALESCE(SUM(r.size), 0) AS bytes,
-                  COUNT(DISTINCT t.name) AS albums
+                  COUNT(DISTINCT t.name) AS albums,
+                  COALESCE(SUM(CASE WHEN r.favorite=1 THEN 1 ELSE 0 END), 0) AS favs
            FROM resources r JOIN tasks t ON t.id = r.task_id
            WHERE r.status='done'"""
     )
@@ -932,12 +1005,137 @@ def library_stats():
         """SELECT r.type AS type, COUNT(*) AS n, COALESCE(SUM(r.size),0) AS bytes
            FROM resources r WHERE r.status='done' GROUP BY r.type ORDER BY n DESC"""
     )
+    tags = query_one(
+        """SELECT COUNT(DISTINCT rt.tag) AS n
+           FROM resource_tags rt JOIN resources r ON r.id = rt.resource_id
+           WHERE r.status='done'"""
+    )
     return {
         "resources": row["n"] if row else 0,
         "bytes": row["bytes"] if row else 0,
         "albums": row["albums"] if row else 0,
+        "favorites": row["favs"] if row else 0,
+        "tags": tags["n"] if tags else 0,
         "by_kind": [dict(r) for r in by_kind],
     }
+
+
+def tags_of(resource_ids):
+    """批量取标签: {resource_id: [tag, ...]}。
+
+    ⚠️ 一次查完而不是"每行查一次" —— 资源库一页 40 条, 逐行查就是 40 次往返,
+    而列表接口是最高频的调用。缺的键不会出现在结果里, 调用方用 `.get(i, [])`。
+    """
+    ids = [int(i) for i in (resource_ids or [])]
+    if not ids:
+        return {}
+    out = {}
+    # 分批: SQLite 的变量上限默认 999(旧版)/32766(新版), 一页 40 条够用,
+    # 但"全选本页 + 跨页"时调用方可能传进来上千个 id, 别在这里踩边界。
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for row in query(
+            f"SELECT resource_id, tag FROM resource_tags "
+            f"WHERE resource_id IN ({marks}) ORDER BY tag",
+            tuple(chunk),
+        ):
+            out.setdefault(row["resource_id"], []).append(row["tag"])
+    return out
+
+
+def add_tags(resource_ids, tags):
+    """给一批资源打标签, 返回真正新增的条数(已存在的不重复计)。
+
+    ⚠️ 必须**逐条 INSERT OR IGNORE**: 直接 INSERT 会在"重复打同一个标签"时抛
+    UNIQUE 冲突, 而那是用户的正常操作(选中一批再打一次同样的标签)。
+    """
+    clean = [t for t in (normalize_tag(t) for t in (tags or [])) if t]
+    ids = [int(i) for i in (resource_ids or [])]
+    if not clean or not ids:
+        return 0
+    now = _now()
+    added = 0
+    for rid in ids:
+        # 上限按资源的**最终**标签数算, 而不是"本次加几个"
+        have = {r["tag"] for r in query(
+            "SELECT tag FROM resource_tags WHERE resource_id=?", (rid,)
+        )}
+        room = MAX_TAGS_PER_RESOURCE - len(have)
+        if room <= 0:
+            raise ValueError(
+                f"资源 {rid} 的标签已达上限 {MAX_TAGS_PER_RESOURCE} 个,"
+                " 请先删掉一些再加"
+            )
+        for tag in clean:
+            if tag in have:
+                continue
+            if room <= 0:
+                raise ValueError(
+                    f"加完这批会让资源 {rid} 的标签超过上限"
+                    f" {MAX_TAGS_PER_RESOURCE} 个, 请减少要加的标签"
+                )
+            cur = execute(
+                "INSERT OR IGNORE INTO resource_tags(resource_id, tag, created_time)"
+                " VALUES (?,?,?)",
+                (rid, tag, now),
+            )
+            if cur.rowcount:
+                added += 1
+                room -= 1
+    return added
+
+
+def remove_tags(resource_ids, tags):
+    """去掉一批资源上的某些标签, 返回删除条数。空 tags = 清空这些资源的标签。"""
+    ids = [int(i) for i in (resource_ids or [])]
+    if not ids:
+        return 0
+    clean = [t for t in (normalize_tag(t) for t in (tags or [])) if t]
+    marks = ",".join("?" * len(ids))
+    if clean:
+        qs = ",".join("?" * len(clean))
+        cur = execute(
+            f"DELETE FROM resource_tags WHERE resource_id IN ({marks})"
+            f" AND tag IN ({qs})",
+            tuple(ids) + tuple(clean),
+        )
+    else:
+        cur = execute(
+            f"DELETE FROM resource_tags WHERE resource_id IN ({marks})", tuple(ids)
+        )
+    return cur.rowcount or 0
+
+
+def all_tags(limit=200):
+    """标签清单(带资源数), 供筛选下拉。
+
+    ⚠️ 只统计**已落盘**资源上的标签: 资源库只显示 done, 若这里把 failed 资源
+    的标签也算进去, 用户会看到一个点进去什么都没有的标签(数量非 0 但列表空)。
+    """
+    return query(
+        """SELECT rt.tag AS tag, COUNT(*) AS n
+           FROM resource_tags rt JOIN resources r ON r.id = rt.resource_id
+           WHERE r.status='done'
+           GROUP BY rt.tag
+           ORDER BY n DESC, rt.tag LIMIT ?""",
+        (int(limit),),
+    )
+
+
+def set_favorite(resource_ids, value=True):
+    """批量设置/取消收藏, 返回影响条数。"""
+    ids = [int(i) for i in (resource_ids or [])]
+    if not ids:
+        return 0
+    n = 0
+    marks = ",".join("?" * len(ids))
+    cur = execute(
+        f"UPDATE resources SET favorite=? WHERE id IN ({marks})",
+        (1 if value else 0,) + tuple(ids),
+    )
+    n = cur.rowcount or 0
+    return n
 
 
 def resource_refs(local_path):
@@ -954,6 +1152,26 @@ def resource_refs(local_path):
         (local_path,),
     )
     return row["n"] if row else 0
+
+
+def resource_refs_many(local_paths):
+    """批量版 `resource_refs`: {local_path: 引用数}。
+
+    资源库一页几十条, 逐条查是典型的 N+1 —— 而列表页正是最高频的接口。
+    未出现的路径不会在结果里, 调用方用 `.get(path, 0)`。
+    """
+    paths = [p for p in dict.fromkeys(local_paths or []) if p]
+    out = {}
+    for i in range(0, len(paths), 500):
+        chunk = paths[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for row in query(
+            f"SELECT local_path, COUNT(*) AS n FROM resources "
+            f"WHERE status='done' AND local_path IN ({marks}) GROUP BY local_path",
+            tuple(chunk),
+        ):
+            out[row["local_path"]] = row["n"]
+    return out
 
 
 def get_resource(resource_id):

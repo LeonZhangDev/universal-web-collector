@@ -39,6 +39,7 @@
 | 12 | 流式响应不关 = 连接泄漏 | 一条 404 漏一个连接 → 池满后所有 worker 阻塞，**任务卡死不报错** |
 | 13 | 形参被局部变量遮蔽 | `_download_m3u8` 的 `info` 被预检结果顶掉 → HLS `resolved_url` 恒缺 |
 | 14 | 测试里"顺手调真实入口" | `POST /tasks/create` → 全局 `task_manager.submit()` 起**真 worker**；用例结束后它给**下一个用例的库**写心跳（id 都从 1 开始） |
+| 15 | 登记成"已处理"又拿"未处理"去筛它 | 直播 `absorb()` 把 init 的 key 塞进 `seen`，而 `seen` 就是"没见过的才下"的过滤器 → init 永远不下（字节数正常、播放器判损坏） |
 | A | 条件请求 ⊥ 续传 | 有 `Range` 不能带 `If-None-Match`（回 304 而非 206，收尾路径永远走不到） |
 | B | 隔离的窗口期 | `monkeypatch.undo()` 还原 `DB_PATH` → 谁在那时碰库就写**用户真库** |
 | C | 素材/断言的前提会失效 | 产品加了校验或能力 → 回头问 fixture 与旧断言（**也包括文档声称**） |
@@ -71,6 +72,7 @@ curl 对 127.0.0.1 加 `--noproxy '*'`；起服务用 `run_in_background`。
 ⚠️ **别前置 `export PATH="/usr/bin:/bin:$PATH"`** —— 会把裸 `python` 换成交管版 3.13.12（没 pytest）。coreutils 全无（`cat`/`grep`/`tail`/`dirname`），但 `echo`、`git`、`python` 可用。
 ⚠️ 宿主包装器 `windows-child-process-containment.cjs` 偶发缺失 → 跑得久的命令直接 `MODULE_NOT_FOUND`（**压根没跑**）；**加 `run_in_background=true` 绕过**。
 ⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50），现有三个实例：`verify_output.py` 的 `rmtree` / `vite build` 的 `emptyDir` / **pytest 收尾清 `tmp_path`** → 无 `FAILED` 行、**连汇总行都没有**。判据：看进度行有没有 `F`。
+⚠️ 被守卫 kill 时**重定向到文件的那份输出会丢**（stdout 块缓冲没 flush）→ 脚本要 `python -u`；想拿失败清单就先 `--collect-only -q`（`pytest-randomly` **没装**，顺序=文件顺序）再按 `F` 的**列位置**反查用例名。
 ⚠️ **行尾**：`Path.write_text()` 在 Windows 上把 `\n` 翻成 `\r\n` → 被 Python 改写过的文件**整份变 CRLF**（diff 71 行炸到 415）。提交前必查；用 `newline=""` 或 `write_bytes`。
 ⚠️ `downloaders/video.py` 与 `scripts/verify_output.py` 的 **HEAD 本来就是 CRLF**，别去"统一"。
 
@@ -82,7 +84,7 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 ```
 环境变量：`UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` / `UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_FFMPEG` /
 `UWC_CDN_PROFILE` / `UWC_PROXY_HEALTH` / `UWC_MAX_BPS`（`5MB`/`512k` 写法）/ `UWC_PARTIAL_STAGING`(off 可关) /
-`UWC_PARTIAL_TTL_HOURS` / `UWC_PARTIAL_MAX_BYTES` / `UWC_PARTIAL_MIN_BYTES`
+`UWC_PARTIAL_TTL_HOURS` / `UWC_PARTIAL_MAX_BYTES` / `UWC_PARTIAL_MIN_BYTES` / `UWC_LIVE_MAX_SECONDS`(直播录制上限, 0=不限时)
 
 ## Git / 远端
 独立建仓（toplevel = 项目目录），分支 `main`。**上级 `C:\Users\admin` 那个仓库绝不能碰**。
@@ -103,4 +105,6 @@ python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
 - **V35**：断点续传持久化（`core/partials.py`，**按 URL 寻址** + TTL/预算 + 启动清扫）/ DASH(.mpd) / 资源库标签与收藏。**顺带修掉**：`_fetch_segments` 不关响应 → 404 漏连接 → 池(10)漏满后任务卡死（第 12 条）。**文档复核抓出 3 处谎报**（站点并发配额 / 巡检落库 / 熔断"只在内存"）。测试 942。
 - **V36**：分片缓存跨任务复用（`partials` 扩 `kind=segments`，按**清单 URL** 寻址 + **指纹**校验）/ 标签层级与颜色（层级 = 名字里的 `/`，零新表；调色板后端下发）/ DASH 字节区间与多时段（`parse_sidx` 按 §8.16.3，**拿 ffmpeg 真吐的 sidx 钉答案**；多时段**逐轨** `-f concat`，顶层 `video`/`audio` 置 `None` 防静默截断）。**顺带修掉**：第 13 条形参遮蔽、`park` 失败无痕。测试 997。前端 90 modules / 216.05 kB。
 - **V37**：三条**被静默丢掉的建议**（既不在 backlog 也没实现，靠逐条读代码才发现）——① 媒体元数据落库（宽高/时长；**复用已有探测**，不新增 ffprobe；"没测量"≠0）；② 下载顺序（`order_resources` 纯函数重排**提交序**；**排序不是过滤**）；③ 跨任务死信重放（`_failure_where` 单一定义 + 两数字 `n`/`replayable`；复用 `submit_resource` 唯一入口）。**顺带抓出**第 14 条（测试点火真 worker）。
-- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：更多站点插件（按需求）/ `sidx` 嵌套索引 / 直播（`type="dynamic"`）—— 后两条都标"低"。
+- **V38**：收掉最后两条标"低"的候选 —— ① 嵌套 `sidx`（`parse_sidx_refs` 分 `media`/`index`，`_expand_sidx` **原地 DFS**；层数/条数上限**报错不截断**）；② 直播录制（窗口 `[now - tsbd, now]`，**显式列出的分片不按时钟裁**，只下没见过的**且只往前**，多时段**各段各记窗口**，上限 `UWC_LIVE_MAX_SECONDS`=300s）。⚠️ 取消时**仍封文件**（与点播故意相反）；漏录片数必须进日志。**顺带抓出**第 15 条（`seen` 把 init 自己过滤掉）。测试 1063。
+  复核要点：那两条当初写的拒绝理由（"真实站点几乎不出现 / 与产物模型冲突"）**站不住** —— 一个只是"再解一层"，一个缺的是**结束条件**（产品决策）。**"暂时不做"不许写成"不该做"。**
+- **下一步候选**（详见 `docs/PROJECT_OVERVIEW.md`「后续可做」）：更多站点插件（按需求）/ HLS 直播（`EVENT` 或无 `ENDLIST`，可复用 `_record_live` 骨架，缺真站样本）/ 直播断点续录（低）。

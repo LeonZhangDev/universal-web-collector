@@ -3000,3 +3000,113 @@ safe-delete 守卫（阈值 50 文件）。判定看进度行有没有 `F`，别
 | `README.md` / `docs/PROJECT_OVERVIEW.md` | 改：两个新接口 + 三行能力 + 用例数 |
 | `scripts/verify_output.py` / `verify_hls.py` / `selfcheck.py` | 未改，均通过（40 / 18 / 自检） |
 
+## 17. V38 — 嵌套 `sidx` / DASH 直播录制（收掉两条"低"候选）
+
+这一版收掉的是「后续可做」表里最后两条标着"低、暂不做"的候选。**先去看它们当初被拒绝
+的理由**，那比看代码更重要：
+
+| 条目 | 当初写的理由 | 复核后的真相 |
+| --- | --- | --- |
+| `sidx` 嵌套索引 | "真实站点几乎不出现，出现时明确报错已经足够" | 它是"再解一层"而已，成本很低 |
+| 直播（`type="dynamic"`） | "与'产物是一个完整文件'的模型冲突，暂不做" | 缺的是**结束条件**（录多久），是产品决策，不是技术欠债 |
+
+**教训**：把"暂时不做"写成"不该做 / 已经足够"，会让后来的人失去重新评估的机会 ——
+清单上的**理由**和清单上的**条目**一样需要复核（这是 V36「反向审计」的加强版：上次查的是
+"清单上写着、代码里没有"，这次查的是"理由不成立"）。
+
+### 17.1 嵌套 `sidx`：必须原地 DFS
+
+`sidx` 的引用有两种 —— `reference_type=0` 指向媒体字节，`=1` 指向**下一层索引**。
+`dash.py` 拆成两个函数，各自的契约不同：
+
+* `parse_sidx_refs(blob, box_start)` → `[(kind, (起, 止)), ...]`，`kind ∈ {"media","index"}`，
+  **按引用顺序**；
+* `parse_sidx(...)` 保留单层视图，遇到嵌套**报错**（老调用方/老断言继续成立）——
+  "忽略那一层"等于静默少下它覆盖的全部内容。
+
+展开在 `video.py::_expand_sidx`：
+
+```
+父 sidx: [媒体A(68-77), 子索引(78-144), 媒体B(145-174)]
+         子索引 -> [媒体C(134-138), 媒体D(139-144)]
+文件里的顺序 = A, C, D, B     (子层分片紧跟在它那份索引 box 后面)
+```
+
+⚠️ 第一版实现是**错的**：先遍历父层把媒体全收下、把嵌套索引压进栈里事后处理 ——
+那样排出 A, B, C, D，**长度对得上、能播、每几秒错一段**。修法是原地递归
+（`walk()` 遇到 `index` 立刻把那一层走完，再回父层的下一条引用）。
+
+上限（`SIDX_MAX_DEPTH=4` / `SIDX_MAX_INDEXES=64`）到顶**报错不截断**：引用可以成环，
+上限的意义只是"清单坏掉时别无限请求下去"；截断则是静默少下几片。
+
+### 17.2 直播：产出是"一段录制"，四个判据缺一不可
+
+窗口 = `[now - timeShiftBufferDepth, now]`，`now` 取**取清单那一刻**（退回 `publishTime`；
+两者都没有就报错 —— 猜会算出几万片早已滚走的分片，全 404，而报错指向"下载失败"）。
+
+| 判据 | 做错了会怎样 |
+| --- | --- |
+| 清单**显式列出**的分片不拿时钟裁 | 时钟偏一点就把该录的裁掉 → 静默少录 |
+| 只下**没见过的**分片，且**只往前**（不回头） | 回头 = 给滚出窗口的分片发请求（404）+ 流结束时从节目开头重下一整遍 |
+| 多时段**每段各自**记窗口 | 只按轨记，后段的末尾会被当成整条轨的末尾 → 前段新分片被跳过（不报错） |
+| 漏录的片数**写进日志** | 不影响退出码、不影响能不能播，用户唯一感知是"这几秒怎么跳过去了" |
+
+停下来的三条路：时间上限（`UWC_LIVE_MAX_SECONDS`，默认 300s / `0` 不限时）、源站把清单
+改成 `static`（流结束）、用户取消。取清单连续失败 5 次也放弃（否则任务永不结束）。
+
+⚠️ **取消时仍然封文件**（与点播故意不同）：点播留的是"下次能接着下"的半成品，而直播
+窗口滚过去就补不回来 —— 取消那一刻手上的分片就是全部产物。封文件时 `progress_cb` 传
+`None`（取消信号会让它立刻再抛一次，那不是"取消生效了"，是"文件没封出来"）。
+
+### 17.3 ⚠️ 顺带抓出：`seen` 把初始化段自己过滤掉了
+
+`absorb()` 里先判断"这个 init 见过没有"，然后**顺手把 init 的 key 塞进了 `seen`** ——
+而 `seen` 正是下面那条"没见过的才下"的过滤器。于是初始化段永远进不了待下队列：
+
+* 拼出来的字节数**一切正常**（少几百字节看不出来）；
+* 播放器打开是一片黑／直接判损坏。
+
+防重复本来就该由 `inited` 管，`seen` 只该管分片。**这一类（"我把它登记成已处理，
+然后又拿'未处理'去筛它"）值得单独记一条**：多一个集合就多一个口径，而多出来的那一个
+往往正好把刚登记的东西筛掉。
+
+### 17.4 测试怎么写的：假时钟，不 sleep
+
+直播的轮询间隔是 2~30s，靠墙钟跑要好几秒一条用例，而且"到点没到点"本身会成为 flaky 的
+来源。`tests/test_features_v38.py` 用一个 `_Clock` 顶掉 `V.time`：
+
+* `time()` 由测试推进（窗口/清单里的"现在"）；
+* `monotonic()` 每读一次走一步（`_interruptible_sleep` 立刻返回，不真睡）；
+* `sleep()` 只记账。
+
+回路靠**清单本身**收尾：第二轮给一份 `type="static"` 的清单 → 下完这一轮就 break
+（比"上限到点"这种时间判据确定得多）。
+
+另外两条**反向**断言值得留着：`test_dynamic_is_refused_unless_the_caller_opted_in`
+（不开口就不录直播 —— 老行为不许被顺手改掉）、
+`test_static_timeline_with_r_minus_one_still_refuses`（点播里的 `r=-1` 仍然报错）。
+
+### 17.5 验证（2026-09-23）
+
+| 项 | 结果 |
+| --- | --- |
+| `pytest` | **1063 用例**；仅 4 条红，全部是 `curl_cffi` 缺失的**环境问题** —— 按**执行序号**核对过（第 133/134/135 位 = `test_downloaders`，第 591 位 = `test_gallery_preview::test_preview_sample_files_match_actual_paths`，堆栈都是 `ModuleNotFoundError`） |
+| `tests/test_features_v38.py` | **新增 43 项**，全绿 |
+| `scripts/verify_output.py` | **40 / 40** |
+| `scripts/verify_hls.py` | **18 / 18** |
+| `scripts/selfcheck.py` | 站点声明自洽；CDN 画像正常 |
+| 前端构建 | 本轮未改前端（90 modules / 220.76 kB 不变） |
+
+### 17.6 新增/改动文件（V38）
+
+| 文件 | 性质 |
+| --- | --- |
+| `backend/downloaders/dash.py` | 改：`parse_iso_time`（认不出回 `None`，不当 0）、`parse_sidx_refs`（区分 `media`/`index`）、`parse_sidx` 保留单层契约、`_segments_from_template` 接 `win`（显式列出的不裁 / `r=-1` 展开到窗口末尾）、`parse_mpd(now=, allow_dynamic=)` 直播窗口 + `live`/`minimum_update_period`/`time_shift_buffer_depth` 与窗口说明性 notes |
+| `backend/downloaders/video.py` | 改：`_seg_key`（字节区间进身份）、`SIDX_MAX_*` / `LIVE_*` 常量、`_expand_sidx`（原地 DFS）、`_fetch_range`、`_resolve_index` 走嵌套、`_fetch_one_segment`（点播与直播共用，"安全地取一片"只有一份实现）、`_finalize_tracks`（三种组合一份判据）、`_record_live` / `_finalize_live`（录制）、`_download_mpd` 认 `live` |
+| `backend/core/config.py` | 改：`live_max_seconds`（默认 300）+ `UWC_LIVE_MAX_SECONDS` |
+| `config.yaml` | 改：`live_max_seconds` 与注释（为什么不默认"不限时"） |
+| `tests/test_cancel_guard.py` | 改：`_fetch_one_segment` 进取消门禁清单 |
+| `tests/test_features_v38.py` | **新增**：43 项 |
+| `README.md` / `docs/PROJECT_OVERVIEW.md` | 改：V38 章节、DASH 能力表、环境变量、用例数；两条"低"候选从「后续可做」撤下 |
+| `scripts/verify_output.py` / `verify_hls.py` / `selfcheck.py` | 未改，均通过（40 / 18 / 自检） |
+

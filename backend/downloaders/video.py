@@ -87,6 +87,20 @@ ENGINES = ("auto", "ffmpeg", "builtin")
 MIN_HLS_DURATION_RATIO = 0.99
 SHUTDOWN_IO_TIMEOUT = TASK_IO_TIMEOUT
 
+#: 嵌套 `sidx`(`reference_type=1`)展开时最多往下钻几层 / 取回几个索引。
+#: 真实站点两级就够; 上限的意义是"清单坏掉时别无限请求下去" ——
+#: 一个环形的索引引用会让递归永远走不完, 而且每层都要发一个请求。
+SIDX_MAX_DEPTH = 4
+SIDX_MAX_INDEXES = 64
+
+#: 直播轮询的间隔上下限。节奏由清单声明的 `minimumUpdatePeriod` 决定, 这里只兜住
+#: 两端: 太快是白打源站, 太慢会漏分片 —— 直播分片滚出窗口就再也补不回来。
+LIVE_MIN_POLL = 2.0
+LIVE_MAX_POLL = 30.0
+LIVE_DEFAULT_POLL = 4.0
+#: 连续多少次取不回清单就放弃录制(而不是永远重试下去 —— 那是一个不会结束的任务)。
+LIVE_MAX_FETCH_FAILURES = 5
+
 
 def _short(err, limit=180):
     """异常压成一行短文本, 便于写进任务日志。"""
@@ -119,6 +133,23 @@ def _seg_target(seg, headers):
         hdrs["Range"] = f"bytes={int(start)}-{int(end)}"
         return str(url), hdrs
     return seg, headers
+
+
+def _seg_key(seg):
+    """分片地址 -> 可哈希的身份, 用于"这一片是不是已经下过"。
+
+    ⚠️ 必须把**字节区间**算进身份里: `SegmentBase` / `mediaRange` 的分片地址是
+    `(同一个URL, 不同区间)`, 只拿 URL 当身份会让整条轨"只认作一片" ——
+    于是直播录到第二片就不再录了, 而且不报错。
+    """
+    if isinstance(seg, (tuple, list)) and len(seg) == 2:
+        url, rng = seg
+        try:
+            start, end = rng
+            return f"{url}#{int(start)}-{int(end)}"
+        except (TypeError, ValueError):
+            return str(url)
+    return str(seg)
 
 
 def _notify_bytes(progress_cb, data):
@@ -593,8 +624,13 @@ class VideoDownloader:
         """取 MPD 本体并解析。返回 `(清单 URL, 规格 dict)`。
 
         与 HLS 的 `_preflight_hls` 同一个思路: **先读清单再开工**。区别是 DASH 的
-        拒绝理由更多(DRM / 多时段 / 字节区间), 而那些理由必须原样带到用户面前 ——
+        拒绝理由更多(DRM / 字节区间), 而那些理由必须原样带到用户面前 ——
         它们不是我们的 bug, 是"这份清单不能这么下", 用户看到才知道下一步做什么。
+
+        ⚠️ 直播(`type="dynamic"`)**在这里是允许的**: 由 `_download_mpd` 决定走
+        "录制"那条路(见 `_record_live`)。传 `now=time.time()` 是因为直播窗口要靠
+        "现在"减出来 —— 少给这个参数会退回清单的 `publishTime`, 而重放一份几小时前
+        抓到的清单时那个时间戳会算出早已滚走的窗口。
         """
         with domain_slot(url, progress_cb=progress_cb):
             resp = self.session.get(url, headers=headers, timeout=SHUTDOWN_IO_TIMEOUT)
@@ -609,7 +645,8 @@ class VideoDownloader:
                     f"源站返回的是 HTML(Content-Type: {ctype}), 不是 MPD ——"
                     f" 多半是错误页, 或清单需要登录态/Referer。"
                 )
-            return url, parse_mpd(resp.text, url)
+            return url, parse_mpd(resp.text, url, now=time.time(),
+                                  allow_dynamic=True)
         finally:
             resp.close()
 
@@ -658,6 +695,11 @@ class VideoDownloader:
                 log(f"DASH {note}")
         if log:
             log(f"清单来源 {leaf.split('/')[-1] or leaf}")
+
+        if spec.get("live"):
+            # 直播走另一条路: 它不是"把清单里的分片下完", 而是"按时间录一段"。
+            return self._record_live(leaf, spec, headers, out, stem, progress_cb,
+                                     log, info, mirrors)
 
         ff = find_ffmpeg()
         per = spec.get("periods") or []
@@ -746,27 +788,8 @@ class VideoDownloader:
                     if log:
                         log(f"{kind} 轨: {len(files)} 个时段的产物已拼接")
 
-            video = parts.get("video")
-            audio = parts.get("audio")
-            if video is None:
-                # 纯音频的 MPD: 它本身就是成品, 直接按容器后缀落盘
-                final = out / f"{stem}.m4a"
-                os.replace(audio, final)
-                ctype = "audio/mp4"
-                if log:
-                    log(f"这段 MPD 只有音频轨, 直接作为 {final.name} 落盘")
-            elif audio is None:
-                if (video.suffix == ".ts" or multi) and ff:
-                    final = out / f"{stem}.mp4"
-                    self._ffmpeg_remux(video, final, ff, progress_cb=progress_cb)
-                else:
-                    final = out / f"{stem}{video.suffix}"
-                    os.replace(video, final)
-                if log:
-                    log("该 MPD 只有视频轨, 无需合并音轨")
-            else:
-                final = out / f"{stem}.mp4"
-                self._ffmpeg_mux(video, audio, final, ff, progress_cb=progress_cb)
+            final, ctype = self._finalize_tracks(parts, out, stem, ff,
+                                                 progress_cb, log, multi=multi)
 
             # 落盘后终检: 拿 MPD **自报**的时长对一遍。ffmpeg 退出码 0 但只封了
             # 前一小段的情况是真实存在的(与 HLS 同一种假成功)。
@@ -794,20 +817,324 @@ class VideoDownloader:
                 if not left:
                     shutil.rmtree(work, ignore_errors=True)
 
-    def _resolve_index(self, track, headers, log=None):
-        """`SegmentBase` 的分片要先取回 `sidx` 才算得出来 —— 在这里补上。
+    def _finalize_tracks(self, parts, out, stem, ff, progress_cb, log, multi=False):
+        """把各轨的成品文件落成一个最终文件, 返回 `(路径, content_type)`。
 
-        只请求 `indexRange` 那一段字节(几百字节), 不是整个文件。
+        `parts` 是 `{"video": 路径, "audio": 路径}`(缺轨就是没有那个键)。**点播与
+        直播共用这一份**: 三种组合(只有音频 / 只有视频 / 音视频合并)的判据必须
+        只有一处, 分开写第二遍迟早有一份漂移 —— 而漂移的表现是"下载成功但没有
+        声音", 退出码还是 0。
 
-        ⚠️ 服务器忽略 `Range` 直接把整个文件返回时**明确报错**: 那种情况下
-        `blob` 从文件开头开始, 我们是用"索引区间的绝对偏移"去解它的, 解出来的
-        分片边界会整体错位 —— 拼出来长度对得上、能播、但每隔几秒糊一下。
+        ⚠️ 纯音频落成 `.m4a` 而不是 `.mp4`: 拿 `.mp4` 出去, 播放器会按"没有视频轨
+        的 mp4"处理, 有的直接报错。
         """
-        idx = track.get("index")
-        if not idx:
-            return track
-        media = idx["media"]
-        start, end = idx["range"]
+        video = parts.get("video")
+        audio = parts.get("audio")
+        if video is None:
+            # 纯音频的 MPD: 它本身就是成品, 直接按容器后缀落盘
+            final = out / f"{stem}.m4a"
+            os.replace(audio, final)
+            ctype = "audio/mp4"
+            if log:
+                log(f"这段 MPD 只有音频轨, 直接作为 {final.name} 落盘")
+        elif audio is None:
+            if (video.suffix == ".ts" or multi) and ff:
+                final = out / f"{stem}.mp4"
+                self._ffmpeg_remux(video, final, ff, progress_cb=progress_cb)
+            else:
+                final = out / f"{stem}{video.suffix}"
+                os.replace(video, final)
+            ctype = "video/mp4"
+            if log:
+                log("该 MPD 只有视频轨, 无需合并音轨")
+        else:
+            final = out / f"{stem}.mp4"
+            self._ffmpeg_mux(video, audio, final, ff, progress_cb=progress_cb)
+            ctype = "video/mp4"
+        return final, ctype
+
+    # ---- 直播(DASH type="dynamic")----
+
+    def _record_live(self, leaf, spec, headers, out, stem, progress_cb, log, info,
+                     mirrors=None):
+        """录一段直播: 反复取清单, 把**新出现的**分片下下来, 到点或源站结束时收工。
+
+        与点播那条路的三点结构差别(每一点都是"照抄会错"的地方):
+
+        1. **清单要反复取**。点播取一次就够; 直播的清单是滚动窗口, 只取一次等于只
+           录到取回那一刻的几秒。节奏用清单声明的 `minimumUpdatePeriod`(夹在
+           `LIVE_MIN_POLL`~`LIVE_MAX_POLL`), 没声明就退到 4s 且只录一轮
+           (那种清单不会变, 再取也是同一份 —— 见 `dash.py` 的说明)。
+        2. **分片按"发现顺序"落盘**, 不按它在清单里的位置。清单每轮都在平移, 按位置
+           编号会让新分片覆盖旧位置的文件, 拼出来是乱序的。
+        3. **取不到老分片不算失败**。窗口一直往前滚, 上一轮的分片这一轮可能已经没了
+           (404)—— 那是直播的常态, 记为"漏录"并继续。但**一片都没取到**仍是硬失败:
+           那说明地址模板或鉴权不对, "全漏"和"漏几片"是两件事。
+
+        什么时候停: 时间上限(`settings.live_max_seconds`, 0 = 不限时, 录到取消为止)、
+        源站把清单改成 `static`(直播结束)、或用户取消。
+
+        ⚠️ 取消时**仍然把已录到的封成文件** —— 与点播"留半成品等续传"故意不同: 直播
+        窗口滚过去就再也补不回来, 取消那一刻手上的分片就是全部产物, 丢掉等于把用户
+        已经花掉的时间扔了。任务状态照样是"已取消"。
+        """
+        limit = max(0.0, float(settings.live_max_seconds))
+        ff = find_ffmpeg()
+        per = spec.get("periods") or []
+        if any(p.get("audio") for p in per) and not ff:
+            raise RuntimeError(
+                "这段直播的音视频分成两条轨, 合并需要 ffmpeg, 但现在没找到它。"
+                " 请安装 ffmpeg 或用 UWC_FFMPEG 指定路径 ——"
+                " 只录视频轨会得到一个没有声音的文件, 那不是成品。"
+            )
+
+        limiter = DomainLimiter(
+            settings.segment_concurrency,
+            settings.segment_min_interval,
+            settings.segment_max_interval,
+        )
+        work = out / f".{stem}.dash"
+        work.mkdir(parents=True, exist_ok=True)
+        mup = spec.get("minimum_update_period")
+        poll = min(LIVE_MAX_POLL, max(LIVE_MIN_POLL,
+                                      float(mup or LIVE_DEFAULT_POLL)))
+        started = time.monotonic()
+        if log:
+            budget = f"{limit:.0f}s" if limit else "不限时(直到取消或流结束)"
+            log(f"直播录制开始: 每 {poll:.0f}s 取一次清单, 录制上限 {budget}")
+
+        #: kind -> 已经"记过账"的分片地址(含初始化段)。⚠️ 失败的分片也记进来 ——
+        #: 见 `_fetch_one_segment` 内部已有重试; 反复把同一片放进待下队列, 只会让
+        #: "漏了多少"这个数字失真。
+        seen = {"video": set(), "audio": set()}
+        #: kind -> 已经下过的**初始化段**地址。多时段时每个时段各有自己的一份,
+        #: 所以判据是"这个 init 见过没有"而不是"是不是第一轮"。
+        inited = {"video": set(), "audio": set()}
+        #: kind -> 已下好的分片路径, **按发现顺序**(就是拼接顺序)
+        parts = {"video": [], "audio": []}
+        #: `(时段序号, kind)` -> 上一轮该轨的最后一片。⚠️ 键里必须带时段序号:
+        #: 多时段时每段各有自己的滚动窗口, 只按 kind 记会把后面时段的末尾当成整条
+        #: 轨的末尾, 于是**前面时段新出现的分片全被当成"已经过去了"跳过**, 而且
+        #: 不报错(录出来的文件就是缺了那几秒)。
+        tail = {}
+        #: kind -> 下一片文件名的序号(只保证唯一与递增, 不是拼接依据)
+        seq = {"video": 0, "audio": 0}
+        missed = 0
+        total = 0
+        scrolled_warned = False
+        fetch_failures = 0
+        first_error = []
+
+        def absorb(cur):
+            """把这一轮清单里**没见过的**分片下下来。
+
+            返回 `(新增片数, 失败片数, 上一轮末尾是否已滚出窗口)`。
+            """
+            added = failed = 0
+            moved = False
+            for pi, period in enumerate(cur.get("periods") or []):
+                for kind in ("video", "audio"):
+                    track = period.get(kind)
+                    if not track:
+                        continue
+                    self._resolve_index(track, headers, log=log)
+                    items = []
+                    init = track.get("init")
+                    if init:
+                        ikey = _seg_key(init)
+                        # 初始化段排在**它所属时段的分片前面** —— 少了它拼出来的
+                        # 文件没有轨道元数据, 播放器直接判为损坏, 而字节数是"够"的。
+                        # ⚠️ 这里**不能**顺手把它塞进 `seen`: `seen` 是下面那条
+                        # "没见过的才下"的过滤器, 塞进去等于把 init 自己过滤掉 ——
+                        # 表现是文件能播但打不开/没画面, 长度一切正常。
+                        # 防重复靠 `inited`, 它管的就是这件事。
+                        if ikey not in inited[kind]:
+                            if inited[kind] and log:
+                                log(f"直播 {kind}: 出现新的初始化段"
+                                    f"(时段切分或编码器重启) —— 按顺序接在后面")
+                            inited[kind].add(ikey)
+                            items.append(init)
+                    items += list(track["segments"])
+                    keys = [_seg_key(s) for s in items]
+                    slot = (pi, kind)
+                    prev = tail.get(slot, "")
+                    # ⚠️ 只往前录, 不回头: 上一轮末尾之前的分片一律不再考虑。两个理由都
+                    # 跟"窗口只前进"有关 —— ① 已经滚出去的那些再请求只会换回 404;
+                    # ② 流结束时源站会把清单换成 static(带完整时长), 那时"回头"意味着
+                    # 从节目开头重下一整遍。
+                    cut = keys.index(prev) + 1 if prev in keys else 0
+                    fresh = [(s, k) for s, k in zip(items[cut:], keys[cut:])
+                             if k not in seen[kind]]
+                    if prev and cut == 0 and fresh:
+                        moved = True         # 我们的末尾已经不在窗口里了
+                    for _, k in fresh:
+                        seen[kind].add(k)
+                    if fresh and log:
+                        log(f"直播 {kind}: 本轮新增 {len(fresh)} 片"
+                            f"(已录 {len(parts[kind])})")
+                    for seg, _ in fresh:
+                        n = seq[kind]
+                        seq[kind] = n + 1
+                        d = work / kind
+                        d.mkdir(parents=True, exist_ok=True)
+                        part = d / f"{n:06d}.part"
+                        try:
+                            self._fetch_one_segment(part, seg, headers, limiter,
+                                                    progress_cb,
+                                                    label=f"直播 {kind} #{n}")
+                        except TaskCancelled:
+                            raise
+                        except Exception as e:
+                            failed += 1
+                            if not first_error:
+                                first_error.append(e)
+                            if log:
+                                log(f"直播 {kind} #{n} 没取到: {_short(e, 120)}"
+                                    f"(直播分片滚出窗口后就补不回来了)")
+                            continue
+                        parts[kind].append(part)
+                        added += 1
+                    if keys:
+                        tail[slot] = keys[-1]
+            return added, failed, moved
+
+        try:
+            round_no = 0
+            while True:
+                round_no += 1
+                if progress_cb:
+                    progress_cb()          # 顺带在这里响应取消
+                added, failed, moved = absorb(spec)
+                total += added
+                missed += failed
+                if moved and not scrolled_warned:
+                    scrolled_warned = True
+                    if log:
+                        log("直播窗口已经滚过上一轮的末尾 —— 中间可能有分片没录到"
+                            "(下一轮不会再回头补)")
+                if not total:
+                    # 一片都没录到: 地址模板/鉴权/时钟三者之一不对。**明确失败**,
+                    # 不产出一个"能播但空的"文件。
+                    why = f" (首个错误: {_short(first_error[0], 200)})" if first_error else ""
+                    raise RuntimeError(
+                        f"直播录制期间一个分片都没取到{why} —— 清单里的分片地址"
+                        f"可能不对, 或这些分片都已经滚出可用窗口。"
+                    )
+                if not spec.get("live"):
+                    # 源站把清单改成了 static: 节目结束了, 这一轮下完就是完整内容
+                    if log:
+                        log("直播清单已变成 static —— 流已结束, 录到这里为止")
+                    break
+                elapsed = time.monotonic() - started
+                if limit and elapsed >= limit:
+                    if log:
+                        log(f"直播已录 {elapsed:.0f}s(达到上限 {limit:.0f}s), 收工")
+                    break
+                wait = poll if not limit else min(poll, max(0.0, limit - elapsed))
+                if wait <= 0:
+                    break
+                self._interruptible_sleep(wait, progress_cb)
+                # ---- 取下一份清单 ----
+                nxt, last = None, None
+                for cand in [leaf] + [m for m in (mirrors or []) if m and m != leaf]:
+                    try:
+                        nxt = self._fetch_mpd(cand, headers, log, progress_cb)[1]
+                        break
+                    except TaskCancelled:
+                        raise
+                    except Exception as e:
+                        last = e
+                if nxt is None:
+                    fetch_failures += 1
+                    if log:
+                        log(f"第 {round_no} 轮取清单失败({fetch_failures}/"
+                            f"{LIVE_MAX_FETCH_FAILURES}): {_short(last, 120)}")
+                    if fetch_failures >= LIVE_MAX_FETCH_FAILURES:
+                        raise RuntimeError(
+                            f"直播录制连续 {fetch_failures} 次取不回清单, 放弃:"
+                            f" {_short(last, 200)} —— 已经录到的分片留在 "
+                            f"{work.name}/ 里。"
+                        )
+                    continue
+                fetch_failures = 0
+                spec = nxt
+
+            final, ctype = self._finalize_live(work, out, stem, parts, spec, ff,
+                                               progress_cb, log)
+            # 成品已经在 out 里了, 工作目录里那堆分片是纯冗余 —— 一次五分钟的录制
+            # 会让磁盘上多出一份等大的垃圾, 而且没有任何地方会来清它。
+            # (失败路径**不删**: 那种情况下它是唯一的证据与续录材料, 报错信息也
+            # 指向它。)
+            shutil.rmtree(work, ignore_errors=True)
+            elapsed = time.monotonic() - started
+            if log:
+                # ⚠️ "漏了几片"必须说出来。它不影响退出码, 也不影响文件能不能播 ——
+                # 用户唯一的感知是"这几秒怎么跳过去了", 而没有任何地方告诉他。
+                gap = f", 其中 {missed} 片没取到(已滚出窗口)" if missed else ""
+                log(f"直播录制结束: 共录 {total + missed} 片, 成功 {total} 片{gap}"
+                    f", 墙钟 {elapsed:.0f}s")
+            # ⚠️ 直播没有"清单声明的时长"可对, expected 传 0 = 只回报实测值, 不下
+            # 截断结论(录多久是我们自己定的, 拿它当"应该多长"是循环论证)。
+            _note_duration(info, _check_duration(final, 0.0, ff,
+                                                 progress_cb=progress_cb,
+                                                 what="直播"))
+            if progress_cb:
+                _notify_bytes(progress_cb, final)
+            fill_info(info, leaf, ctype)
+            return final, sha256_file(final, progress_cb=progress_cb)
+        except TaskCancelled:
+            # ⚠️ 直播与点播在这件事上**故意不一样**: 点播取消留的是"下次能接着下"的
+            # 半成品; 直播窗口滚过去就补不回来了, 取消那一刻手上的分片就是全部产物。
+            # 所以这里仍封一次文件再让取消信号照原样穿出去(任务状态照旧是"已取消",
+            # 但文件是能看的)。封文件时 `progress_cb` 传 None: 取消信号会让它立刻
+            # 再抛一次, 那不是"取消生效了", 是"文件没封出来"。
+            try:
+                final, _ = self._finalize_live(work, out, stem, parts, spec, ff,
+                                               None, log)
+                if log:
+                    gap = f"(另有 {missed} 片没取到)" if missed else ""
+                    log(f"取消时已把录到的 {total} 片封成 {final.name}{gap}")
+                shutil.rmtree(work, ignore_errors=True)
+            except Exception as e:
+                # 封不出来不算失败: 取消本身就要发生, 别让它被这里掩盖
+                if log:
+                    log(f"取消时封文件失败({_short(e, 120)}), 分片留在 {work.name}/ 里")
+            raise
+
+    def _finalize_live(self, work, out, stem, parts, spec, ff, progress_cb, log):
+        """把直播录到的分片按发现顺序拼起来并落盘, 返回 `(路径, content_type)`。
+
+        ⚠️ 顺序取 `parts` 的**列表顺序**(= 发现顺序), 不按文件名排序 —— 文件名里的
+        序号只保证唯一, 失败的分片会造成空洞, 依赖排序是自找麻烦。
+        """
+        got = {}
+        for kind in ("video", "audio"):
+            if not parts.get(kind):
+                continue
+            # 容器后缀按轨的 mime 定: TS 分片拼出来是 .ts, fMP4 是 .mp4
+            track = None
+            for period in spec.get("periods") or []:
+                if period.get(kind):
+                    track = period[kind]
+                    break
+            ext = ".ts" if "mp2t" in ((track or {}).get("mime") or "") else ".mp4"
+            dst = work / f"{kind}{ext}"
+            got[kind] = self._concat_parts(parts[kind], dst, progress_cb)
+        if not got:
+            raise RuntimeError("直播录制期间没有任何分片可拼接 —— 无法产出文件。")
+        return self._finalize_tracks(got, out, stem, ff, progress_cb, log)
+
+    def _fetch_range(self, media, rng, headers):
+        """取回 `media` 文件里 `rng` 那段字节, 返回 `bytes`。
+
+        ⚠️ 服务器忽略 `Range` 直接把整个文件返回时**明确报错**: 那种情况下 `blob`
+        从文件开头开始, 而调用方是拿"索引区间的绝对偏移"去解它的, 解出来的分片
+        边界会整体错位 —— 拼出来长度对得上、能播、但每隔几秒糊一下。
+
+        判据是"状态 206 **或** 字节数恰好等于区间长度", 两者有一个成立就说明区间
+        被尊重了(个别 CDN 回 200 + 精确长度)。
+        """
+        start, end = rng
         url, hdrs = _seg_target((media, (start, end)), headers)
         resp = None
         try:
@@ -824,11 +1151,65 @@ class VideoDownloader:
         want = end - start + 1
         if status != 206 and len(blob) != want:
             raise RuntimeError(
-                f"请求索引区间 {start}-{end} 时服务器没有按区间返回"
+                f"请求区间 {start}-{end} 时服务器没有按区间返回"
                 f"(状态 {status}, 返回 {len(blob)} 字节)。无法确定分片边界,"
                 f" 硬解会得到错位的分片。"
             )
-        ranges = _dash.parse_sidx(blob, start)
+        return blob
+
+    def _expand_sidx(self, media, start, blob, headers, log=None):
+        """展开一段 `sidx`, 返回 `[(起, 止), ...]`(**按文件里的先后顺序**)。
+
+        单层直接解; 遇到 `reference_type=1`(嵌套索引)就取回那一小段字节再解一层。
+        真实站点两三层就到头了, 但这里仍然设上限(`SIDX_MAX_DEPTH` /
+        `SIDX_MAX_INDEXES`)—— 因为引用可以成环, 而上限到了**报错**而不是截断:
+        少下几片的表现是"长度对得上、画面断了一截", 比失败难发现得多。
+
+        ⚠️ 顺序不能重排: 嵌套索引的字节区间与它展开出来的媒体区间在文件里是紧挨着
+        的前后关系。所以这里必须**原地** DFS —— 读到 `reference_type=1` 就立刻把
+        那一层走完再回到父层的下一条引用。先收集父层全部媒体、事后再补子层的话,
+        子层的分片会被排到父层后半段的后面, 拼出来是错位的文件(长度对得上、能播)。
+
+        上限到了**报错**而不是截断: 少下几片的表现是"长度对得上、画面断了一截",
+        比失败难发现得多。
+        """
+        out = []
+        state = {"fetched": 0}
+
+        def walk(box_start, data, depth):
+            for kind, rng in _dash.parse_sidx_refs(data, box_start):
+                if kind == "media":
+                    out.append(rng)
+                    continue
+                if depth + 1 > SIDX_MAX_DEPTH:
+                    raise RuntimeError(
+                        f"sidx 的嵌套索引超过 {SIDX_MAX_DEPTH} 层 —— 这份索引结构"
+                        f" 异常(可能是坏的或成环的), 不继续展开。"
+                    )
+                state["fetched"] += 1
+                if state["fetched"] > SIDX_MAX_INDEXES:
+                    raise RuntimeError(
+                        f"sidx 展开需要取回超过 {SIDX_MAX_INDEXES} 个索引 ——"
+                        f" 这份索引结构异常, 不继续展开。"
+                    )
+                walk(rng[0], self._fetch_range(media, rng, headers), depth + 1)
+
+        walk(start, blob, 0)
+        return out
+
+    def _resolve_index(self, track, headers, log=None):
+        """`SegmentBase` 的分片要先取回 `sidx` 才算得出来 —— 在这里补上。
+
+        只请求 `indexRange` 那一段字节(几百字节), 不是整个文件。嵌套索引会按需
+        再取它自己那一小段。
+        """
+        idx = track.get("index")
+        if not idx:
+            return track
+        media = idx["media"]
+        start, end = idx["range"]
+        blob = self._fetch_range(media, (start, end), headers)
+        ranges = self._expand_sidx(media, start, blob, headers, log=log)
         track["segments"] = [(media, r) for r in ranges]
         if log:
             log(f"sidx 解出 {len(ranges)} 个分片 (索引 {start}-{end})")
@@ -903,6 +1284,61 @@ class VideoDownloader:
             return url, info
         raise RuntimeError("播放列表嵌套过深, 疑似 master 链成环")
 
+    def _fetch_one_segment(self, part, seg, headers, limiter, progress_cb,
+                           label="分片"):
+        """下载**一个**分片到 `part`: 先写 `.tmp`, 读完再原子替换。失败抛异常。
+
+        抽出来是因为直播录制也得下分片, 但它的目标文件名不是"按位置编号"而是"按
+        发现顺序编号" —— 差别在**调用方**, "怎么安全地取一个分片"必须只有一份实现。
+        尤其是 `finally` 里那句 `resp.close()`: 抄第二遍必然漏, 而漏掉它的症状是
+        "任务卡死"而不是报错(见下)。带 `Range` 的分片由 `_seg_target` 负责加头。
+        """
+        url, hdrs = _seg_target(seg, headers)
+        last = None
+        for attempt in range(1, settings.segment_retries + 1):
+            tmp = part.with_name(part.name + ".tmp")
+            resp = None
+            try:
+                with limiter.slot():
+                    resp = self.session.get(
+                        url, headers=hdrs, stream=True,
+                        timeout=SHUTDOWN_IO_TIMEOUT,
+                    )
+                resp.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(CHUNK):
+                        if chunk:
+                            f.write(chunk)
+                            # 每块都回调: 单片可能很大, 只按分片回调的话
+                            # "停止"要等整片下完才生效
+                            if progress_cb:
+                                _notify_bytes(progress_cb, chunk)
+                tmp.replace(part)
+                return
+            except TaskCancelled:
+                tmp.unlink(missing_ok=True)
+                raise
+            except Exception as e:
+                last = e
+                tmp.unlink(missing_ok=True)
+                if attempt < settings.segment_retries:
+                    self._interruptible_sleep(min(2 ** attempt, 5), progress_cb)
+            finally:
+                # ⚠️ **必须关**。会走到这里的失败路径(404 → raise_for_status、
+                # 读中断、取消)都没把响应体读完, 连接不会被自动归还; 而会话是
+                # `pool_block=True` 的 —— 泄漏够多之后后面的分片会**永久阻塞在
+                # `_get_conn`**, 症状是"任务卡死"而不是报错, 与真实原因(某个 URL
+                # 404)看起来毫无关系。实测: 10 个分片全 404, 池一满整个下载就不动了。
+                # 池大小 = `max(10, domain_concurrency*2)`(见 base._build_session)。
+                # 读完的路径 close() 是幂等的, 顺带把连接还回池子。
+                # (与 base.py `_stream_one` 里那条纪律同一型 —— 这是第二处。)
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+        raise RuntimeError(f"{label} 失败: {_short(last)}")
+
     def _fetch_segments(self, segments, headers, parts_dir, limiter, progress_cb, log):
         """并发下载分片, 返回按序排列的 part 路径。
 
@@ -933,53 +1369,8 @@ class VideoDownloader:
             part = paths[i]
             if part.exists() and part.stat().st_size > 0:
                 return
-            url, hdrs = _seg_target(segments[i], headers)
-            last = None
-            for attempt in range(1, settings.segment_retries + 1):
-                tmp = part.with_name(part.name + ".tmp")
-                resp = None
-                try:
-                    with limiter.slot():
-                        resp = self.session.get(
-                            url, headers=hdrs, stream=True,
-                            timeout=SHUTDOWN_IO_TIMEOUT,
-                        )
-                    resp.raise_for_status()
-                    with open(tmp, "wb") as f:
-                        for chunk in resp.iter_content(CHUNK):
-                            if chunk:
-                                f.write(chunk)
-                                # 每块都回调: 单片可能很大, 只按分片回调的话
-                                # "停止"要等整片下完才生效
-                                if progress_cb:
-                                    _notify_bytes(progress_cb, chunk)
-                    tmp.replace(part)
-                    return
-                except TaskCancelled:
-                    tmp.unlink(missing_ok=True)
-                    raise
-                except Exception as e:
-                    last = e
-                    tmp.unlink(missing_ok=True)
-                    if attempt < settings.segment_retries:
-                        self._interruptible_sleep(
-                            min(2 ** attempt, 5), progress_cb
-                        )
-                finally:
-                    # ⚠️ **必须关**。会走到这里的失败路径(404 → raise_for_status、
-                    # 读中断、取消)都没把响应体读完, 连接不会被自动归还; 而会话是
-                    # `pool_block=True` 的 —— 泄漏够多之后后面的分片会**永久阻塞在
-                    # `_get_conn`**, 症状是"任务卡死"而不是报错, 与真实原因(某个 URL
-                    # 404)看起来毫无关系。实测: 10 个分片全 404, 池一满整个下载就不动了。
-                    # 池大小 = `max(10, domain_concurrency*2)`(见 base._build_session)。
-                    # 读完的路径 close() 是幂等的, 顺带把连接还回池子。
-                    # (与 base.py `_stream_one` 里那条纪律同一型 —— 这是第二处。)
-                    if resp is not None:
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
-            raise RuntimeError(f"分片 {i + 1}/{total} 失败: {_short(last)}")
+            self._fetch_one_segment(part, segments[i], headers, limiter,
+                                    progress_cb, label=f"分片 {i + 1}/{total}")
 
         errors = []
         with ThreadPoolExecutor(

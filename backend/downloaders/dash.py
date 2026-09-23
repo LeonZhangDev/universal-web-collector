@@ -21,15 +21,36 @@ MPD 比 m3u8 复杂得多(多时段、字节范围、DRM、直播)。这里只�
 | `SegmentURL@mediaRange` / `Initialization@range`(按字节范围) | ✅ 支持 |
 | 多个 `Period`(时段) | ✅ 支持(按时段分段下载, 由上层逐轨拼起来) |
 | `ContentProtection`(DRM: Widevine / PlayReady / CENC) | ❌ 明确报错 |
-| `type="dynamic"`(直播) | ❌ 明确报错 |
-| `SegmentTimeline` 里 `r="-1"`(直到时段结束) | ❌ 明确报错 |
-| `sidx` 里的 `reference_type=1`(嵌套索引) | ❌ 明确报错 |
+| `type="dynamic"`(直播) | ✅ 支持 —— 但产出是**一段录制**, 见下节 |
+| `SegmentTimeline` 里 `r="-1"`(直到时段结束) | ✅ 点播报错 / 直播按窗口末端展开 |
+| `sidx` 里的 `reference_type=1`(嵌套索引) | ✅ 支持(递归展开, 有层数与条数上限) |
 
 **为什么"明确拒绝"比"尽力而为"重要**: 这几类如果硬当成普通分片去下, 得到的不是
 报错, 而是一个"能播几秒 / 打不开"的垃圾文件 —— DRM 流下下来是密文。用户拿到的是
 "下载成功但文件没用", 那比明确失败糟糕得多: 失败会让他换个办法, 假成功会让他以为
 已经拿到了。判据只取**能被证明**的部分, 认不出就拒绝 —— 与 `core/mediacheck.py`
 同一条原则。
+
+直播(`type="dynamic"`)
+=====================
+这里做的是**录制, 不是"把整个流下完"** —— 直播没有"下完"这回事。所以本模块只负责
+把"此刻的可用窗口"翻成一份明确的分片清单, "录多久"由下载层(时间上限)决定。
+
+窗口按 `availabilityStartTime` + 当前时间 + `timeShiftBufferDepth` 推算, 三种情况:
+
+  * `SegmentTimeline` 里**显式列出**的段(r>=0) —— 清单自己就声明了可用范围,
+    **以清单为准**, 不用时钟去裁(时钟偏一点就会把有效分片裁掉);
+  * `SegmentTimeline` 里 `r="-1"`(重复到末尾) —— 只有这种情况**必须**用时钟:
+    点播里"末尾"= 时段末尾, 直播里"末尾"= 可用窗口末尾。用错会永远只录到第一次
+    取回的那几片, 而且不报错;
+  * `SegmentTemplate@duration` 均分 —— 清单没声明任何分片, 个数只能由窗口算:
+    `[窗口起点, 窗口末尾]` 里能被 `duration` 整除的那些。⚠️ 这种形态**必须**有
+    `timeShiftBufferDepth`, 否则"窗口从哪儿开始"就是未知的(按 0 算会算出几万片,
+    全是早就滚走的 404)。
+
+时钟取 `now` 参数, 没给就退回清单自己的 `publishTime` —— 那份时间戳的定义就是
+"编码器生成这份清单的时刻", 正是我们要的"现在"。两个都没有时**不猜**: 能按清单
+声明下的照下, 需要时钟才能算的**明确报错**。
 
 字节范围寻址(`SegmentBase` / `mediaRange`)
 =========================================
@@ -68,6 +89,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
@@ -88,6 +110,11 @@ _NUM_RE = re.compile(r"\$(Number|Time)(?:%0(\d+)d)?\$")
 
 #: 跳过这些轨道: 字幕/缩略图轨不是"视频文件"的一部分, 混进来只会让合并步骤报错
 _SKIP_KINDS = {"text", "image", "subtitle", "closedcaption"}
+
+#: 直播窗口一次最多枚举多少片。⚠️ 这不是性能参数而是**防呆**: 窗口是由
+#: 时间减出来的, 一旦 `timeShiftBufferDepth` 缺失或时钟错得离谱, 算出来就是几万片,
+#: 请求全打出去换回一堆 404。超过上限**明确报错**, 不裁剪 —— 裁剪等于静默少录。
+LIVE_WINDOW_MAX_SEGMENTS = 5000
 
 
 def _local(tag):
@@ -140,6 +167,30 @@ def parse_duration(text):
     g = m.groupdict()
     return (float(g["days"] or 0) * 86400.0 + float(g["hours"] or 0) * 3600.0
             + float(g["minutes"] or 0) * 60.0 + float(g["seconds"] or 0))
+
+
+def parse_iso_time(text):
+    """ISO-8601 时间戳(`2026-09-23T10:00:00Z`) -> epoch 秒; 认不出返回 `None`。
+
+    ⚠️ 认不出时返回 `None`, 而**不是**"当作 0": 它被用来减出直播窗口的起点, 当成 0
+    会算出一个"从上世纪开始"的窗口, 于是请求一大片早就滚走的分片(全 404), 报错会
+    指向"下载失败"而不是"这个字段没读懂"。
+
+    规范里 MPD 的时间都是 UTC。没带时区的按 UTC 解释(而不是本地时区 —— 本机在
+    UTC+8, 按本地解释会让窗口整体偏 8 小时)。
+    """
+    if not text:
+        return None
+    s = str(text).strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def _base_at(el, base):
@@ -230,8 +281,15 @@ def _has_base(el):
     return False
 
 
-def parse_sidx(blob, box_start=0):
-    """解析 Segment Index(`sidx`)box, 返回 `[(起, 止), ...]`(闭区间, 绝对偏移)。
+def parse_sidx_refs(blob, box_start=0):
+    """解析 Segment Index(`sidx`)box, 按**引用顺序**返回 `[(kind, (起, 止)), ...]`。
+
+    `kind` 两种:
+
+      * `"media"` —— 一段媒体字节, 可以直接下;
+      * `"index"` —— **嵌套的下一层索引**(`reference_type=1`)。它本身不是媒体:
+        取回那一小段字节再解一次才是。硬当媒体拼进去得到的是"索引的原始字节",
+        长度对得上、能播、内容是一堆二进制垃圾 —— 所以必须区分。
 
     `blob` 是**从 box 头开始**取回的那段字节(`indexRange` 请求的结果),
     `box_start` 是它在整个文件里的绝对偏移。
@@ -246,9 +304,11 @@ def parse_sidx(blob, box_start=0):
 
     第一段起点 = **sidx box 结束处 + first_offset**, 之后每段紧接上一段。
 
-    ⚠️ 只认 `reference_type=0`(媒体)。`reference_type=1` 是嵌套的一层索引,
-    展开它要先请求下一段索引 —— 那不是"多下一点字节"的事, 这里明确拒绝而不是
-    把嵌套索引当成媒体段一起拼进去(那样得到的是别人索引的原始字节)。
+    ⚠️ 两种引用**在文件里是同一条字节流的前后顺序**: 嵌套索引的区间与它展开出来的
+    媒体区间是紧挨着的(嵌套索引 box 之后跟着它索引的那些媒体)。所以调用方要按返回
+    顺序**原地**处理 —— 遇到 `index` 就先把那一层走完, 再回到父层的下一条引用。
+    先收集父层全部媒体、事后再补子层的话, 子层分片会被排到父层后半段之后, 拼出来
+    是错位的文件(长度对得上、能播)。
     """
     b = bytes(blob or b"")
     if len(b) < 12:
@@ -303,20 +363,36 @@ def parse_sidx(blob, box_start=0):
     for _ in range(count):
         w0 = int.from_bytes(b[p:p + 4], "big")
         p += 12
-        if w0 >> 31:
-            raise ValueError(
-                "sidx 用了嵌套索引引用(reference_type=1)。展开它要先请求下一层索引,"
-                " 本下载器不做 —— 硬当成媒体段拼进去得到的是索引的原始字节。"
-            )
         size = w0 & 0x7FFFFFFF
         if size <= 0:
             raise ValueError("sidx 里有 0 字节的分片引用 —— 这份索引不可信。")
-        out.append((cur, cur + size - 1))
+        out.append(("index" if w0 >> 31 else "media", (cur, cur + size - 1)))
         cur += size
     return out
 
 
-def _segments_from_template(attrs, nodes, rep, base, period_dur):
+def parse_sidx(blob, box_start=0):
+    """只认媒体段的单层视图: 返回 `[(起, 止), ...]`(闭区间, 绝对偏移)。
+
+    ⚠️ 出现嵌套索引(`reference_type=1`)时**报错**而不是忽略它 —— 忽略会静默少下
+    一整段内容(嵌套索引覆盖的那些分片全部没下), 长度对得上但内容是断的。要支持
+    嵌套的调用方用 `parse_sidx_refs` 自己递归展开(见 `video.py::_expand_sidx`)。
+    """
+    refs = parse_sidx_refs(blob, box_start)
+    if any(k == "index" for k, _ in refs):
+        raise ValueError(
+            "sidx 用了嵌套索引引用(reference_type=1)。展开它要先请求下一层索引,"
+            " 本调用方不做 —— 硬当成媒体段拼进去得到的是索引的原始字节。"
+        )
+    return [r for _, r in refs]
+
+
+def _segments_from_template(attrs, nodes, rep, base, period_dur, win=None):
+    """`SegmentTemplate` -> `(init, [分片 URL...])`。
+
+    `win` 只在**直播**时有值, 形如 `{"start": 秒|None, "end": 秒|None}`, 是相对于
+    本周起点的可用窗口。点播(`win is None`)的行为与既往完全一致。
+    """
     media = attrs.get("media")
     if not media:
         return None, None               # 没有 media 模板: 交由别的寻址方式处理
@@ -337,8 +413,12 @@ def _segments_from_template(attrs, nodes, rep, base, period_dur):
             timeline = tl
     pairs = []                          # (time, number) 对
     if timeline is not None:
+        # ⚠️ 直播里**不**拿时钟去裁显式列出的段: 清单既然一条条写出来了, 那就是
+        # 它声明可用的范围。用时钟裁的话, 时钟偏一点(或 tsbd 填得比实际小)就会把
+        # 本该录的有效分片裁掉 —— 那是静默少录。
+        entries = _kids(timeline, "S")
         cur = None
-        for s in _kids(timeline, "S"):
+        for i, s in enumerate(entries):
             if s.get("t") is not None:
                 cur = _int(s.get("t"), 0)
             dur = _int(s.get("d"), 0)
@@ -347,16 +427,39 @@ def _segments_from_template(attrs, nodes, rep, base, period_dur):
                     "MPD 的 SegmentTimeline 里有 d<=0 的分段 —— 无法确定分片时长。"
                     " 这份 MPD 可能不是给普通点播用的。"
                 )
-            repeat = _int(s.get("r"), 0)
-            if repeat < 0:
-                raise ValueError(
-                    "MPD 的 SegmentTimeline 用了 r=-1(表示'重复到时段结束')。"
-                    " 它要先解出时段时长才能换算成分片个数, 本下载器不猜这个 ——"
-                    " 猜错会少下尾部一截, 而且不报错。"
-                )
             if cur is None:
                 cur = 0
-            for _ in range(repeat + 1):
+            repeat = _int(s.get("r"), 0)
+            if repeat >= 0:
+                count = repeat + 1
+            else:
+                # `r="-1"`: 重复到"下一段的起点"为止; 最后一段则重复到**末尾**。
+                # 点播里那个"末尾"是时段末尾(由 Period@mediaPresentationDuration 定),
+                # 直播里则是**可用窗口末尾** —— 这两个值不一样, 用错会永远只录到
+                # 第一次取回的那几片, 而且不报错。
+                nxt = entries[i + 1].get("t") if i + 1 < len(entries) else None
+                if nxt is not None:
+                    limit = _int(nxt, 0)
+                elif win is not None and win.get("end") is not None:
+                    # 窗口末尾按 timescale 换算, 再加一格: 起点恰好落在末尾上的
+                    # 那一片仍然是有内容的(它覆盖 [t, t+d), 只要 t 早于末尾就算)。
+                    limit = int(math.floor(win["end"] * timescale)) + 1
+                else:
+                    if win is None:
+                        raise ValueError(
+                            "MPD 的 SegmentTimeline 用了 r=-1(表示'重复到时段末尾')。"
+                            " 它要先解出时段时长才能换算成分片个数, 本下载器不猜这个 ——"
+                            " 猜错会少下尾部一截, 而且不报错。"
+                        )
+                    raise ValueError(
+                        "直播清单的 SegmentTimeline 用了 r=-1(重复到可用窗口末尾),"
+                        " 但推不出窗口 —— 需要 availabilityStartTime 与"
+                        " publishTime/当前时间。"
+                        " 不猜: 猜错会少录尾部一截, 而且不报错。"
+                    )
+                # 段起点 t, t+d, t+2d ... 取所有 t < limit 的
+                count = max(0, -(-(limit - cur) // dur)) if limit > cur else 0
+            for _ in range(count):
                 pairs.append((cur, start + len(pairs)))
                 cur += dur
     else:
@@ -366,13 +469,41 @@ def _segments_from_template(attrs, nodes, rep, base, period_dur):
                 "MPD 的 SegmentTemplate 既没有 SegmentTimeline, 也没有 duration/"
                 "timescale —— 推不出分片个数。"
             )
-        if period_dur is None:
-            raise ValueError(
-                "MPD 没有声明时长(mediaPresentationDuration / Period@duration),"
-                " 而分片是靠 duration 均分的 —— 无法确定要下几片。"
-            )
-        count = max(1, int(math.ceil(period_dur * timescale / seg_dur)))
-        pairs = [(int(i * seg_dur), start + i) for i in range(count)]
+        if win is not None and win.get("end") is not None:
+            # 直播 + 均分时长: 清单里一个分片都没写, 个数**只能**由窗口算。
+            # 起点取 timeShiftBufferDepth 划出的那一段 —— 缺它时窗口起点 = 直播点,
+            # 也就是"从此刻开始录"(而不是从头补全整段历史, 那既下不到也存不下)。
+            seg_dur_s = seg_dur / timescale
+            end_s = win["end"]
+            start_s = win.get("start")
+            if start_s is None:
+                start_s = end_s
+            first_off = max(0, int(math.floor(start_s / seg_dur_s)))
+            last_off = int(math.floor(end_s / seg_dur_s))
+            count = last_off - first_off + 1
+            if count > LIVE_WINDOW_MAX_SEGMENTS:
+                raise ValueError(
+                    f"直播窗口按 timeShiftBufferDepth 算出来有 {count} 个分片,"
+                    f" 超过上限 {LIVE_WINDOW_MAX_SEGMENTS} ——"
+                    f" 多半是 timeShiftBufferDepth 缺失或时钟对不上。"
+                    f" 这里明确报错而不是裁掉一部分: 裁掉就是静默少录。"
+                )
+            if count <= 0:
+                raise ValueError(
+                    "直播的可用窗口里没有任何分片 —— 流可能还没开始,"
+                    " 或 availabilityStartTime 比当前时间还晚。"
+                )
+            pairs = [(int((first_off + i) * seg_dur), start + first_off + i)
+                     for i in range(count)]
+        else:
+            if period_dur is None:
+                raise ValueError(
+                    "MPD 没有声明时长(mediaPresentationDuration / Period@duration),"
+                    " 而分片是靠 duration 均分的 —— 无法确定要下几片。"
+                    " (直播需要 availabilityStartTime + 当前时间才能算出窗口。)"
+                )
+            count = max(1, int(math.ceil(period_dur * timescale / seg_dur)))
+            pairs = [(int(i * seg_dur), start + i) for i in range(count)]
 
     if not pairs:
         raise ValueError("MPD 的 SegmentTimeline 是空的 —— 没有任何分片可下。")
@@ -480,12 +611,13 @@ def _track_kind(adapt, rep):
     return ""
 
 
-def _representation(adapt, rep, period, mpd_base, period_dur, notes):
+def _representation(adapt, rep, period, mpd_base, period_dur, notes, win=None):
     """把一条 Representation 解析成可下载的分片清单。
 
     返回 `(init, 地址列表, 索引描述)`。认不出抛 `ValueError`。
     `地址列表` 的每个元素是 URL 或 `(URL, (起, 止))`; `索引描述` 非空时表示
     "分片要先取回 sidx 才算得出来"(见 `parse_sidx`), 由下载层完成。
+    `win` 只在直播时非空, 见 `_segments_from_template`。
     """
     base = _base_at(rep, _base_at(adapt, _base_at(period, mpd_base)))
     has_base = any(_has_base(x) for x in (period, adapt, rep))
@@ -497,7 +629,7 @@ def _representation(adapt, rep, period, mpd_base, period_dur, notes):
     if found["SegmentTemplate"][0]:
         init, urls = _segments_from_template(found["SegmentTemplate"][0],
                                             found["SegmentTemplate"][1],
-                                            rep, base, period_dur)
+                                            rep, base, period_dur, win)
         if urls:
             return init, urls, None
     if found["SegmentList"][0]:
@@ -518,7 +650,7 @@ def _representation(adapt, rep, period, mpd_base, period_dur, notes):
     )
 
 
-def parse_mpd(text, mpd_url):
+def parse_mpd(text, mpd_url, now=None, allow_dynamic=False):
     """解析 MPD。失败抛 `ValueError`, 消息是**写给用户看的**(不含栈/内部术语)。
 
     成功返回::
@@ -526,6 +658,9 @@ def parse_mpd(text, mpd_url):
         {"duration": float|None,
          "periods": [period, ...],          # 至少一个
          "video": track|None, "audio": track|None,   # 只有**单时段**时才有值
+         "live": bool,                      # 这份清单是直播(type="dynamic")
+         "minimum_update_period": float|None,   # 直播: 清单多久刷新一次
+         "time_shift_buffer_depth": float|None, # 直播: 可回溯窗口有多长
          "notes": [str]}
 
     period = {"video": track|None, "audio": track|None, "duration": float|None,
@@ -542,6 +677,12 @@ def parse_mpd(text, mpd_url):
 
     ⚠️ 多时段时顶层 `video`/`audio` 是 `None`, 只读第一条轨的调用方会拿到空值而
     **自己炸**, 而不是静默少下后面全部 —— 这是故意的(见模块 docstring 末节)。
+
+    `now`(epoch 秒)只在直播时用到: 没给就退回清单自己的 `publishTime`。两个都没有
+    时, 需要时钟才能算出来的形态会**明确报错**(见模块 docstring 的直播一节)。
+
+    `allow_dynamic` 默认 False —— 解析器不替调用方决定"录不录直播"。关着的时候
+    遇到 `type="dynamic"` 仍然报错, 这是给"只想拿点播清单"的调用方(和旧行为)留的。
     """
     if not text or not str(text).strip():
         raise ValueError("MPD 是空的(源站返回了 0 字节)")
@@ -557,10 +698,11 @@ def parse_mpd(text, mpd_url):
         )
 
     mtype = (root.get("type") or "static").strip().lower()
-    if mtype == "dynamic":
+    live = mtype == "dynamic"
+    if live and not allow_dynamic:
         raise ValueError(
-            "MPD 声明 type=\"dynamic\"(直播/长时段流)。本下载器只处理点播"
-            "(static): 直播没有确定的结束点, 按分片清单下会得到一个一直长不大的文件。"
+            "MPD 声明 type=\"dynamic\"(直播/长时段流), 而这次调用没有开启直播录制。"
+            " 直播没有确定的结束点: 按分片清单一路下会得到一个一直长不大的文件。"
         )
 
     # DRM: 只要出现 ContentProtection 就拒绝。它的子元素里可能有 PSSH 数据,
@@ -582,6 +724,32 @@ def parse_mpd(text, mpd_url):
     notes = []
     periods = _kids(root, "Period") or [root]
 
+    # ---- 直播: 先定出"现在" ----
+    # ⚠️ 时钟只有一个来源, 优先级明确写在这里: 调用方给的 now 最准(它就在下载的
+    # 那一刻), 其次是清单的 publishTime(编码器生成这份清单的时刻, 定义上就是
+    # "这份清单的现在")。都没有就是 None —— 需要它的形态会报错, 不需要的照下。
+    clock = None
+    live_meta = {"minimum_update_period": None, "time_shift_buffer_depth": None}
+    if live:
+        published = parse_iso_time(root.get("publishTime"))
+        clock = now if now is not None else published
+        live_meta["minimum_update_period"] = parse_duration(
+            root.get("minimumUpdatePeriod"))
+        live_meta["time_shift_buffer_depth"] = parse_duration(
+            root.get("timeShiftBufferDepth"))
+        ast = parse_iso_time(root.get("availabilityStartTime"))
+        if clock is None:
+            notes.append(
+                "直播: 清单没有 publishTime, 调用方也没给当前时间 ——"
+                " 只有把分片一条条写出来的清单能下"
+            )
+        elif ast is None:
+            clock = None
+            notes.append(
+                "直播: 清单没有 availabilityStartTime, 推不出可用窗口 ——"
+                " 只有把分片一条条写出来的清单能下"
+            )
+
     parsed = []
     skipped = []
     for idx, period in enumerate(periods):
@@ -589,6 +757,19 @@ def parse_mpd(text, mpd_url):
         p_dur = parse_duration(period.get("duration"))
         if p_dur is None:
             p_dur = duration
+        win = None
+        if live:
+            p_start = parse_duration(period.get("start")) or 0.0
+            w_end = None
+            if clock is not None:
+                w_end = clock - parse_iso_time(root.get("availabilityStartTime")) - p_start
+            tsbd = live_meta["time_shift_buffer_depth"]
+            # ⚠️ 窗口起点: 有 tsbd 就回溯那么长(**这是特性** —— 中途接入直播能补上
+            # 刚才那几分钟), 没有就把起点放在直播点上, 也就是"从现在开始录"。
+            # 绝不用 0 当起点: 那等于"从流的开头补全", 下不到还全是 404。
+            w_start = (max(0.0, w_end - tsbd) if tsbd is not None
+                       else w_end) if w_end is not None else None
+            win = {"start": w_start, "end": w_end}
         best = {"video": None, "audio": None}
         for adapt in _kids(period, "AdaptationSet") or [period]:
             reps = _kids(adapt, "Representation")
@@ -601,7 +782,7 @@ def parse_mpd(text, mpd_url):
                     skipped.append(kind or "unknown")
                     continue
                 init, segs, index = _representation(
-                    adapt, rep, period, p_base, p_dur, notes
+                    adapt, rep, period, p_base, p_dur, notes, win
                 )
                 mime = (rep.get("mimeType") or adapt.get("mimeType")
                         or ("video/mp4" if kind == "video" else "audio/mp4"))
@@ -684,5 +865,28 @@ def parse_mpd(text, mpd_url):
     if best["audio"] is None and best["video"] is not None:
         notes.append("没有音频轨(该 MPD 只有视频)")
 
+    if live:
+        tsbd = live_meta["time_shift_buffer_depth"]
+        mup = live_meta["minimum_update_period"]
+        # 把窗口"用秒说出来" —— 用户唯一能据此判断"这次会录到多少"的东西
+        if clock is None:
+            pass                    # 上面已经写过"推不出窗口"的说明
+        elif tsbd is not None:
+            notes.append(
+                f"直播: 可用窗口 {tsbd:.0f}s(清单声明的回溯范围),"
+                f" 从这里开始录"
+            )
+        else:
+            notes.append("直播: 清单未声明 timeShiftBufferDepth, 从当前直播点开始录")
+        # ⚠️ 没有 minimumUpdatePeriod 就没有"下一份清单"的节奏: 只能录到第一次
+        # 取回的窗口就结束。这不是失败, 但必须说出来 —— 否则用户以为"录了 5 分钟"
+        # 而实际只录到 2 秒。
+        if mup is None:
+            notes.append(
+                "直播: 清单没有声明 minimumUpdatePeriod, 无法得知新分片何时出现 ——"
+                " 本轮只会下取回时已经存在的那几片"
+            )
+
     return {"duration": duration, "video": best["video"], "audio": best["audio"],
-            "periods": parsed, "notes": notes}
+            "periods": parsed, "notes": notes, "live": live,
+            **live_meta}

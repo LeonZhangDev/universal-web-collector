@@ -52,6 +52,12 @@ segment_retries: 3
 #    mirrors 也不会轮换。对限速/镜像敏感的站点请用 builtin。
 video_engine: auto
 
+# DASH 直播(type="dynamic")录多久, 秒。直播没有"下完"这回事, 所以必须有结束条件。
+#   0 = 不限时(录到用户取消, 或源站把清单改成 static 为止)
+# ⚠️ 默认 5 分钟而不是"不限时": 一个会自动跑满磁盘的任务不该是默认行为。
+# 环境变量 UWC_LIVE_MAX_SECONDS 覆盖。
+live_max_seconds: 300
+
 # ffmpeg 可执行文件路径。留空则自动探测:
 #   显式配置 -> PATH -> 常见安装位置(winget / scoop / choco / 手工解压目录)
 # 之所以不只用 PATH: PATH 是进程启动时的快照, 服务运行期间新装的 ffmpeg

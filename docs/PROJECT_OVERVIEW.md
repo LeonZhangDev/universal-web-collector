@@ -155,17 +155,19 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | 落盘后完整性巡检 | 已实现：`POST /library/verify` 用 `mediacheck` 巡检缺失/截断，只标记不删；新增 `missing` 分类 |
 | 测试隔离即时守卫 | 已实现：`isolation.install_real_db_guard()` 在**打开真实库的那一刻**带调用栈失败（指纹守卫只能事后发现，且 `_migrate` 幂等） |
 | 断点续传持久化 | 已实现：`core/partials.py` 按 **URL** 寻址的暂存区（`_meta/partial/{sha1(url)}.part` + `index.json`），取消/失败时 park、坏文件/满盘时 discard，TTL + 总量预算按「最久没用」淘汰；`GET/DELETE /library/partials` + 首页可见可清 |
-| DASH（`.mpd`） | 已实现：`downloaders/dash.py` 解析 `SegmentTemplate`（`$Number$` / `$Time$`+`SegmentTimeline`）、`SegmentList`、`SegmentBase` / `mediaRange`（字节区间）与多 `Period`；视频取最高档、音频单独一轨，下载后 `-c copy` mux；DRM / 直播 / `r=-1` / 嵌套 sidx **明确拒绝**（那些会下出「成功但没用」的文件） |
+| DASH（`.mpd`） | 已实现：`downloaders/dash.py` 解析 `SegmentTemplate`（`$Number$` / `$Time$`+`SegmentTimeline`）、`SegmentList`、`SegmentBase` / `mediaRange`（字节区间）与多 `Period`；视频取最高档、音频单独一轨，下载后 `-c copy` mux；点播里 `r=-1` 与**所有** DRM 仍**明确拒绝**（那些会下出「成功但没用」的文件） |
 | 资源库标签与收藏 | 已实现：`resource_tags` 明细表（`COLLATE NOCASE`，级联删除）+ `resources.favorite`；`/library/tags`、`/library/favorite`、`GET /library?tag=&favorite=`；标签筛选用 `EXISTS` 而非 JOIN（JOIN 会让「一个资源 3 个标签」变成 3 行，分页口径全错） |
 | 标签层级与颜色 | 已实现：层级 = 标签名里的 `/`（`系列/角色A`），**不建树表**；`all_tags()` 回 `parent`/`depth`/`n_tree` 并补齐中间层，`/library/tags` 下发调色板（界面不硬编码色值）；颜色存在 `tag_meta`，是**标签**的属性（资源删光也不丢）；`GET /library?tag=&tag_children=true` 做带分隔符的前缀匹配 |
 | 分片缓存的跨任务复用 | 已实现：分片缓存也进暂存区（`{sha1(清单URL)}.seg/`），与单文件 `.part` 共用 TTL/预算/淘汰；**按清单指纹**（`fingerprint`，支持字节区间）判断能否复用，不符整份丢弃 |
 | 媒体元数据 | 已实现：`resources.width/height/duration`，图片在落盘后读文件头量宽高、视频取下载层**已经测过**的容器时长（`info["probed_duration"]`，三条收尾路径统一回填）。⚠️ 没装 ffprobe 时 `duration` 留 **NULL**，不写 0 —— "没测量"与"0 秒"是两件事 |
 | 下载顺序（优先级） | 已实现：`options.resource_order` ∈ `original` / `video_first` / `small_first`。线程池固定大小、空闲 worker 按**提交序**取任务，所以重排提交顺序就是事实上的优先级；`task_manager.order_resources` 只排序不过滤（输出长度与输入恒等） |
 | 跨任务死信重放 | 已实现：`GET /library/failures`（按 `error_kind` 分组，每个原因给 `n` 与 `replayable` 两个数字）+ `POST /library/replay`（按 `refs`/`kinds`，同给取交集）。全部复用 `submit_resource` 这一条重下入口，跳过理由逐条回报 |
+| `sidx` 嵌套索引（`reference_type=1`） | 已实现：`parse_sidx_refs` 把两种引用（`media` / `index`）分开，`video.py::_expand_sidx` **原地 DFS** 逐层取回再展开（`SIDX_MAX_DEPTH` / `SIDX_MAX_INDEXES`，到上限**报错不截断**）。⚠️ 顺序不能重排：子层分片与索引 box 在文件里是紧挨着的先后关系，先收父层媒体、事后再补子层会拼出「长度对得上、能播、内容错位」的文件 |
+| 直播录制（DASH `type="dynamic"`） | 已实现：产出是**一段录制**而不是"下完整个流"。窗口 = `[now - timeShiftBufferDepth, now]`（`now` 取下载那一刻，退回 `publishTime`；两者都没有就**明确报错**）；清单**显式列出的**分片不按时钟裁（时钟偏一点就会裁掉该录的）；`_record_live` 按 `minimumUpdatePeriod` 反复取清单，只下**新出现的**分片（只往前不回头，多时段各自记窗口），时间上限（`UWC_LIVE_MAX_SECONDS`，默认 300s）/ 源站转 `static` / 取消时收工。⚠️ 取消时**仍把已录到的封成文件**（点播留的是能续传的半成品，直播窗口滚过去就补不回来）；漏录片数写进日志 |
 
 ## 后续可做
 
-截至 V36，前面几轮列出的建议已**全部实施**，无遗留项。
+截至 V38，前面几轮列出的建议已**全部实施**，无遗留项。
 
 - V33 是四条**缺陷修复**（跑通了但结果是错的）。
 - V34 把 V33 列的八项 backlog 一次做完，并修掉两个"看不见"的问题（前端引用的
@@ -176,14 +178,20 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 - V36 收掉 V35 结束时列出的最后三项（分片缓存跨任务复用 / 标签层级与颜色 /
   DASH 的 `SegmentBase` 与多 Period），并顺手修掉 HLS 路径**丢掉调用方 `info`**
   的那个静默缺陷。
+- V37 做完了三条**在清单上消失的建议**（媒体元数据 / 下载顺序 / 跨任务死信重放）
+  —— 它们写在 2026-09-22 的深度分析里，却既没进 backlog 也没实现，于是从所有
+  清单上一起消失，是**逐条读代码**才发现的。
+- V38 收掉最后两条标「低」的候选（嵌套 sidx / 直播录制）。它们当初被列成"暂不做"，
+  理由是"明确报错已经足够"——**那个理由现在不成立**：嵌套索引只是"再解一层"，
+  直播缺的是**结束条件**（时间上限），是产品决策而不是技术欠债。
 
 若之后继续扩展，方向明确的有：
 
 | 优先级 | 建议 | 价值与范围 |
 | --- | --- | --- |
 | 按需求 | 更多站点插件 | 契约已稳定（`GallerySite` + `@register`），新增站点只需声明 + `match_score` 把关 |
-| 低 | `sidx` 的嵌套索引（`reference_type=1`） | 需要连取多层索引再展开。真实站点几乎不出现，出现时**明确报错**已经足够 |
-| 低 | 直播（`type="dynamic"`） | 要引入"跟到某个时间点为止"的语义（`availabilityStartTime` + 结束条件），与"点播产物是一个完整文件"的模型冲突，暂不做 |
+| 按需求 | HLS 直播（`#EXT-X-PLAYLIST-TYPE:EVENT` / 无 `ENDLIST`） | 与 DASH 直播同形的问题，可以复用 `_record_live` 的"反复取清单 + 只下新分片 + 时间上限"骨架；缺的是真站样本 |
+| 低 | 直播断点续录 | 现在取消即收工（窗口滚过去补不回来）。要支持"接着录"得把已录分片进暂存区并按 `$Time$` 续接，收益取决于是否真有人长时间录 |
 
 > **复核纠错记录（V35）**：曾有两条列在这里，去代码里核时发现**已经实现**，属文档
 > 过期（声称缺失的能力其实在）：
@@ -191,6 +199,10 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 >   `BoundedSemaphore(settings.domain_concurrency)`，默认 3，`slot()` 确实 acquire。
 > * 巡检结果落库 —— `/library/verify` 会把 `error_kind` + `note` 写回 `resources`，
 >   持久化从 V34 起就有。
+>
+> **复核纠错记录（V38）**：上面那两条「低」候选的**理由**是错的 —— 它们写的是
+> "明确报错已经足够"，但那两条路径被拒绝的原因只是"当时没做"，不是"做不到"。
+> 把"暂时不做"写成"不该做"，会让后来的人失去重新评估的机会。
 >
 > 这与「fixture 不诚实」「旧测试断言的前提失效」是**同一型**：声称某能力不在，其实早有。
 > 区别只是这次说谎的是**文档**。**维护文档时要去代码里核，不能凭印象增删条目。**

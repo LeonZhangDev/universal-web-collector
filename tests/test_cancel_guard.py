@@ -32,6 +32,7 @@ CANCEL_SOURCES = {
     "_download_m3u8",       # 视频链路: download -> _download_m3u8 -> _fetch_segments
     "_download_file",
     "_fetch_segments",
+    "_fetch_one_segment",   # 单片下载: 重试与限速里都会检查取消
     "_ffmpeg_pull",         # ffmpeg 拉流的子进程监控里会检查取消
 }
 

@@ -107,6 +107,11 @@ class Config:
     segment_min_interval: float = 0.15
     segment_max_interval: float = 0.35
     segment_retries: int = 3
+    # ---- 直播录制(DASH type="dynamic")----
+    # 直播没有"下完"这回事, 所以必须给一个**时间上限**: 到点就封成文件收工。
+    # 0 = 不限时(录到用户取消、或源站把清单改成 static 为止)。
+    # ⚠️ 默认给 5 分钟而不是"不限时": 一个会自动跑满磁盘的任务不该是默认行为。
+    live_max_seconds: int = 300
     # 站点级限速分组: 显式声明哪些域名属于同一站点, 共享一个限速器。
     # 例: {"xchina": ["xchina.io", "xchina.co"]}
     # 留空时按注册域自动推断: img.xchina.io 与 cdn.xchina.io 都归到 xchina.io。
@@ -232,6 +237,12 @@ def load(path: Path = None) -> Config:
     if os.environ.get("UWC_PARTIAL_TTL_HOURS"):
         try:
             cfg.partial_ttl_hours = max(0, int(os.environ["UWC_PARTIAL_TTL_HOURS"]))
+        except ValueError:
+            pass        # 写错就沿用默认值: 这条不该有能力让服务起不来
+    if os.environ.get("UWC_LIVE_MAX_SECONDS"):
+        try:
+            # 允许负数/0: 0 及以上都当"不限时"由下载层解释, 负数一律按 0 处理
+            cfg.live_max_seconds = max(0, int(os.environ["UWC_LIVE_MAX_SECONDS"]))
         except ValueError:
             pass        # 写错就沿用默认值: 这条不该有能力让服务起不来
     if os.environ.get("UWC_PARTIAL_STAGING") is not None:

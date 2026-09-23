@@ -37,11 +37,41 @@ class ResourceOut(BaseModel):
     phash: Optional[str] = None
     duplicate_of: Optional[int] = None
     # 失败的机器可读分类(gone/forbidden/corrupt/disk/ratelimit/server/network/
-    # unknown, 见 core/errors.py)。前端用它归类失败原因、画分布图 —— 不再靠正则
+    # unknown/missing, 见 core/errors.py)。前端用它归类失败原因、画分布图 —— 不再靠正则
     # 解析 note 文案(那是拿人看的字当数据用, 文案一改就静默失效)。
     # ⚠️ 注意它也出现在**成功**资源上: error_kind='corrupt' + status='done' 表示
     # "文件保留了, 但解码器说它可能坏了"(见 core/phash.py 的约束 1/4)。
     error_kind: Optional[str] = None
+    # ---- 资源级遥测 ----
+    # 起始/结束时刻(epoch 秒)与"真正发起过几次下载"。前端据此显示一条资源的
+    # 耗时, 详情页再聚合成"最慢的几条" —— 没有它, 慢只能看到一个任务总时长,
+    # 而"120 张各 1 秒"与"119 张各 0.2 秒 + 1 张卡 95 秒"的处置完全不同。
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    attempts: Optional[int] = None
+    # 条件请求凭据(源站给的 ETag / Last-Modified)。界面上不必显示, 但排查
+    # "内容为什么没更新 / 为什么走了 304"时要看得到, 所以随详情一并下发。
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
+
+
+class ResourceTimingItem(BaseModel):
+    id: int
+    type: str = ""
+    status: str = ""
+    name: str = ""
+    ms: float = 0.0
+    attempts: int = 0
+
+
+class ResourceTiming(BaseModel):
+    """任务的逐资源耗时画像(见 database.resource_timing)。"""
+
+    measured: int = 0        # 有完整起止时刻的资源数(未完成的没算进来)
+    avg_ms: float = 0.0
+    max_ms: float = 0.0
+    retried: int = 0         # 尝试次数 > 1 的资源数: "平均很快但一直在重试"是另一种病
+    slowest: List[ResourceTimingItem] = []
 
 
 class ResourceCounts(BaseModel):
@@ -58,10 +88,75 @@ class ResourceCounts(BaseModel):
 class TaskDetail(TaskOut):
     resources: List[ResourceOut]
     resource_counts: ResourceCounts
+    # 逐资源耗时画像。放在详情里而不是单开接口: 它只在打开详情页时用得上,
+    # 多一次往返只会让详情加载更慢。
+    resource_timing: Optional[ResourceTiming] = None
     # 失败分类的中文标签(kind -> 文字)。随详情一起下发而不是让前端硬编码:
     # 前端只用它做展示, 而"gone 该显示成什么"是后端词汇表的一部分 —— 两处各写
     # 一套迟早对不上, 而失败措辞正是用户判断"要不要重试"的依据。
     error_kind_labels: dict = {}
+
+
+# ---- 资源库批量操作 ----
+# 资源库此前只读浏览。"看到那张不要的图, 得先想起它在哪个任务里、再点进那个
+# 任务去删" —— 而资源库恰恰是"我手上有什么"的视角, 批量选择是这个视角下
+# 最自然的动作。
+
+class LibraryBulkDeleteIn(BaseModel):
+    """删除资源库条目。
+
+    ⚠️ `with_files` 默认 False: 删记录**不动文件**。真删文件是不可逆的, 而资源库
+    里同一张图可能被多个任务引用(去重复用), 用户点"删除"时心里想的多半是
+    "这条记录别显示了"。要连文件一起删必须显式打开, 且后端还会按 refs 复查。
+    """
+
+    ids: List[int]
+    with_files: bool = False
+
+
+class LibraryBulkOut(BaseModel):
+    requested: int = 0
+    deleted: int = 0
+    files: int = 0            # 真正从磁盘删掉的文件数
+    bytes: int = 0
+    skipped: List[int] = []   # 不存在/已被别处删掉的 id
+    # 文件被别的任务引用而**保留**的条目 id —— 需要明确告诉用户"文件还在",
+    # 否则他会以为删干净了, 下次在别的任务里又看到同一张图, 变成"删了没用"。
+    kept_files: List[int] = []
+    # id(str) -> 出错原因。删除是**不可逆**的操作, 失败绝不能静默吞掉 ——
+    # 用户看到"删了 3 个"而实际只删掉 2 个, 下次再看到那张图会以为程序有毛病。
+    errors: dict = {}
+
+
+class LibraryVerifyIn(BaseModel):
+    """落盘后完整性巡检。
+
+    ⚠️ 默认只查**有记录**的那些(status='done'): 库里说"下好了"、磁盘上却不在
+    (或长度对不上), 是唯一需要用户知道的情况。失败/已删的行没有文件可核,
+    把它们算进分母只会让"缺失率"这个指标失去意义。
+    """
+
+    task_id: Optional[int] = None   # 只查某个任务; 留空 = 全库
+    limit: int = 500                # 单次扫描上限(大库要分批, 别把接口挂住)
+
+
+class LibraryVerifyItem(BaseModel):
+    id: int
+    task_id: int
+    name: str = ""
+    path: Optional[str] = None
+    kind: str = ""            # missing | corrupt
+    reason: Optional[str] = None
+
+
+class LibraryVerifyOut(BaseModel):
+    checked: int = 0
+    missing: int = 0
+    truncated: int = 0
+    #: 被标记的条目数。**只标记不删除** —— 与 phash / mediacheck 的一贯原则一致:
+    #: 判据可能误报(尤其是"文件被外部程序改小了"这种), 删文件是不可逆的。
+    marked: int = 0
+    items: List[LibraryVerifyItem] = []
 
 
 class TaskListOut(BaseModel):

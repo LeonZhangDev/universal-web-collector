@@ -56,6 +56,7 @@ from .base import (
     safe_filename,
     sha256_file,
     task_session,
+    validators_for,
 )
 from .browser_session import browser_session_for
 from .ratelimit import DomainLimiter
@@ -266,7 +267,7 @@ class VideoDownloader:
 
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None,
-                 info=None, session=None, **kw):
+                 info=None, session=None, etag=None, last_modified=None, **kw):
         # 任务级代理(session)覆盖实例默认(基于全局 settings.proxy)。
         # 每个资源下载前 task_manager 都新建实例(见 DOWNLOADERS[type]()),
         # 故这里覆盖 self.session 不会与并发任务互相污染。
@@ -286,7 +287,11 @@ class VideoDownloader:
                 return self._download_m3u8(url, h, save_dir, progress_cb, log, mirrors,
                                            filename, info)
             return self._download_file(url, h, save_dir, mirrors, progress_cb, log,
-                                       filename, info)
+                                       filename, info,
+                                       # 条件请求只对 mp4 直链有意义; m3u8 是播放
+                                       # 列表, 它的"变没变"由分片自身决定, 把播放
+                                       # 列表的 ETag 当作整段视频的身份是错的。
+                                       validators=validators_for(etag, last_modified))
         finally:
             if self._owns_session:
                 self.close()
@@ -294,7 +299,7 @@ class VideoDownloader:
     # ---- mp4 直链 ----
 
     def _download_file(self, url, headers, save_dir, mirrors, progress_cb, log,
-                       filename=None, info=None):
+                       filename=None, info=None, validators=None):
         out = Path(save_dir)
         out.mkdir(parents=True, exist_ok=True)
         path = resolve_target(save_dir, url, filename, ".mp4")
@@ -308,6 +313,7 @@ class VideoDownloader:
             reject_ct=REJECT_CT,
             info=info,
             request_timeout=SHUTDOWN_IO_TIMEOUT,
+            validators=validators,
         )
         # ⚠️ 落盘后再校验内容。放在这里(而不是下载前)是因为只有此时手上才是完整
         # 文件: 零额外请求、零误判。校验不过就删掉 —— 一份坏字节留在最终位置上会

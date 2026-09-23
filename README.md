@@ -46,6 +46,9 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | GET | /tasks/stats | 采集统计: 总量 / 按状态 / 按采集器 / 近 30 天日期序列 / 失败原因聚合 / 去重报表 |
 | GET | /library | **跨任务资源库**: `q`(搜索) / `kind`(image,text) / `album`(相册名精确匹配) / `task_id` / `page` / `page_size`; 默认只列 `done` 资源, 每条带 `refs`(被多少任务共用) |
 | GET | /library/albums | 资源库内出现过的相册名(仅含有已完成资源的相册) |
+| POST | /library/bulk-delete | **资源库批量删除** `{"ids":[...]}`; `refs > 1` 时只删记录、**保留文件**并如实回报 |
+| GET | /library/archive | 把选中的资源打成 ZIP 流(`ids` 逗号分隔), 不落临时文件 |
+| POST | /library/verify | **落盘后完整性巡检**: 用 `mediacheck` 判缺失/截断, **只标记不删**; 可按 `task_id` 限定范围 |
 | GET | /tasks/{id}/proxy | 该任务代理池状态: 脱敏 spec + 每线路 `{proxy,fails,blocked,blocked_for}` |
 | GET | /tasks/storage | 任务/产出占用概览, 供"清理"界面预检 |
 | GET | /env/diagnose | 环境诊断: Python / 浏览器 / ffmpeg / 磁盘 / 下载目录 五项 ok/warn/fail + 修复提示 |
@@ -61,6 +64,10 @@ make frontend       # 前端开发模式 (http://127.0.0.1:5173)
 | GET | /notifications | 任务结算通知列表 + 未读数 |
 | POST | /notifications/read | 标记通知已读(不传 `ids` 表示全部) |
 | GET | /files/{task_id}/manifest | 产出清单 manifest.json(JSON) |
+| GET | /files/raw | 按资源记录的 `local_path` 回原图(限定在下载根内, 防目录穿越) |
+| GET | /files/thumb | 缩略图(`_meta/thumb/{sha}.jpg` 缓存, 按 `w` 现场生成一次就复用) |
+| GET | /config/bandwidth | 当前全局字节速率上限(bytes/s, 0 = 不限) |
+| POST | /config/bandwidth | 设置全局字节速率上限 `{"rate":"5MB"}`; 桶是**全局共享**的 |
 | GET | /watches | 订阅源列表 |
 | POST | /watches | 新建订阅源 `{"url","collector","interval_minutes"}` |
 | POST | /watches/{id}/run | 立即巡检一次 |
@@ -519,10 +526,93 @@ python scripts/selfcheck.py --reset-profile
 契约未变 —— 画像只是线索, 写不进去仍然不该让采集失败。区别是"写不进去"从常态变回了
 罕见。它同时也正是本仓库测试套件偶发变红的原因, 所以这一版顺手收掉。
 
+## 深度能力: 遥测 / 缩略图 / 限速 / 批量 / 巡检(V34)
+
+V33 修的是"结果是错的", V34 补的是"看不了、管不住、查不出" —— 八项一次做完,
+另有两个"看不见"的问题一并收掉。
+
+### 资源级遥测
+
+`resources` 加三列: `started_at` / `finished_at` / `attempts`。
+
+- 写入点只有一个(`begin_resource_attempt` / `finish_resource_attempt`), 由
+  `task_manager` 在下载前后各调一次; `resume` 与手动重试会把 `attempts` **清零重算**,
+  否则界面上的"重试 7 次"会横跨好几轮, 看不出这一轮到底试了几次。
+- 任务详情据此给出**最慢的几条**与"重试过的行" —— 之前只能看到聚合总时长,
+  无法回答"这个任务为什么慢"。
+
+### 缩略图(顺带修掉一个从不存在的接口)
+
+资源库网格一直引用 `/files/raw`, 而**这个接口根本不存在** —— 图片全是 404。
+因为它走 `<img onerror>` 把失败的图藏起来, 界面看起来只是"没有缩略图", 而不是报错。
+
+现在两条路径都补齐:
+
+- `/files/raw`: 按资源记录的 `local_path` 回原图, **限定在下载根内**(防目录穿越);
+- `/files/thumb`: `core/thumbs.py` 用 ffmpeg 生成, 缓存在 `_meta/thumb/{sha}.jpg`,
+  **同一内容只生成一次**(按 sha 命名, 与文件在哪无关); 网格改用缩略图。
+
+### 条件请求(ETag / Last-Modified)
+
+下载前带上 `If-None-Match` / `If-Modified-Since`; 服务器答 304 且本地文件在 →
+**复用本地副本, 一个字节都不传**。
+
+⚠️ **有 `Range` 时不能带条件头**: 带 `Range` 时若本地那份已是最新, 服务器会以 304
+而不是 206 回答 —— 于是"416 = 本地已完整"那条断点续传的收尾路径永远走不到, 续传再也
+没机会收尾。两条路是互斥的, 让位规则写死在 `_stream_one` 里。
+
+### 全局字节速率上限
+
+`max_download_bytes_per_sec`(或 `UWC_MAX_BPS`), 支持 `5MB` / `512k` 这类写法。
+与"请求数/秒"是**两件事**: 令牌桶只改突发, 字节桶才真正限带宽。
+
+- 桶是**全局共享**的(不分域名) —— 想控的总量本来就是"我这个程序总共能占多少带宽";
+- 节流点必须保持**可取消**: 等额度时用可中断的等待, 否则"停止"会在限速场景下卡住;
+- 配置可在环境诊断面板里当场改, 立即生效(不需要重启)。
+
+### 资源库批量操作
+
+- `POST /library/bulk-delete`: 先按 `refs` 判引用, `refs > 1` 时**只删记录、保留文件**
+  并如实回报(还有别的任务指着它);
+- `GET /library/archive`: 选中资源打 ZIP 流, 边打边吐, 不落临时文件。
+
+### 落盘后完整性巡检
+
+`POST /library/verify`: 用 `core/mediacheck.py` 巡检库里的文件 —— 区分**缺失**
+(文件被外部删了)与**截断**(大小不对)。**只标记不删**, 新增 `error_kind='missing'`。
+
+> 为什么"只标记": 巡检的判据是算术推断, 误报的代价是删掉一个好文件。V33 建立的原则
+> 在这里继续适用 —— 只下"能被证明"的结论, 认不出的一律放行。
+
+### 熔断状态持久化
+
+`core/proxy_health.py`: 按**代理 URL**分桶(跨任务全局, 不按任务), 重启后熔断结论还在。
+
+它与 CDN 画像现在共用 `core/jsonstore.py` 的四条并发纪律 —— "读写都进 `RLock` +
+`replace` 退避重试 + 写不进去不假装成功"**只有一份实现**。手写第二遍 = 少一条纪律
+= 又是静默丢一半(V33 的原话)。
+
+### Pexels 集合/搜索页
+
+`/v1/search` 与 `/v1/collections/{id}` 分页拉取, 兼容 `photos` 与 `media` 两种返回形状
+(后者每项外面还包了一层 `{type:"Photo", ...}`)。只认一种的话, 另一种会表现为
+"集合是空的"而不是报错, 用户完全无从判断是没图还是我们解析错了。
+
+### 收掉: 测试隔离的窗口期
+
+测试套件的 `monkeypatch.undo()` 会把 `DB_PATH` 还原成**真实路径**, 于是在"某个用例
+teardown 之后、下一个用例 setup 之前"那段窗口里, 任何数据库访问都会落到**用户的真库**
+上(能在那段窗口里干活的: 看门狗的心跳线程、没关闭的 `TestClient` portal 线程、
+别处 fixture 的终结器)。
+
+原来的指纹守卫只能**事后**发现"文件变了", 而且 `_migrate` 是**幂等**的 —— 加一列之后
+真实库就永久"正确"了, 再犯同样的错也看不出来。所以 V34 把判据下沉到**打开的那一刻**
+(`isolation.install_real_db_guard()`), 带调用栈失败。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (819 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发)
+make test           # pytest (880 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)

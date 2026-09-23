@@ -16,9 +16,12 @@
 ## 关键文件
 `api/tasks.py`(HTTP+SSE) · `core/task_manager.py`(状态机/看门狗) · `core/database.py`(加列必须进 `_MIGRATIONS`)
 `core/filters.py`(有效资源唯一定义 `match_resource`) · `core/errors.py` · `core/disk.py` · `core/layout.py`
-`core/phash.py`(只标记不删) · `core/cdn_profile.py` · `core/manifest.py`
+`core/phash.py`(只标记不删) · `core/mediacheck.py`(容器完整性**算术**判据) · `core/manifest.py`
+`core/cdn_profile.py` · `core/proxy_health.py`(代理熔断持久化) · **`core/jsonstore.py`**(JSON 状态存储唯一实现)
+`core/thumbs.py`(缩略图 `_meta/thumb/{sha}.jpg`，**按 sha 不按路径**)
 `collectors/gallery_base.py`(SequenceGallerySpider/GallerySite/check_site) · `collectors/hls.py` · `collectors/scores.py`
-`downloaders/base.py` · `downloaders/ratelimit.py`(令牌桶+AIMD) · `main.py`(lifespan)
+`downloaders/base.py` · `downloaders/ratelimit.py`(请求令牌桶 + **全局字节桶**) · `main.py`(lifespan)
+`tests/isolation.py`(共享状态隔离清单 + **真实库即时守卫**) · `tests/conftest.py`
 
 ## ⚠️ 六条"静默"坑（细节见 PITFALLS）
 1. **次序即契约**：先 `_write_manifest` 再 `_settle_status`；`_settle_status` 不得抛。
@@ -49,7 +52,8 @@ python scripts/verify_output.py            # 40 项断言
 python scripts/verify_hls.py               # 18 项断言
 python scripts/selfcheck.py                # 站点声明自检 + CDN 画像快照
 ```
-环境变量：`UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` / `UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_FFMPEG` / `UWC_CDN_PROFILE`
+环境变量：`UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` / `UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_FFMPEG` /
+`UWC_CDN_PROFILE` / `UWC_PROXY_HEALTH` / `UWC_MAX_BPS`（全局字节速率上限，`5MB`/`512k` 写法）
 
 ⚠️ **行尾**：`Path.write_text()` 在 Windows 上默认把 `\n` 翻成 `\r\n`；本仓库 `core.autocrlf=false`
 且无 `.gitattributes`，git 原样存盘 → Python 改写过的文件会**整份变 CRLF**（diff 71 行炸到 415 行）。
@@ -105,6 +109,33 @@ V32 加 Pexels 时，自写 `parse_gid(strict=False)` 把 xchina 的 `/photo/id-
 150 次；它也正是测试套件偶发变红的根源）。修：`RLock` + 读者进临界区 + `replace` 退避重试。
 ⚠️ 必须 `RLock`：`record_hit` 在同一次读-改-写里调 `_read`/`_write`，两者也要加锁，普通 Lock 自锁死。
 
+## ⚠️ 第 11 条静默坑：前端引用了一个**从来不存在**的接口
+V34 发现资源库网格一直引用 `/files/raw` —— 这个接口**从来没实现过**（V32 加资源库时写的）。
+图片全是 404，但走 `<img onerror>` 把失败的图藏起来，**界面看起来只是"没有缩略图"而不是报错**。
+静默失败的新变体：**请求根本没成功，却没有任何信号**。
+通用教训：`<img>/<video>` 的 `onerror` 只该用于"这一项没有"，不该用于掩盖"整个功能没接上" ——
+后者必须有一条能看见的痕迹（至少 console 一次）。接线新前端功能时，**接口存在性要当场验一次**。
+
+## ⚠️ 测试隔离的"窗口期"：`monkeypatch.undo()` 会把 DB_PATH 还原成真实路径
+`tests/isolation.py` 的隔离靠 `monkeypatch.setattr`，于是 teardown 的 `undo()` 之后、
+下一个用例 setup 之前有一段窗口 —— 谁在这段里访问数据库，就写到**用户的真库**上。
+能干这活儿的：看门狗心跳线程、没 `close()` 的 `TestClient` portal 线程、别处 fixture 的终结器。
+⚠️ **指纹守卫不够**：① 只能事后发现"变了"，且 `_migrate()` 幂等 → **同一次变更只能逮到一次**；
+② 报错只有"db 变了"，**没有是谁改的**。
+修：`isolation.install_real_db_guard()` 包装 `db.get_conn`，在**打开的那一刻**判路径并带调用栈失败。
+两道闸各管一段：即时守卫抓"谁干的"，指纹守卫兜"清单漏登记"。
+
+## ⚠️ 旧断言的前提会失效：改了产品能力，回头问旧测试还成立吗
+V34 实现了 Pexels 集合页，而 `test_features_v32.py::test_pexels_collections_unsupported`
+断言的正是"集合页报不支持"。**产品加了能力，就回头问旧测试的前提** —— 与"fixture 也要诚实"
+是同一条教训，只是这次说谎的是**断言**。看到"新功能做完，旧的某条测试红了"先想这个，
+别急着改产品去迁就它。
+
+## ⚠️ 条件请求与断点续传**互斥**：有 `Range` 时不能带 `If-None-Match`
+本地那份恰是最新时，服务器对带 `Range` 的请求会答 **304 而不是 206** —— 于是
+"416 = 本地已完整"那条 `_prepare_resume` 的收尾路径**永远走不到**，`.part` 再也收不了尾。
+让位规则写死在 `_stream_one`（有 `offset` 就不加条件头）。
+
 ## ⚠️ fixture 也要诚实：产品加了校验，就回头问 fixture 还成立吗
 V33 给直链加内容终检后，`verify_output.py` 的"假 mp4"被**正确地**判成坏文件删掉，红的却是
 "视频任务应当成功"—— 根因在 fixture 说谎。同类共三处（假 mp4 / `verify_hls` 未收尾的播放列表 /
@@ -144,3 +175,15 @@ V33 给直链加内容终检后，`verify_output.py` 的"假 mp4"被**正确地*
   ⑤ `verify_output.py` mp4 fixture 换成内嵌真实容器 ⑥ `verify_hls.py` 加 `-hls_playlist_type vod`
   + 素材自检。⚠️ 测试基线 **819**（813 passed / 6 skipped），别再拿 587/808 当基准。
   **新增第 9、10 条静默坑（见上）。**
+- V34（`9c7a666` 之后）：**把 V33 列出的八项 backlog 一次做完** — ① 资源级遥测
+  （`started_at`/`finished_at`/`attempts`，写入点收拢成 `begin/finish_resource_attempt`；
+  resume/重试**清零重算** attempts）② 缩略图 `core/thumbs.py` + `/files/raw`/`/files/thumb`
+  （**顺带修掉 `/files/raw` 从来不存在**，见第 11 条）③ 条件请求 ETag/Last-Modified
+  （**有 Range 时让位**，见上）④ 全局字节速率上限 `UWC_MAX_BPS` + `/config/bandwidth`
+  ⑤ 资源库 `/library/bulk-delete`（按 `refs` 判是否真删）与 `/library/archive`（zip 流）
+  ⑥ 完整性巡检 `POST /library/verify`（缺失/截断，新增 `error_kind='missing'`，**只标记不删**）
+  ⑦ 熔断持久化 `core/proxy_health.py`（按代理 URL 分桶，跨任务全局）⑧ Pexels 集合页
+  `/v1/collections/{id}`（兼容 `photos`/`media` 双形状）。
+  新增 `core/jsonstore.py` —— 与 `cdn_profile` **共用**四条并发纪律，**别为新状态文件手写第二遍**。
+  ⚠️ 测试基线 **880**（874 passed / 6 skipped）；前端 90 modules / 209.35 kB。
+  **新增第 11 条静默坑 + 测试隔离窗口期 + 旧断言前提失效（见上）。**

@@ -2347,3 +2347,184 @@ DECODE_FAILED = "decode_failed"  # ffmpeg 在, 但解不开 —— 文件可疑
 | `tests/test_task_summary.py` | 改：`gone` 口径（含新增一条语义测试） |
 | `tests/test_ffmpeg.py` | 改：直链终检契约 + 坏文件删除 |
 | `tests/test_features_v32.py` | 新增：30 项 |
+
+---
+
+# 13. V34 — 深度能力: 遥测 / 缩略图 / 限速 / 批量 / 巡检
+
+V33 修的是"跑通了但结果是错的"；V34 补的是三类缺口：**看不了**（没有资源级耗时）、
+**管不住**（没有字节限速、资源库只能看不能动）、**查不出**（文件被外部删了不知道）。
+八项一次做完，另收掉两个"静默"问题。
+
+## 13.1 资源级遥测
+
+`resources` 加三列：`started_at` / `finished_at` / `attempts`。
+
+| 决定 | 理由 |
+| --- | --- |
+| 写入点收拢到 `begin_resource_attempt` / `finish_resource_attempt` | "开始"与"结束"必须成对，散在各分支里迟早漏一处，漏了就是"耗时永远为空" |
+| `resume`/手动重试**清零重算** `attempts` | 否则界面上的"重试 7 次"横跨好几轮，看不出**这一轮**试了几次 |
+| 时间戳用 `now_ts()`（带毫秒） | 秒级精度下"两张图各 0 秒"，看不出哪张慢 |
+
+## 13.2 缩略图 —— 附带修掉一个从不存在的接口
+
+⚠️ **前端资源库引用的 `/files/raw` 从来没有实现过。** 图片全是 404，但因为走
+`<img onerror>` 把失败图藏起来，界面看起来只是"没有缩略图"，**不是报错**。
+这是"静默失败"的又一个变体：**请求根本没成功，但没有任何信号**。
+
+现在两条路径都补齐：
+
+- `/files/raw`：按 `local_path` 回原图，**必须限定在下载根内**（防目录穿越 —— 库里的
+  路径来自数据库，而数据库可能被手工改过）；
+- `/files/thumb`：`core/thumbs.py`，缓存到 `_meta/thumb/{sha}.jpg`。
+
+| 决定 | 理由 |
+| --- | --- |
+| 缓存按 **sha** 命名，不按原文件路径 | 同一内容可能在多个任务下各有一份副本（复用），按 sha 命名后**只生成一次** |
+| 生成失败**不**抛错，返回原图 | 缩略图是优化，缺 ffmpeg 时该退化成原图而不是让整个网格崩掉 |
+| `w` 参与缓存键 | 不同宽度的请求不能命中同一份缓存 |
+
+## 13.3 条件请求（ETag / Last-Modified）
+
+下载前带 `If-None-Match` / `If-Modified-Since`；服务器答 304 且本地文件在 → 复用本地
+副本，**一个字节都不传**（`info["not_modified"] = True`，调用方据此写日志与进度）。
+
+⚠️ **有 `Range` 时不能带条件头 —— 这是本节唯一容易写错的地方。**
+
+带 `Range` 时若本地那份恰好已是最新，服务器会以 **304 而不是 206** 回答。于是：
+
+```
+_prepare_resume 准备了 Range  →  服务器答 304  →  走不到"416 = 本地已完整"那条收尾路径
+                                              └→  .part 永远收不了尾, 续传变成死循环
+```
+
+两条路是**互斥**的，让位规则写死在 `_stream_one` 里（有 `offset` 就不加条件头）。
+测试 `test_range_takes_precedence_over_conditional_headers` 钉住它。
+
+## 13.4 全局字节速率上限
+
+`max_download_bytes_per_sec`（或 `UWC_MAX_BPS`），支持 `5MB` / `512k` / `3.5MB` 写法
+（`core/config.parse_bytes_per_sec`，认不出返回 0 = 不限，**不抛错** —— 用户手写配置
+不该让服务起不来）。
+
+| 决定 | 理由 |
+| --- | --- |
+| 桶**全局共享**，不分域名 | 用户想控的是"我这个程序总共占多少带宽"，不是"每个站各占多少" |
+| 与"请求数/秒"是两件事 | 令牌桶只改突发；`domain_min_interval` 决定长程平均**请求**速率。两者互补，不能互相替代 |
+| 节流点必须**可取消** | 等额度时用可中断等待（`progress_cb` 为哨兵）—— 否则限速场景下点"停止"会卡到这一块下完 |
+| 配置可在诊断面板当场改 | 限速是"边下边看视频"时才想起来的，要重启就没人用了 |
+
+## 13.5 资源库批量操作
+
+- `POST /library/bulk-delete`：先算 `refs`，`refs > 1` 时**只删记录、保留文件**并如实回报
+  （还有别的任务指着它）—— 与 `DELETE /tasks/{id}` 的口径一致；
+- `GET /library/archive`：选中资源打 ZIP 流，边打边吐，**不落临时文件**。
+
+> 落盘语义与 `tasks/{id}/archive` 共用 `_zip_stream` + `_dedup_name`：
+> 同名文件在 zip 里加 `(2)` 后缀，而不是互相覆盖。
+
+## 13.6 落盘后完整性巡检
+
+`POST /library/verify`：用 `core/mediacheck.py` 巡检 —— 区分**缺失**（文件被外部删了）
+与**截断**（大小不对），新增 `error_kind='missing'`。
+
+⚠️ **只标记不删。** 判据是算术推断，误报的代价是删掉一个好文件。V33 的原则在这里继续
+适用：只下"能被证明"的结论，认不出的一律放行。
+
+## 13.7 状态文件统一并发纪律 —— `core/jsonstore.py`
+
+`cdn_profile`（V33 修过）与新的 `proxy_health` 现在共用同一份实现。四条纪律：
+
+1. 读写都进 **`RLock`**（必须可重入：读-改-写要在一次临界区里同时调 `_read`/`_write`）；
+2. `tmp` + `replace` 原子落盘；
+3. `replace` 加**退避重试**（Windows 上外部句柄占用是锁挡不住的）；
+4. 写不进去**不假装成功**（留可观测痕迹）。
+
+⚠️ **不要为新状态文件手写第二遍。** 手写一遍 = 少一条纪律 = 又是静默丢一半
+（V33 实测 300 次写丢 150 次的原话）。
+
+## 13.8 收掉: 测试隔离的"窗口期"
+
+`monkeypatch.undo()` 会把 `DB_PATH` 还原成**真实路径**。于是在
+
+```
+某个用例 teardown 之后  →  [ 窗口期 ]  →  下一个用例 setup 之前
+```
+
+这段窗口里，任何数据库访问都落到**用户的真库**上。能在这段窗口里干活的：
+
+- 看门狗的心跳线程（`tasks.hb`）；
+- 没被 `close()` 的 `TestClient` 的 portal 线程；
+- 别处 fixture 的终结器。
+
+⚠️ **为什么指纹守卫（`snapshot_real` / `changed_keys`）不够**：
+
+1. 它只能**事后**发现"文件变了"，而且同一次变更**只能发现一次** —— `_migrate()` 是
+   **幂等**的，加一列之后真实库就永久"正确"了，再犯同样的错也看不出来；
+2. 报错只有"db 变了"，**没有是谁改的**，复盘要重新反推。
+
+所以 V34 把判据下沉到**打开的那一刻**：
+
+```
+isolation.install_real_db_guard()   # 由 conftest 的会话夹具调用一次
+    └→ 包装 db.get_conn: DB_PATH 解析后等于真实库路径 → 带调用栈 AssertionError
+```
+
+两道闸各管一段：**即时守卫**抓住"谁干的"，**指纹守卫**兜住"清单漏登记"。
+（本机跑真实环境时 `UWC_TEST_ALLOW_REAL_WRITE=1` 一起关掉。）
+
+## 13.9 Pexels 集合/搜索页
+
+`/v1/search` 与 `/v1/collections/{id}` 分页拉取，每页 80 张，直到 `max_items` 或翻完。
+
+⚠️ **集合端点的返回形状与搜索页不同，而且站点在不同版本里用过两种**：顶层是 `photos`
+或 `media`（后者每项外面还包了一层 `{type:"Photo", ...}`）。**两种都认** —— 只认一种的话
+另一种会表现为"集合是空的"，**而不是报错**，用户完全无从判断是没图还是我们解析错了。
+
+搜索页与集合页共用 `_api_get`，把每种失败翻译成"用户能照做的一句话"（401 → 查 key、
+429 → 说清免费额度、非 JSON → 可能被网关拦了）。两处各写一遍迟早漏掉一种，而漏掉的那种
+会以"任务失败但不知道为什么"的形式出现。
+
+## 13.10 验证（2026-09-23）
+
+| 项目 | 结果 |
+| --- | --- |
+| 新增 `tests/test_features_v34.py` | 59 项 |
+| `tests/test_isolation.py` | +2 项（即时守卫的命中与放行） |
+| 全量 pytest（CI 等价环境：`uv sync --group dev`，含 `curl-cffi`） | **874 passed / 6 skipped**（共 880 用例） |
+| `verify_output.py` / `verify_hls.py` | 40 项 / 18 项断言 |
+| `selfcheck.py` | 站点声明自洽（xchina 画像未变） |
+| 前端 `vite build` | 90 modules / 209.35 kB |
+
+⚠️ **V34 改了 `tests/test_features_v32.py` 的一条断言**：`test_pexels_collections_unsupported`
+断言"集合页报不支持"，而 V34 正好实现了它。**产品加了能力，就回头问旧测试的前提还成立吗**
+—— 这与 V33 的 fixture 诚实性是同一条教训，只是这次"说谎"的是断言而不是 fixture。
+
+## 13.11 新增/改动文件（V34）
+
+| 文件 | 性质 |
+| --- | --- |
+| `backend/core/jsonstore.py` | **新增**：共享 JSON 状态存储（四条并发纪律的唯一实现） |
+| `backend/core/proxy_health.py` | **新增**：代理熔断持久化（按代理 URL 分桶，跨任务全局） |
+| `backend/core/thumbs.py` | **新增**：缩略图生成 + `_meta/thumb/{sha}.jpg` 缓存 |
+| `backend/core/database.py` | 改：遥测三列 + `etag`/`last_modified` + `begin/finish_resource_attempt`、`find_resource_by_path`、`resource_refs`、`done_resources_for_scan` |
+| `backend/core/errors.py` | 改：`KIND_MISSING` + 标签 |
+| `backend/core/config.py` | 改：`max_download_bytes_per_sec` + `UWC_MAX_BPS` + `parse_bytes_per_sec` |
+| `backend/core/cdn_profile.py` | 改：迁到 `jsonstore`（行为不变，实现合一） |
+| `backend/core/task_manager.py` | 改：遥测写入点、条件请求凭据透传、巡检资源枚举 |
+| `backend/downloaders/base.py` | 改：`validators` 入参、304 复用、`Range` 让位、字节桶节流、`ProxyPool` 接 `proxy_health` |
+| `backend/downloaders/ratelimit.py` | 改：全局字节令牌桶 + `throttle_bytes` / `set_byte_rate` |
+| `backend/downloaders/image.py` / `file.py` / `text.py` / `video.py` | 改：`session`/`info`/`validators` 统一透传 |
+| `backend/api/tasks.py` | 改：`/files/raw`、`/files/thumb`、`/library/bulk-delete`、`/library/archive`、`/library/verify`、`/config/bandwidth` |
+| `backend/models/schemas.py` | 改：遥测字段、`LibraryBulk*`、`LibraryVerify*`、`ByteRateIn`、`resource_timing` |
+| `backend/collectors/stockphotos/spider.py` | 改：集合页 + 搜索页分页、`_api_get` 统一失败语义、`photos`/`media` 双形状 |
+| `backend/collectors/stockphotos/pexels.py` | 改：声明补集合页输入形态 |
+| `frontend/src/api.js` | 改：新增六个接口 |
+| `frontend/src/components/LibraryPanel.vue` | 改：多选工具条、缩略图网格、巡检结果 |
+| `frontend/src/components/TaskDetail.vue` | 改：耗时列、重试次数、"最慢的几条"块 |
+| `frontend/src/components/EnvDiagnose.vue` | 改：带宽设置 |
+| `tests/isolation.py` | 改：`install_real_db_guard()` 即时守卫 |
+| `tests/conftest.py` | 改：代理健康隔离 + 接入即时守卫 |
+| `tests/test_features_v34.py` | **新增**：59 项 |
+| `tests/test_features_v32.py` | 改：集合页断言（前提已失效） |
+

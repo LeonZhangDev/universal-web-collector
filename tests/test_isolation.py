@@ -9,6 +9,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import core.database as db
 import isolation
 from core.config import settings
@@ -94,6 +96,41 @@ def test_changed_keys_detects_writes():
 def test_changed_keys_notices_missing_entries():
     """键被整个删掉(如库文件被重建)同样算脏写。"""
     assert isolation.changed_keys({"db": (1, 2)}, {}) == ["db"]
+
+
+def test_real_db_guard_fires_on_the_users_db(monkeypatch):
+    """真要打开**用户真实库**时必须当场失败, 且报错里带调用栈。
+
+    这道即时守卫补的是指纹守卫抓不到的那一段: `monkeypatch.undo()` 会把 DB_PATH 还原成
+    真实路径, 于是"某个用例 teardown 之后、下一个用例 setup 之前"任何 DB 访问都落到用户
+    的真库上(心跳线程 / 没关闭的 TestClient / 别处 fixture 的终结器)。指纹守卫只能事后
+    发现"变了", 而 `_migrate` 是幂等的 —— 同一次变更只能逮到一次。
+
+    报错里必须带调用栈: 只有"db 变了"三个字的话, 复盘要重新反推是谁干的。
+    """
+    isolation.install_real_db_guard()      # 会话夹具已装; 幂等, 这里只是明示依赖
+    assert isolation._REAL_DB_GUARD_ON, (
+        "守卫没装上就不能往下走 —— 下面那次 get_conn() 会真的打开用户的库"
+    )
+    monkeypatch.setattr(db, "DB_PATH", isolation.real_paths()["db"])
+    monkeypatch.setattr(db, "_conn", None)
+
+    with pytest.raises(AssertionError) as ei:
+        db.get_conn()
+
+    msg = str(ei.value)
+    assert "真实库" in msg, "报错要说清是「用户真实库」, 不然会被当成普通断言失败"
+    assert "调用栈" in msg and "test_isolation" in msg, "必须能看出是谁打开的"
+
+
+def test_real_db_guard_lets_the_temp_db_through(monkeypatch, tmp_path):
+    """临时库必须放行 —— 守卫宁可漏也不能误报, 误报等于整轮测试跑不下去。"""
+    isolation.install_real_db_guard()
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ok.db")
+    monkeypatch.setattr(db, "_conn", None)
+
+    assert db.get_conn() is not None
+    assert (tmp_path / "ok.db").is_file()
 
 
 def _tasks_in(path):

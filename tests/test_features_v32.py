@@ -409,13 +409,48 @@ def test_pexels_single_rejects_bad_id(monkeypatch):
         spider.crawl("https://www.pexels.com/photo/no-digits-here/")
 
 
-def test_pexels_collections_unsupported(monkeypatch):
-    """集合页明确报"暂不支持", 而不是把它当成搜索词搜出一个无关结果。"""
+def test_pexels_collection_uses_the_collection_endpoint(monkeypatch):
+    """集合页走 `/collections/{id}` 端点, **不是**把 slug 当搜索词。
+
+    ⚠️ 这条替换了 V32 时期的 `test_pexels_collections_unsupported`。当时集合页
+    是明确报"暂不支持"的(拿集合 slug 去搜会得到一个无关的结果集, 比报错更糟)。
+    V34 实现了集合采集, 于是那条断言的前提没了 —— 但要守住的东西没变:
+    **输入形态必须被正确区分**, 只是判据从"报错"变成"打对了端点"。
+
+    V32 的旧用例还有一个副作用: 它会真的发出网络请求(拿到 401 而不是预期文案),
+    所以这里把会话整个换成替身 —— 单测不该依赖外网。
+    """
+    import collectors.stockphotos.spider as S
+
     monkeypatch.setenv("PEXELS_API_KEY", "dummy")
-    spider = PexelsSpider()
-    with pytest.raises(ValueError) as ei:
-        spider.crawl("https://www.pexels.com/collections/nature-abc123/")
-    assert "集合" in str(ei.value)
+    seen = []
+
+    class Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"photos": [{"id": 5, "src": {"original": "https://i.p.com/5.jpeg"}}],
+                    "next_page": None}
+
+        @staticmethod
+        def raise_for_status():
+            pass
+
+    class Sess:
+        def get(self, url, **kw):
+            seen.append((url, kw.get("params")))
+            return Resp()
+
+    monkeypatch.setattr(S, "_session", lambda: Sess())
+    out = S.PexelsSpider().crawl("https://www.pexels.com/collections/nature-2sx8z9c/")
+
+    assert len(out) == 1 and out[0]["url"] == "https://i.p.com/5.jpeg"
+    # 端点正确 + slug 被换成 ID(拿 slug 去请求只会得到与"集合不存在"无法区分的 404)
+    url, params = seen[0]
+    assert url.endswith("/collections/2sx8z9c"), url
+    # 而且**不能**带 query 参数 —— 那是搜索端点的形状
+    assert "query" not in (params or {})
 
 
 def test_pexels_single_detects_missing(monkeypatch, tmp_path):

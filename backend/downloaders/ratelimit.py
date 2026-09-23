@@ -369,3 +369,110 @@ def domain_slot(url, log=None, progress_cb=None):
     if cooldown_left(url) > 0:
         _await_cooldown(url, log=log, progress_cb=progress_cb)
     return _limiter(site_key(url)).slot(progress_cb=progress_cb)
+
+
+# ---- 全局字节速率 ----
+#
+# 与 DomainLimiter 的分工**不是**同一个东西的两档, 而是两个正交的维度:
+#   * DomainLimiter 管"多少请求/秒" —— 保护站点, 防封禁;
+#   * ByteRateLimiter 管"多少字节/秒" —— 保护本机带宽与其他人的使用体验。
+# 图集站上两者缺一不可: 1000 张小图可以请求数很低账面很礼貌, 却把上行占满;
+# 一个大视频则相反(请求 1 个, 带宽吃满 10 分钟)。
+#
+# ⚠️ 为什么是**全局单例**而不是按站点/按任务: 用户说的"限速 5MB/s"指的是"这台机器
+# 别跑满", 与在采哪个站、开了几个任务无关。按站点分会变成"3 个任务 = 3 倍带宽",
+# 那就不叫上限了。
+
+#: 字节桶的突发额度(秒)。攒满 1 秒的额度即停 —— 再大就失去限速意义了。
+_BYTE_BURST_SECONDS = 1.0
+
+
+class ByteRateLimiter:
+    """全局字节令牌桶。`rate <= 0` 表示不限速(默认)。"""
+
+    def __init__(self, rate=0):
+        self._rate = float(rate or 0)
+        self._lock = threading.Lock()
+        self._tokens = self._burst()
+        self._updated = time.monotonic()
+
+    def _burst(self):
+        return max(1.0, self._rate * _BYTE_BURST_SECONDS)
+
+    @property
+    def rate(self):
+        with self._lock:
+            return self._rate
+
+    def set_rate(self, rate):
+        """运行时改速率(测试与诊断用)。0 = 关闭限速。"""
+        with self._lock:
+            self._rate = float(rate or 0)
+            self._tokens = self._burst()
+            self._updated = time.monotonic()
+
+    def throttle(self, nbytes, progress_cb=None, sleep=None):
+        """按令牌桶为这 n 个字节等够时间, 返回实际等待的秒数。
+
+        ⚠️ 等待必须可中断且**要回调 progress_cb**: 限速会把一次下载拉得很长
+        (1GB @ 1MB/s = 17 分钟), 期间若不给心跳, 看门狗会把这个任务判成"卡住了"
+        并取消掉 —— 限速本身反而变成了故障源。`_interruptible_wait` 每 100ms
+        回调一次, 正好满足"心跳+取消检查"这两个要求。
+
+        ⚠️ 锁内只算不睡, 与 `DomainLimiter._wait_token` 同理: 持锁 sleep 会把
+        所有并发下载串行化, 限速器会变成一把全局互斥锁。
+        """
+        try:
+            nbytes = int(nbytes)
+        except (TypeError, ValueError):
+            return 0.0
+        if nbytes <= 0:
+            return 0.0
+        with self._lock:
+            if self._rate <= 0:
+                return 0.0
+            now = time.monotonic()
+            # 先按流逝时间补额度, 再扣本块。额度上限 = 1 秒的量。
+            self._tokens = min(
+                self._burst(), self._tokens + (now - self._updated) * self._rate
+            )
+            self._updated = now
+            self._tokens -= nbytes
+            if self._tokens >= 0:
+                return 0.0
+            wait = -self._tokens / self._rate
+            # 欠债用"等"来还, 还清即额度归零(不能继续背着负数, 否则下一块会重复计息)
+            self._tokens = 0.0
+        (sleep or _interruptible_wait)(wait, progress_cb)
+        return wait
+
+
+#: 全局字节闸门。进程内唯一 —— 见上面的说明。
+bytes_limiter = ByteRateLimiter()
+
+
+def throttle_bytes(nbytes, progress_cb=None):
+    """下载循环每写一块就调一次。**不允许抛异常**: 限速是优化, 不是流程的一环。"""
+    try:
+        # 每块都对一次配置: 限速值是**运行期能改**的(诊断接口/配置文件热改),
+        # 而桶在导入时就建好了。不做这一步的话, "改了配置没反应"会成为一个
+        # 新的静默坑 —— 而它恰好最容易被归因成"限速根本没生效"。
+        # ⚠️ 比较是 O(1) 的整数比较, 且不在桶的锁内, 对热路径无影响。
+        configured = float(getattr(settings, "max_download_bytes_per_sec", 0) or 0)
+        if configured != bytes_limiter.rate:
+            bytes_limiter.set_rate(configured)
+        return bytes_limiter.throttle(nbytes, progress_cb)
+    except Exception:
+        return 0.0
+
+
+def set_byte_rate(rate):
+    """设置全局字节上限(bytes/s); 0 = 不限。返回生效值。
+
+    ⚠️ 同时写回 `settings`: 配置是单一事实源, 只改桶的话下一块就会被
+    `throttle_bytes` 的配置同步逻辑覆盖回去 —— 表现为"接口调了没反应"。
+    """
+    value = max(0, int(rate or 0))
+    settings.max_download_bytes_per_sec = value
+    bytes_limiter.set_rate(value)
+    return value

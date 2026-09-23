@@ -116,6 +116,11 @@ KIND_DISK = "disk"              # 磁盘满/不可写
 KIND_RATELIMIT = "ratelimit"    # 429: 站点要求减速
 KIND_SERVER = "server"          # 5xx: 站点自己出错
 KIND_NETWORK = "network"        # 连接/超时/TLS
+#: 库里有记录、磁盘上却没有(或长度变了)。与 gone/corrupt 的分工:
+#: gone = 源站没了, corrupt = 字节坏了, missing = **我们本地这部分不见了**。
+#: ⚠️ 单独一类是必要的: 用户看到"文件不见了"时的第一个反应是"程序把我的文件删了",
+#: 而这三者的取证方向完全不同(查源站 / 查网络 / 查本地是谁动的)。
+KIND_MISSING = "missing"        # 落盘后本地文件被外部删除
 KIND_UNKNOWN = "unknown"        # 分类之外 —— 通常是我们自己的 bug
 
 #: 归属于"不让你访问"而非"不存在"的状态码。
@@ -167,6 +172,7 @@ KIND_LABELS = {
     KIND_RATELIMIT: "被站点限速",
     KIND_SERVER: "源站服务端错误",
     KIND_NETWORK: "网络中断或超时",
+    KIND_MISSING: "本地文件已丢失",
     KIND_UNKNOWN: "未知原因",
 }
 

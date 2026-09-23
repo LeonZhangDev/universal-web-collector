@@ -23,9 +23,11 @@ from collectors.gallery_base import (
 from core import database as db
 from core import events
 from core import layout
+from core import mediacheck
+from core import thumbs
 from core.config import settings
 from core.content_identity import canonical_content_key
-from core.errors import KIND_LABELS
+from core.errors import KIND_CORRUPT, KIND_LABELS, KIND_MISSING
 from core.filters import parse_size
 from core.manifest import read_manifest
 from core.task_dedup import create_or_dispose
@@ -36,12 +38,19 @@ from core.task_manager import (
     task_base_dir,
     task_manager,
 )
+from downloaders import ratelimit
+from downloaders.base import discard_partial
 from models.schemas import (
     BatchTaskIn,
     BatchTaskItemOut,
     BatchTaskOut,
     BulkActionIn,
     BulkActionOut,
+    LibraryBulkDeleteIn,
+    LibraryBulkOut,
+    LibraryVerifyIn,
+    LibraryVerifyItem,
+    LibraryVerifyOut,
     MarkReadIn,
     NotificationListOut,
     NotificationOut,
@@ -501,7 +510,36 @@ def get_config():
         # 与后端校验共用同一个常量, 避免"前端允许 999 后端只收 500"。
         "aggregate_max_items": AGGREGATE_MAX_ITEMS,
         "aggregate_max_depth": AGGREGATE_MAX_DEPTH,
+        # 全局带宽上限(bytes/s, 0 = 不限)。下发是必要的: 这是一个"看不见的阈值",
+        # 而看不见的阈值会被反复误调 —— 用户会以为"下载慢"是站点的问题。
+        "max_download_bytes_per_sec": int(
+            getattr(settings, "max_download_bytes_per_sec", 0) or 0
+        ),
     }
+
+
+#: 前端可以随时查询/调整全局带宽上限(见 downloaders/ratelimit.ByteRateLimiter)。
+class ByteRateIn(BaseModel):
+    bytes_per_sec: int = 0
+
+
+@router.get("/config/bandwidth")
+def get_bandwidth():
+    """当前全局带宽上限 + 实时速率(供诊断面板展示"限速到底生效没有")。"""
+    lim = ratelimit.bytes_limiter
+    return {"bytes_per_sec": int(lim.rate or 0)}
+
+
+@router.post("/config/bandwidth")
+def set_bandwidth(payload: ByteRateIn):
+    """设置全局带宽上限; 0 = 不限速。
+
+    ⚠️ 走 `ratelimit.set_byte_rate` 而不是直接改 settings: 桶在进程启动时就建好了,
+    只改配置会表现为"接口返回成功但下载速度没变" —— 那正是最容易被归因成
+    "限速功能是假的"的一类问题。
+    """
+    value = max(0, int(payload.bytes_per_sec or 0))
+    return {"bytes_per_sec": ratelimit.set_byte_rate(value)}
 
 
 #: 单页上限。不设上限的话一个 `page_size=100000` 就能把整表打出来, 分页白做。
@@ -757,6 +795,208 @@ def library_albums(limit: int = Query(200, ge=1, le=1000)):
     return {"items": [dict(r) for r in db.library_albums(limit)]}
 
 
+# ⚠️ 批量与巡检这两个路由必须声明在 `/tasks/{task_id}` 之前(FastAPI 按注册顺序
+# 匹配)。它们挂在 /library 前缀下, 本来就与 /tasks 不冲突, 但仍按既有惯例
+# 集中放在这里, 免得日后有人把 /library/{id} 加进来时踩到顺序问题。
+
+@router.post("/library/bulk-delete", response_model=LibraryBulkOut)
+def library_bulk_delete(payload: LibraryBulkDeleteIn):
+    """资源库批量删除。
+
+    ⚠️ 文件是**最后一步、且带三道闸**才删的:
+
+      1. `with_files` 必须显式为真(默认只删记录);
+      2. 引用的行必须只剩这一条(`resource_refs <= 1`)—— sha256 去重时后到的
+         任务只是复用路径、不复制文件, 删掉等于把别人的结果一并毁掉;
+      3. 路径必须真的落在某个任务下载根之内 —— 库里的 local_path 是数据, 不能
+         当可信路径直接 unlink。
+
+    删记录而不是删任务: 用户在资源库里看到的粒度是"一张图", 不是"一个任务"。
+    """
+    out = LibraryBulkOut(requested=len(payload.ids))
+    for rid in payload.ids:
+        row = db.get_resource(rid)
+        if not row:
+            out.skipped.append(rid)
+            continue
+        local = db_row_field(row, "local_path")
+        if payload.with_files and local:
+            refs = db.resource_refs(local)
+            if refs > 1:
+                # 还有别的任务指着这个文件 —— 记录照删, 文件留着并如实回报
+                out.kept_files.append(rid)
+                db.delete_resource(rid)
+                out.deleted += 1
+                continue
+            path = _safe_local_for_delete(row)
+            if path is None:
+                out.errors[str(rid)] = "路径不在任何任务下载根内, 未删文件"
+            else:
+                try:
+                    if path.is_file():
+                        out.bytes += path.stat().st_size
+                        out.files += 1
+                    # 半成品一并清: 只删最终文件会在用户目录里留下 xxx.jpg.part
+                    discard_partial(path)
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    out.errors[str(rid)] = f"删除文件失败: {e}"
+        db.delete_resource(rid)
+        out.deleted += 1
+    return out
+
+
+def db_row_field(row, key):
+    """读 sqlite3.Row 的可选列: 旧库缺列时返回 None 而不是抛 IndexError。
+
+    与 `TaskManager._row_field` 同一件事 —— 那边是实例内部工具, 这边在 API 层,
+    但"旧库缺列"这个现实是共享的, 所以判据也必须一致(缺列 == 视作没有值),
+    否则同一份数据在两个层次上会得到两种结论。
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _safe_local_for_delete(row):
+    """把库里的 local_path 还原成"可以安全 unlink"的路径, 不安全返回 None。
+
+    判据: 必须落在**该记录所属任务**的下载根之内。库里存的是我们自己写的路径,
+    但"数据"与"可信输入"是两回事 —— 用户手改过库、或早期版本的记录混进来时,
+    一行记录就能让批量删除去 unlink 任意文件。
+    """
+    local = db_row_field(row, "local_path")
+    if not local:
+        return None
+    task = db.get_task(db_row_field(row, "task_id"))
+    if not task:
+        return None
+    try:
+        p = Path(str(local)).resolve()
+        base = task_base_dir(task).resolve()
+    except (OSError, ValueError):
+        return None
+    if p == base or not p.is_relative_to(base):
+        return None
+    return p
+
+
+@router.get("/library/archive")
+def library_archive(ids: str = Query(..., description="逗号分隔的资源 id")):
+    """把选中的资源打成一个 zip 流式下载。
+
+    ⚠️ 命名规则: `相册名/文件名`。资源库是跨任务的, 直接把一堆 `00001.jpg` 装进
+    同一个包必然互相覆盖 —— 加一层相册目录是最省心的区分方式, 且与落盘布局
+    (下载根/相册名/文件)一致, 解压后与用户目录里的结构对得上。
+    """
+    try:
+        wanted = [int(x) for x in str(ids).replace(" ", "").split(",") if x]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ids 必须是逗号分隔的资源 id")
+    if not wanted:
+        raise HTTPException(status_code=400, detail="未选中任何资源")
+    if len(wanted) > 2000:
+        raise HTTPException(status_code=400, detail="单次最多 2000 项, 请分批")
+
+    named = []
+    for rid in wanted:
+        row = db.get_resource(rid)
+        if not row:
+            continue
+        p = _resolve_safely_for_row(row)
+        if p is None:
+            continue
+        task = db.get_task(db_row_field(row, "task_id"))
+        album = (db_row_field(task, "name") if task else None) or "未命名"
+        named.append((f"{album}/{p.name}", p))
+    if not named:
+        raise HTTPException(status_code=404, detail="选中的资源都没有可下载的文件")
+
+    headers = {
+        # 文件名可能是中文: 用 RFC 5987 的 filename* 而不是把原始字节塞进 header
+        "Content-Disposition": (
+            "attachment; filename=library.zip; "
+            "filename*=UTF-8''" + quote("资源库.zip")
+        )
+    }
+    return StreamingResponse(
+        _zip_stream_named(named), media_type="application/zip", headers=headers
+    )
+
+
+def _resolve_safely_for_row(row):
+    """按记录的所属任务校验并返回真实文件路径(不存在/越界返回 None)。"""
+    task = db.get_task(db_row_field(row, "task_id"))
+    if not task:
+        return None
+    local = db_row_field(row, "local_path")
+    if not local:
+        return None
+    try:
+        base = task_base_dir(task).resolve()
+    except OSError:
+        return None
+    return _resolve_safely(base, local)
+
+
+@router.post("/library/verify", response_model=LibraryVerifyOut)
+def library_verify(payload: LibraryVerifyIn):
+    """落盘后完整性巡检: 库里的 `local_path` 可能已被外部删除或截断。
+
+    ⚠️ 只**标记**不删除。判据用的是 `core/mediacheck.py` 那套**算术级**证据
+    (容器自述长度 / 尾部结束标记)与"文件缩小了"这一条, 都能被证明;
+    认不出的容器一律放行(误报的代价是删掉一个好文件)。
+
+    标记写进 `resources.error_kind` + `note`, 不改 `status` —— 文件可能仍然能看
+    (比如截断的 JPEG 前半段还是好的), 把状态改成 failed 会让用户以为整份没了。
+    """
+    limit = max(1, min(int(payload.limit or 500), 5000))
+    rows = db.done_resources_for_scan(task_id=payload.task_id, limit=limit)
+    out = LibraryVerifyOut()
+    for r in rows:
+        out.checked += 1
+        path = Path(str(r["local_path"]))
+        kind = reason = None
+        if not path.is_file():
+            kind = KIND_MISSING
+            reason = "库里有记录, 磁盘上找不到该文件(被外部删除或移动过)"
+        else:
+            reason = mediacheck.truncation_reason(path)
+            if reason:
+                kind = KIND_CORRUPT
+            else:
+                real = path.stat().st_size
+                recorded = r["size"]
+                if isinstance(recorded, int) and 0 < real < recorded:
+                    # 文件比记录里小 = 被截断过(变大则可能是被替换成另一份内容,
+                    # 那属于"源站换了内容", 不是损坏, 不在这里报)
+                    kind = KIND_CORRUPT
+                    reason = (
+                        f"文件比记录里小: 实际 {real} 字节, 记录 {recorded} 字节"
+                        f"(疑似被截断)"
+                    )
+        if not kind:
+            continue
+        item = LibraryVerifyItem(
+            id=r["id"], task_id=r["task_id"],
+            name=(r["filename"] or path.name), path=str(path),
+            kind=kind, reason=reason,
+        )
+        out.items.append(item)
+        if kind == KIND_MISSING:
+            out.missing += 1
+        else:
+            out.truncated += 1
+        try:
+            db.update_resource(r["id"], error_kind=kind, note=reason)
+            out.marked += 1
+        except Exception:
+            # 标记失败不影响这次巡检的结论 —— 报告本身仍然有效
+            pass
+    return out
+
+
 @router.get("/tasks/storage")
 def storage_overview():
     """任务与产出的整体占用概览, 供"一键清理"界面预检。"""
@@ -887,6 +1127,9 @@ def get_task(task_id: int):
         **dict(task),
         resources=resources,
         resource_counts=db.summarize_resources(task_id),
+        # 逐资源耗时: "这个任务为什么慢"的答案。集成在详情里而不是单开接口 ——
+        # 多一次往返只会让打开详情更慢, 而它只在详情页用得上。
+        resource_timing=db.resource_timing(task_id),
         error_kind_labels=KIND_LABELS,
     )
 
@@ -1062,6 +1305,14 @@ def task_proxy(task_id: int):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     lines = task_manager.proxy_snapshot(task_id)
+    # 跨会话的熔断历史(见 core/proxy_health.py): 任务结束后内存条目会被回收,
+    # 但"这条线上一轮就不行"这条信息仍然有价值 —— 它正是重启后不必重新踩坑的依据。
+    try:
+        from core import proxy_health
+
+        history = proxy_health.snapshot()
+    except Exception:
+        history = []
     # 从 options 里把配置读回来, 好让前端在没有活动 worker 时也能告诉用户
     # "这个任务配了几条线"(否则一块空白让人以为没配)。
     spec = ""
@@ -1079,6 +1330,7 @@ def task_proxy(task_id: int):
         "configured": len([p for p in str(spec).split(",") if p.strip()]),
         "masked_spec": _mask_proxy(spec),
         "lines": lines,
+        "history": history,
     }
 
 
@@ -1249,6 +1501,78 @@ def task_manifest(task_id: int):
     return data
 
 
+def _verify_local_file(raw):
+    """把 `?path=` 还原成一个**可信**的本地文件, 返回 (task, row, path, base)。
+
+    ⚠️ 两道校验缺一不可:
+
+      1. **库里必须有这条记录。** `downloads/` 是用户自己的目录, 里面还可能有
+         他放进去的别的东西; 只判"在下载根内"等于给了任意文件读取权
+         (`.partsrc`、别的任务自定义目录、以及一切恰好落在 downloads 下的文件)。
+      2. **必须在该任务的下载根内。** 记录本身也可能指向去重复用时别的目录
+         的文件(见 task_manager._download_one 的 dedup 分支), 那时按本任务
+         的根去判会拒掉 —— 所以这里用**记录所属任务**的根, 而不是调用方给的。
+    """
+    if not raw or not str(raw).strip():
+        raise HTTPException(status_code=400, detail="缺少 path 参数")
+    try:
+        p = Path(str(raw)).resolve()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid path")
+    row = db.find_resource_by_path(str(p))
+    if not row:
+        raise HTTPException(status_code=404, detail="resource not found")
+    task = db.get_task(row["task_id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    base = task_base_dir(task).resolve()
+    if not p.is_relative_to(base):
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return task, row, p, base
+
+
+# ⚠️ 这两个路由必须在 `/files/{task_id}/{file_path:path}` **之前**注册。
+# 那个通配路由虽然需要两段路径(所以单段的 /files/raw 理论上不冲突), 但把字面量
+# 路由放在通配之前是 FastAPI 的硬纪律: 一旦哪天有人把通配改成可选段,
+# `/files/raw` 就会被解析成 task_id="raw" 并返回 422 —— 而前端看到的只是
+# "缩略图不显示", 完全联想不到是路由顺序。
+@router.get("/files/raw")
+def serve_raw(path: str = Query(..., description="资源记录的本地绝对路径")):
+    """按库里的路径取原文件(资源库网格与预览用)。
+
+    与 `/files/{task_id}/{file}` 的分工: 那个按**任务**定位, 这个按**库里的路径**
+    定位 —— 资源库是跨任务视图, 条目上只有 local_path, 没有唯一 task_id 可用
+    (同一张图被多个任务 sha256 去重复用时会有多条记录指向同一个文件)。
+    """
+    _task, _row, p, _base = _verify_local_file(path)
+    return FileResponse(p)
+
+
+@router.get("/files/thumb")
+def serve_thumb(
+    path: str = Query(..., description="资源记录的本地绝对路径"),
+    size: int = Query(thumbs.DEFAULT_MAX_SIDE, ge=64, le=1024,
+                      description="缩略图长边上限(像素)"),
+):
+    """按库里的路径取缩略图; 生成不了就**回退原图**。
+
+    ⚠️ 回退而不是返回错误图: 缩略图是加速手段。没有 ffmpeg、或这张图 ffmpeg 解不开
+    (冷门格式/文件损坏)时, 用户仍然应该**看得到内容**, 只是慢一点 ——
+    给一个破图标等于把人要的信息拿走了。
+    """
+    _task, _row, p, base = _verify_local_file(path)
+    thumb = thumbs.ensure_thumb(base, p, max_side=size)
+    if thumb is None:
+        return FileResponse(p)
+    resp = FileResponse(thumb)
+    # 缩略图内容由源文件 mtime 决定, 而 URL 里带着源路径 —— 换源即换 URL,
+    # 所以可以放心让浏览器长缓存, 省掉"每次滚动都重新请求"的开销。
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 @router.post("/tasks/{task_id}/archive")
 def archive_task(task_id: int, only: str = "done"):
     """把任务产出打包成 zip 下载。
@@ -1271,7 +1595,11 @@ def archive_task(task_id: int, only: str = "done"):
     if not items:
         raise HTTPException(status_code=404, detail="no downloadable file in this task")
     return StreamingResponse(
-        _zip_stream(base, items, task_id),
+        # ⚠️ 这里原来多传了一个 task_id: `_zip_stream` 只收两个参数, 而生成器函数
+        # 直到**第一次 next() 才执行函数体** —— 于是 TypeError 不发生在调用处,
+        # 而是发生在 Starlette 迭代响应的时候, 表现成"打包接口 500 且没有堆栈
+        # 指向这里"。有了回归测试(见 test_features_v34)之后这条路径才被走到过。
+        _zip_stream(base, items),
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="task-{task_id}.zip"',
@@ -1305,47 +1633,57 @@ def _dedup_name(name, counter):
     return f"{head} ({counter[name]}){tail}"
 
 
+class _ZipSink(io.RawIOBase):
+    """收集 zipfile 写出的字节, 取走后清空(缓冲区不膨胀)。"""
+
+    def __init__(self):
+        self.pending = []
+
+    def writable(self):
+        return True
+
+    def write(self, b):
+        data = bytes(b)
+        self.pending.append(data)
+        return len(data)
+
+    def take(self):
+        if not self.pending:
+            return b""
+        out = b"".join(self.pending)
+        self.pending.clear()
+        return out
+
+
+def _zip_stream_named(named):
+    """`named` = [(归档内名字, 真实路径)] 的流式 zip。
+
+    与 `_zip_stream` 的区别: 那个按"同一个下载根的相对路径"命名; 资源库的条目
+    可能跨多个根(任务可以各自指定下载目录), 相对路径无从算起, 所以命名由调用方
+    给定。两者的压缩策略与流式机制共用, 不各写一遍。
+    """
+    sink = _ZipSink()
+    counter = {}
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
+        for arcname, path in named:
+            zf.write(path, arcname=_dedup_name(arcname, counter))
+            chunk = sink.take()
+            if chunk:
+                yield chunk
+    tail = sink.take()
+    if tail:
+        yield tail
+
+
 def _zip_stream(base, items):
     """边打包边吐数据的生成器, 不把整个压缩包攒在内存里。
 
     图片/视频本身已经是压缩过的媒体, deflate 几乎压不动却要吃掉不少 CPU,
     所以这里用 ZIP_STORED(仅归档, 不再压缩)。
     """
-
-    class _Sink(io.RawIOBase):
-        """收集 zipfile 写出的字节, 取走后清空(缓冲区不膨胀)。"""
-
-        def __init__(self):
-            self.pending = []
-
-        def writable(self):
-            return True
-
-        def write(self, b):
-            data = bytes(b)
-            self.pending.append(data)
-            return len(data)
-
-        def take(self):
-            if not self.pending:
-                return b""
-            out = b"".join(self.pending)
-            self.pending.clear()
-            return out
-
-    sink = _Sink()
-    counter = {}
-    # zipfile 对不可 seek 的 fileobj 会自动走流式路径(self._seekable=False)
-    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
-        for _, path in items:
-            zf.write(path, arcname=_dedup_name(path.relative_to(base).as_posix(), counter))
-            chunk = sink.take()
-            if chunk:
-                yield chunk
-    # 退出 with 时写出的是 central directory, 必须一并吐出去
-    tail = sink.take()
-    if tail:
-        yield tail
+    return _zip_stream_named(
+        [(p.relative_to(base).as_posix(), p) for _, p in items]
+    )
 
 
 @router.get("/files/{task_id}/{file_path:path}")

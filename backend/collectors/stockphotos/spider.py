@@ -1,17 +1,22 @@
-r"""Pexels 采集器: 单张照片 + 搜索/集合页。
+r"""Pexels 采集器: 单张照片 + 搜索页 + 集合页。
 
-两种输入形态, 两条路径
+三种输入形态, 三条路径
 ======================
 
 1. **单张照片**(`/photo/{slug}-{id}/` 或图片直链或纯 id)
    —— 只有一个资源, 走 `crawl_single()`: 一次探测确认存在性, 产出 1 条资源。
    此时**不需要序号枚举**, 也不需要浏览器。
 
-2. **搜索页 / 集合页**(`/search/{query}/`、`/collections/{slug}/`)
-   —— 多张图, 但**没有可枚举的序号**。走 `crawl_page()`: 用官方 API
-   (`api.pexels.com/v1/search`) 分页拉取, 每页 80 张, 直到 `max_items` 或
-   翻完。⚠️ 绝不用"猜 id"的方式枚举 —— 那是本项目最贵的一课
-   (见 `gallery_base.parse_gid` 的说明: 猜错 id 是静默失败, 报 success 而 0 资源)。
+2. **搜索页**(`/search/{query}/`) —— 多张图, 但**没有可枚举的序号**。
+   走 `crawl_page()`: 用官方 API(`api.pexels.com/v1/search`) 分页拉取,
+   每页 80 张, 直到 `max_items` 或翻完。⚠️ 绝不用"猜 id"的方式枚举 —— 那是
+   本项目最贵的一课(见 `gallery_base.parse_gid` 的说明: 猜错 id 是静默失败,
+   报 success 而 0 资源)。
+
+3. **集合页**(`/collections/{slug}-{id}/`) —— 同样多张图、同样没有序号。
+   走 `_crawl_collection()`: 端点不同(`/v1/collections/{id}`), 且**必须**先从
+   slug 里抽出 ID —— 见 `_collection_id` 的说明(拿 slug 去请求会得到一个与
+   "集合真不存在"无法区分的 404)。
 
 为什么不用官方 API 处理单张照片
 ------------------------------
@@ -19,11 +24,11 @@ API 要 API key(`PEXELS_API_KEY`), 而单张照片的图片直链是**公开可�
 `images.pexels.com/photos/{id}/pexels-photo-{id}.jpeg`。为一个"只用一次"的
 请求引入密钥依赖不划算。所以:
   * 单张 -> 直接构造直链 + probe 确认(零密钥)
-  * 列表 -> 必须走 API(列表内容无法从 id 推导), 此时才要求密钥
+  * 列表(搜索/集合) -> 必须走 API(列表内容无法从 id 推导), 此时才要求密钥
 
 缺密钥时的行为
 --------------
-搜索页输入且没有 `PEXELS_API_KEY` -> **明确报错并说清怎么配**, 而不是静默
+搜索/集合页输入且没有 `PEXELS_API_KEY` -> **明确报错并说清怎么配**, 而不是静默
 返回空列表。空列表会被上层判成 failed, 但用户看不到"为什么" —— 那种
 "任务失败但你不知道为什么"是本项目反复想消灭的体验。
 """
@@ -47,10 +52,37 @@ API_PAGE_SIZE = 80
 DEFAULT_MAX_ITEMS = 300
 
 _SEARCH_RE = re.compile(r"pexels\.com/(?:search|collections)/([^/?#]+)")
+_COLLECTION_RE = re.compile(r"pexels\.com/collections/([^/?#]+)")
 _QUERY_RE = re.compile(r"[?&]query=([^&#]+)")
 #: 纯 ID 输入的形状 —— 与 PEXELS.gid_shape 一致, 单独提出来是因为它在
 #: `match_score` 里要先于通用判据生效(见那里的说明)。
 _BARE_ID = re.compile(PEXELS.gid_shape)
+
+#: 站点上**不是**集合 id 的特殊 slug。写在这里是为了把它们与真实 id 明确分开:
+#: `featured` 是一个"集合的列表页", 请求它只会得到一个集合数组而不是照片。
+_NON_ID_SLUGS = {"featured", "popular", "latest", "search", "all"}
+
+
+def _collection_id(slug):
+    """从集合页 URL 的末段里抽出集合 ID; 抽不出返回 None。
+
+    ⚠️ 站点 URL 给的是 **slug**(可读文字, 形如 `nature-2sx8z9c`), 而官方集合 API
+    只认 **ID**。两者不是一回事: 拿 slug 去请求会得到 404, 而"这个集合不存在"与
+    "我们猜错了 ID"在界面上长得一模一样 —— 于是用户会以为自己的集合被删了。
+
+    抽取规则: 末段若有 `-`, 取其**最后一段**; 必须含数字且长度 >= 4 才认。
+    含数字这一条能把 `nature`、`featured` 这类纯词挡掉 —— 宁可明确报"取不到 ID,
+    请改用别的输入形态", 也不要拿一个必然 404 的串去试。
+    """
+    seg = unquote(str(slug or "")).strip().strip("/")
+    if not seg:
+        return None
+    tail = seg.rsplit("-", 1)[-1] if "-" in seg else seg
+    if tail.lower() in _NON_ID_SLUGS:
+        return None
+    if len(tail) < 4 or not re.search(r"\d", tail):
+        return None
+    return tail
 
 
 def _api_key():
@@ -182,19 +214,13 @@ class PexelsSpider:
                 "  或者直接粘贴**单张照片**的 URL / ID, 那条路径不需要 key。"
             )
 
+        collection = _COLLECTION_RE.search(raw)
+        if collection:
+            return self._crawl_collection(raw, key, collection.group(1))
+
         query = None
-        kind = "search"
         if search:
-            slug = unquote(search.group(1))
-            # /search/{query}/ 与 /collections/{slug}/ 的语义不同, 后者没有
-            # 关键词查询 —— 现在只支持前者, 后者明确报错而不是硬当成搜索词,
-            # 否则会拿集合 slug 去搜出一个无关的结果集。
-            if "/collections/" in raw:
-                raise ValueError(
-                    "暂不支持 Pexels 集合页(需要额外的集合 API)。"
-                    "可改用搜索页 https://www.pexels.com/search/{关键词}/ 。"
-                )
-            query = slug
+            query = unquote(search.group(1))
         else:
             qs = parse_qs(urlparse(raw).query)
             query = (qs.get("query") or qs.get("q") or [""])[0]
@@ -223,29 +249,75 @@ class PexelsSpider:
             )
         return resources[:DEFAULT_MAX_ITEMS]
 
-    def _fetch_page(self, sess, key, query, page):
-        """拉一页搜索结果, 返回 (resources, has_next)。"""
+    # ---- 集合页 ----
+
+    def _crawl_collection(self, raw, key, slug):
+        """集合页: `GET /v1/collections/{id}` 分页拉取。
+
+        与搜索页的两点不同:
+          * 端点是 `/collections/{id}`(不是 `/search`);
+          * **必须先从 slug 里抽出 ID** —— 见 `_collection_id` 的说明, 拿 slug 去
+            请求只会得到一个与"集合真不存在"无法区分的 404。
+        """
+        cid = _collection_id(slug)
+        if not cid:
+            raise ValueError(
+                f"无法从 {raw} 里确定集合 ID。\n"
+                "  Pexels 的集合页 URL 前面是可读的 slug(如 nature-2sx8z9c), 而官方\n"
+                "  集合 API 只认末尾的 ID; 拿 slug 去试会返回『集合不存在』, 与\n"
+                "  『我们猜错了 ID』无法区分, 所以这里宁可明确报错。可改用:\n"
+                "    · 集合页里任意一张照片的链接(单张路径不需要集合 ID)\n"
+                "    · 搜索页 https://www.pexels.com/search/{关键词}/\n"
+                "    · 或把集合 ID 直接拼成 "
+                "https://www.pexels.com/collections/{slug}-{id}/ 再试"
+            )
+
+        resources = []
+        page = 1
+        sess = _session()
+        while len(resources) < DEFAULT_MAX_ITEMS:
+            batch, has_next = self._fetch_collection_page(sess, key, cid, page)
+            resources.extend(batch)
+            if not has_next or not batch:
+                break
+            page += 1
+
+        if not resources:
+            raise ValueError(
+                f"Pexels 集合 {cid} 没有返回任何照片(集合可能是空的, 或已被作者删除)。"
+            )
+        return resources[:DEFAULT_MAX_ITEMS]
+
+    # ---- API 调用 ----
+
+    def _api_get(self, sess, key, path, params, what):
+        """调官方 API 并把每种失败翻译成"用户能照做的一句话"。
+
+        单独提出来是因为搜索页与集合页**共用同一套失败语义**: key 错了要提示检查
+        环境变量, 限流要说清免费额度, 非 JSON 说明可能被网关拦了 —— 两处各写一遍
+        迟早漏掉一种, 而漏掉的那种会以"任务失败但不知道为什么"的形式出现。
+        """
         import requests
 
-        params = {
-            "query": query,
-            "per_page": API_PAGE_SIZE,
-            "page": page,
-        }
         try:
             resp = sess.get(
-                f"{API_BASE}/search",
+                f"{API_BASE}{path}",
                 params=params,
                 headers={"Authorization": key, "Accept": "application/json"},
                 timeout=30,
             )
         except requests.RequestException as e:
-            raise ValueError(f"调用 Pexels API 失败: {e}") from e
+            raise ValueError(f"调用 Pexels API 失败({what}): {e}") from e
 
         if resp.status_code == 401:
             raise ValueError(
                 "Pexels API 拒绝了这个 key(401)。检查 PEXELS_API_KEY 是否填对、"
                 "是否已被撤销。"
+            )
+        if resp.status_code == 404:
+            raise ValueError(
+                f"Pexels API 说这个 {what} 不存在(404)。"
+                "若确认链接有效, 可能是站点改了集合/搜索页的 URL 形态。"
             )
         if resp.status_code == 429:
             raise ValueError(
@@ -254,29 +326,72 @@ class PexelsSpider:
             )
         resp.raise_for_status()
         try:
-            data = resp.json()
+            return resp.json()
         except json.JSONDecodeError as e:
-            raise ValueError(f"Pexels API 返回的不是 JSON: {e}") from e
+            raise ValueError(f"Pexels API 返回的不是 JSON({what}): {e}") from e
 
-        out = []
-        for p in data.get("photos") or []:
-            src = p.get("src") or {}
-            # 优先 original, 退化到 large2x/large —— 三级都拿不到就跳过这一条,
-            # 而不是塞一个空 URL 进去(下载层会因为空 URL 报一个含糊的错)。
-            url = src.get("original") or src.get("large2x") or src.get("large")
-            if not url:
+    def _fetch_page(self, sess, key, query, page):
+        """拉一页搜索结果, 返回 (resources, has_next)。"""
+        data = self._api_get(
+            sess, key, "/search",
+            {"query": query, "per_page": API_PAGE_SIZE, "page": page},
+            f"搜索 {query!r}",
+        )
+        return _resources_of(data.get("photos") or []), bool(data.get("next_page"))
+
+    def _fetch_collection_page(self, sess, key, cid, page):
+        """拉一页集合内容, 返回 (resources, has_next)。
+
+        ⚠️ 集合端点的返回**形状与搜索页不同**, 而且站点在不同版本里用过两种:
+        顶层是 `photos` 或 `media`(后者每项外面还包了一层 `{type: "Photo", ...}`)。
+        两种都认 —— 只认一种的话, 另一种会表现为"集合是空的", 而不是报错,
+        用户完全无从判断到底是没图还是我们解析错了。
+        """
+        data = self._api_get(
+            sess, key, f"/collections/{cid}",
+            {"per_page": API_PAGE_SIZE, "page": page},
+            f"集合 {cid}",
+        )
+        raw_items = data.get("photos")
+        if raw_items is None:
+            raw_items = data.get("media") or []
+        photos = []
+        for item in raw_items:
+            if not isinstance(item, dict):
                 continue
-            pid = p.get("id")
-            mirrors = [u for u in (src.get("large2x"), src.get("large"),
-                                   src.get("medium")) if u]
-            out.append({
-                "type": "image",
-                "url": url,
-                "headers": {"Accept": IMAGE_ACCEPT},
-                "filename": f"{pid}.jpg" if pid else "",
-                # 页面/API 自报体积, 可用于体积筛选(下载前就知道大小)
-                "size": None,
-                "mirrors": mirrors,
-                "source": "pexels_search",
-            })
-        return out, bool(data.get("next_page"))
+            # `{type: Photo, photo: {...}}` 与直接的 photo 对象都要能接住
+            inner = item.get("photo")
+            photos.append(inner if isinstance(inner, dict) else item)
+        return _resources_of(photos, source="pexels_collection"), bool(
+            data.get("next_page")
+        )
+
+
+def _resources_of(photos, source="pexels_search"):
+    """把 API 返回的照片对象列表转成资源列表(两种端点的公共部分)。"""
+    out = []
+    for p in photos or []:
+        if not isinstance(p, dict):
+            continue
+        src = p.get("src") or {}
+        if not isinstance(src, dict):
+            src = {}
+        # 优先 original, 退化到 large2x/large —— 三级都拿不到就跳过这一条,
+        # 而不是塞一个空 URL 进去(下载层会因为空 URL 报一个含糊的错)。
+        url = src.get("original") or src.get("large2x") or src.get("large")
+        if not url:
+            continue
+        pid = p.get("id")
+        mirrors = [u for u in (src.get("large2x"), src.get("large"),
+                               src.get("medium")) if u]
+        out.append({
+            "type": "image",
+            "url": url,
+            "headers": {"Accept": IMAGE_ACCEPT},
+            "filename": f"{pid}.jpg" if pid else "",
+            # 页面/API 自报体积, 可用于体积筛选(下载前就知道大小)
+            "size": None,
+            "mirrors": mirrors,
+            "source": source,
+        })
+    return out

@@ -14,7 +14,14 @@ import requests
 from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
 from core.errors import DiskFullError, GoneError
-from .ratelimit import describe, domain_slot, note_failure, note_rate_limited, note_success
+from .ratelimit import (
+    describe,
+    domain_slot,
+    note_failure,
+    note_rate_limited,
+    note_success,
+    throttle_bytes,
+)
 
 #: 流式写入的分块。64KB 在大文件上要跑几千次 Python 层循环, 256KB 是纯收益。
 CHUNK = 256 * 1024
@@ -322,7 +329,7 @@ class ProxyPool:
     #: 熔断后的冷却秒数(冷却结束自动半开放出)
     COOLDOWN = 300.0
 
-    def __init__(self, spec, fail_threshold=None, cooldown=None):
+    def __init__(self, spec, fail_threshold=None, cooldown=None, persist=True):
         self.spec = spec
         self.proxies = [p.strip() for p in str(spec or "").split(",") if p.strip()]
         self._i = 0
@@ -334,6 +341,28 @@ class ProxyPool:
         self._fails = {}
         #: proxy -> 熔断到期时间戳(0 = 未熔断)
         self._blocked_until = {}
+        # 把**上一轮/上一个进程**记下的健康状态接过来: 否则"上次已经发现第 2 条线
+        # 是死的"这件事每轮都要重新踩一遍 —— 每条线又要失败 FAIL_THRESHOLD 次才
+        # 熔断, 而代价是几个真实资源白下。见 core/proxy_health.py。
+        # ⚠️ persist=False 用于测试与"只想要本次运行的状态"的调用方: 带持久化时
+        # 跨用例的隐形污染非常难查(症状是"另一个用例莫名挑了别的代理")。
+        self._persist = bool(persist)
+        if self._persist:
+            self._load_state()
+
+    def _load_state(self):
+        """从持久化状态里恢复失败计数与熔断到期时刻(读不到就当没有)。"""
+        try:
+            from core import proxy_health
+
+            for p in self.proxies:
+                st = proxy_health.load(p)
+                if st["fails"]:
+                    self._fails[p] = st["fails"]
+                if st["blocked_until"]:
+                    self._blocked_until[p] = st["blocked_until"]
+        except Exception:
+            pass    # 健康记录是线索不是事实源: 读不到就当"全部健康"
 
     @property
     def empty(self):
@@ -381,6 +410,13 @@ class ProxyPool:
         if proxy:
             self._fails.pop(proxy, None)
             self._blocked_until.pop(proxy, None)
+            if self._persist:
+                try:
+                    from core import proxy_health
+
+                    proxy_health.note_success(proxy)
+                except Exception:
+                    pass    # 持久化失败不影响本次下载
 
     def note_failure(self, proxy):
         """该代理失败一次: 累计达阈值则熔断 COOLDOWN 秒。"""
@@ -390,6 +426,15 @@ class ProxyPool:
         self._fails[proxy] = c
         if c >= self.FAIL_THRESHOLD:
             self._blocked_until[proxy] = time.time() + self.COOLDOWN
+        if self._persist:
+            try:
+                from core import proxy_health
+
+                # ⚠️ 交给我们自己的阈值/冷却时长, 而不是让它用默认值 ——
+                # `ProxyPool` 允许按实例覆盖, 两处各存一份默认值迟早对不上。
+                proxy_health.note_failure(proxy, self.FAIL_THRESHOLD, self.COOLDOWN)
+            except Exception:
+                pass
 
     def snapshot(self):
         """当前池状态(供诊断/前端展示)。"""
@@ -417,7 +462,10 @@ def make_proxy_session(spec=None, n=0):
     """
     sess = _build_session()
     if spec:
-        ProxyPool(spec).apply(sess, n)
+        # ⚠️ persist=False: 这里只是"把某条代理装进 session", 而它**每个资源**
+        # 都会被调用一次 —— 带上持久化就是每个资源读一次状态文件。真正需要熔断
+        # 状态的是任务级的 ProxyPool(见 task_manager._download_all), 它自己会读。
+        ProxyPool(spec, persist=False).apply(sess, n)
     return sess
 
 
@@ -442,7 +490,7 @@ def safe_filename(url, default_ext=".bin"):
 
 def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                 require_image=False, reject_ct=None, info=None,
-                request_timeout=None):
+                request_timeout=None, validators=None):
     """对单个 URL 做带重试的流式下载, 返回 (sha256, Content-Type)。
 
     Content-Type 校验提供互补的两种用法:
@@ -456,6 +504,10 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
 
     info: 可选的 dict 出参, 成功后写入实际生效的下载点与响应类型, 供
           manifest 做溯源(区分"原本要下的 URL"与"真正下的是哪个镜像")。
+    validators: 可选 `{"etag": ..., "last_modified": ...}`, 上一次成功下载时源站
+          给的校验器。带上它有两个收益: ① 源站可以回 304, 我们一个字节都不传;
+          ② 源站**换了内容**时校验器会变 —— 那是"同一个 URL 背后已不是同一份
+          东西"的唯一可见证据(增量模式只看 URL, 对这件事完全无感)。
     """
     last_err = None
     for attempt in range(1, retries + 1):
@@ -464,6 +516,16 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             offset = _prepare_resume(path, url) if resume else 0
             if offset:
                 req_headers["Range"] = f"bytes={offset}-"
+            elif validators:
+                # ⚠️ 只在**整份**下载时带条件头。带 Range 时若本地那份恰是最新的,
+                # 服务器会以 304 而不是 206 回答, 于是"416 = 本地已完整"这条
+                # 断点续传的收尾路径永远走不到, 续传就再也没机会收尾。
+                et = (validators or {}).get("etag")
+                lm = (validators or {}).get("last_modified")
+                if et:
+                    req_headers["If-None-Match"] = et
+                if lm:
+                    req_headers["If-Modified-Since"] = lm
 
             slot = (
                 domain_slot(url, progress_cb=progress_cb)
@@ -482,6 +544,24 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                     _commit_part(path)
                     fill_info(info, url, None)
                     return sha256_file(path), None
+                if resp.status_code == 304:
+                    # 源站说"你手上那份还是最新的" —— 一个字节都不用传。
+                    # ⚠️ 成立的前提是**本地那份真的还在**。用户清过下载目录、
+                    # 或文件被外部删掉时, 304 会让我们"成功地什么都没得到",
+                    # 比下载失败还难查(任务报成功、目录里没有文件)。
+                    local = path if path.exists() else _part_path(path)
+                    if local.is_file() and local.stat().st_size > 0:
+                        _commit_part(path)
+                        fill_info(info, url, None)
+                        _mark_not_modified(info)
+                        return sha256_file(path), None
+                    # 没有可复用的副本: 丢掉校验器, 重新要一份完整内容
+                    validators = None
+                    last_err = OSError(
+                        "源站返回 304(内容未变更) 但本地没有可复用的副本,"
+                        " 已改为请求完整内容"
+                    )
+                    continue
                 if resp.status_code == 429:
                     # 站点明确要求减速: 按它说的等, 而不是套普通退避
                     raise RateLimited(_retry_after(resp, float(settings.image_retries) * 5))
@@ -503,7 +583,7 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                     raise ValueError(
                         f"rejected Content-Type: {ctype} (疑似错误页而非媒体文件)"
                     )
-                fill_info(info, url, ctype or None)
+                fill_info(info, url, ctype or None, resp)
 
                 part = _part_path(path)
                 mode = "ab" if offset and resp.status_code == 206 else "wb"
@@ -540,6 +620,12 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
                                     progress_cb(len(chunk))
                                 except TypeError:
                                     progress_cb()
+                            # 全局带宽闸门(0 = 不限速时是一次整数比较)。
+                            # ⚠️ 放在写盘与心跳**之后**: 先让这块真正落下去、把进度
+                            # 发出去, 再去等下一个额度 —— 否则限速时进度条会先卡住
+                            # 再跳, 看起来像卡死。等待期间由 progress_cb 维持心跳与
+                            # 取消检查, 否则 1GB @ 1MB/s 的下载会被看门狗判成僵死。
+                            throttle_bytes(len(chunk), progress_cb)
                 # ⚠️ 长度不符就丢弃重来: 否则这个坏文件会以"成功"的身份落盘,
                 # 之后去重/manifest/预览全都建立在错误的字节上, 且毫无报错。
                 got = part.stat().st_size
@@ -588,29 +674,65 @@ def _stream_one(url, path, headers, retries, resume, sess, progress_cb,
             _interruptible_wait(
                 backoff * random.uniform(0.6, 1.4), progress_cb
             )
+    # ⚠️ 不能直接 `raise last_err`: 重试次数为 0(或全部尝试都走了 304-continue
+    # 那条不记错误的路径)时它是 None, `raise None` 会抛 TypeError, 报错离真相极远。
+    if last_err is None:
+        raise OSError(f"下载未产生有效响应: {url}")
     raise last_err
 
 
-def fill_info(info, url, ctype):
+def fill_info(info, url, ctype, resp=None):
     """回填"这个字节实际来自哪个 URL、服务器说它是什么类型"。
 
     只在 info 是 dict 时写入, 调用方不想溯源时保持零开销。
+    resp 传入时顺带记下校验器(ETag / Last-Modified), 见 _stream_one 的 validators。
     """
     if info is None:
         return
     info["resolved_url"] = url
     if ctype:
         info["content_type"] = ctype
+    if resp is not None:
+        et = _hdr(resp, "ETag").strip()
+        lm = _hdr(resp, "Last-Modified").strip()
+        # ⚠️ 弱校验器(`W/"..."`)照收: 它同样足以证明"内容没变"。这里不做强弱
+        # 语义判断 —— 我们只把它当作内容身份的近似, 不当作加密级保证。
+        if et:
+            info["etag"] = et
+        if lm:
+            info["last_modified"] = lm
+
+
+def _mark_not_modified(info):
+    """标记"这次一个字节都没传, 复用的是本地副本"。调用方据此写日志与进度。"""
+    if info is not None:
+        info["not_modified"] = True
+
+
+def validators_for(etag=None, last_modified=None):
+    """把两个可选凭据收成 `_stream_one` 要的形状; 都没有时返回 None。
+
+    单独提出来是为了让四个下载器与 `_stream_one` 用**同一套**形状描述 ——
+    各写一遍 dict 迟早有一处键名打错, 而打错的表现是"条件请求静默没生效"
+    (语法上完全合法, 只是永远不命中), 极难发现。
+    """
+    out = {}
+    if etag:
+        out["etag"] = etag
+    if last_modified:
+        out["last_modified"] = last_modified
+    return out or None
 
 
 def stream_download(url, path, headers, retries=None, resume=True, session=None,
-                    progress_cb=None, info=None):
+                    progress_cb=None, info=None, validators=None):
     """带限速/重试/断点续传的流式下载, 返回文件 sha256。"""
     retries = retries if retries is not None else settings.image_retries
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     sha, ctype = _stream_one(url, path, headers, retries, resume,
-                             session or SESSION, progress_cb, info=info)
+                             session or SESSION, progress_cb, info=info,
+                             validators=validators)
     fill_info(info, url, ctype)
     return sha
 
@@ -636,7 +758,8 @@ def _swap_ext(path, url):
 
 def download_with_mirrors(url, path, headers, retries=None, resume=True, session=None,
                           progress_cb=None, mirrors=None, log=None, require_image=False,
-                          reject_ct=None, info=None, request_timeout=None):
+                          reject_ct=None, info=None, request_timeout=None,
+                          validators=None):
     """主 URL 失败时依次尝试备用下载点(mirrors), 返回 (sha256, 实际路径)。
 
     mirrors 由采集器给出(如同一张图的多个尺寸/CDN 变体), 下载层只负责
@@ -644,6 +767,7 @@ def download_with_mirrors(url, path, headers, retries=None, resume=True, session
     关闭方式: config.yaml 设 mirror_fallback: false。
     require_image / reject_ct 透传给 _stream_one 做 Content-Type 校验。
     info: 成功时回填真正生效的下载点与响应类型(见 _fill_info)。
+    validators: 上次成功下载记下的 ETag/Last-Modified, 见 _stream_one。
     """
     retries = retries if retries is not None else settings.image_retries
     path = Path(path)
@@ -666,10 +790,14 @@ def download_with_mirrors(url, path, headers, retries=None, resume=True, session
             if log:
                 log(f"切换下载点 -> {cand.split('/')[-1]}")
         try:
-            # 只有主 URL 用断点续传; 切换后是全新 URL, 必须从头下
+            # 只有主 URL 用断点续传; 切换后是全新 URL, 必须从头下。
+            # ⚠️ 条件请求凭据同理只给主 URL: 那个 ETag 是**某个** URL 给的,
+            # 拿它去问另一个域名的镜像, 最好的结果是白带一个头, 最坏的是镜像
+            # 恰好也在用同一套 ETag 语义而我们据此误判"没变"。
             sha, ctype = _stream_one(cand, cur, headers, retries, resume and i == 0,
                                      sess, progress_cb, require_image, reject_ct,
-                                     info, request_timeout)
+                                     info, request_timeout,
+                                     validators=validators if i == 0 else None)
             fill_info(info, cand, ctype)
             return sha, cur
         except TaskCancelled:
@@ -686,6 +814,10 @@ def download_with_mirrors(url, path, headers, retries=None, resume=True, session
             last_err = e
             if log:
                 log(f"下载点失败 {cand.split('/')[-1]}: {type(e).__name__}")
+    if last_err is None:
+        # candidates 为空时才会走到(理论上不会), 但 `raise None` 是 TypeError,
+        # 报错会离真相极远 —— 宁可给一句能读懂的话
+        raise OSError(f"没有可用的下载点: {url}")
     raise last_err
 
 

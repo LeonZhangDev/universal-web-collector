@@ -63,9 +63,23 @@ CREATE TABLE IF NOT EXISTS resources(
     phash TEXT,
     duplicate_of INTEGER,
     -- 失败的机器可读分类: gone/forbidden/corrupt/disk/ratelimit/server/
-    -- network/unknown。见 core/errors.py 的 classify() —— 界面与"按原因重试"
+    -- network/unknown/missing。见 core/errors.py 的 classify() —— 界面与"按原因重试"
     -- 都读这一列, 不再靠正则解析 note 文案。
-    error_kind TEXT
+    error_kind TEXT,
+    -- 资源级遥测(epoch 秒浮点): "这个任务为什么慢" 的唯一可靠依据。
+    -- ⚠️ 用 REAL 而不是 created_time 那种秒级字符串: 单张图常常几百毫秒,
+    -- 秒级精度会把 0.4s 与 1.4s 记成同一件事, 遥测就白做了。
+    started_at REAL,
+    finished_at REAL,
+    -- 这是第几次真正发起下载。与 tasks.retry_count(任务级) 不是一回事:
+    -- 单个资源的失败重试同样会让它 +1, 是"这条为什么一直不成功"的证据。
+    attempts INTEGER NOT NULL DEFAULT 0,
+    -- 条件请求凭据(HTTP 校验器), 见 downloaders/base.py 的 _stream_one。
+    -- 存下来有两个用处: ① 重试时带 If-None-Match, 源站回 304 -> 不传字节;
+    -- ② 全量重下后比对 etag, 能发现"同一个 URL 的内容被源站换掉了"
+    -- —— 增量模式原来只按 URL 判断"下过就复用", 对此完全无感。
+    etag TEXT,
+    last_modified TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_logs(
@@ -140,10 +154,18 @@ _ADD_COLUMNS = [
     ("resources", "phash", "TEXT"),
     ("resources", "duplicate_of", "INTEGER"),
     # 失败的**机器可读**分类(gone/forbidden/corrupt/disk/ratelimit/server/
-    # network/unknown, 见 core/errors.py 的 classify)。界面此前靠正则去解析 note
-    # 文案来归类失败原因 —— 那是拿人看的字当数据用, 文案一改归类就静默失效, 而且
+    # network/unknown/missing, 见 core/errors.py 的 classify)。界面此前靠正则去解析
+    # note 文案来归类失败原因 —— 那是拿人看的字当数据用, 文案一改归类就静默失效, 而且
     # 没法支持"按原因筛选/批量重试"。
     ("resources", "error_kind", "TEXT"),
+    # 资源级遥测: 起止时刻(epoch 秒)与实际尝试次数。没有它们, "这个任务为什么慢"
+    # 只能看到一个聚合后的总时长, 无从下判断(哪个资源慢、是慢还是卡在重试)。
+    ("resources", "started_at", "REAL"),
+    ("resources", "finished_at", "REAL"),
+    ("resources", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    # 条件请求凭据(ETag / Last-Modified), 见 downloaders/base.py。
+    ("resources", "etag", "TEXT"),
+    ("resources", "last_modified", "TEXT"),
 ]
 
 
@@ -223,6 +245,16 @@ def query_one(sql, params=()):
 
 def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def now_ts():
+    """当前时刻(epoch 秒, 浮点) —— 资源级遥测专用。
+
+    ⚠️ 刻意不复用 `_now()`: 那个是秒级字符串, 用来给人看时间点; 遥测要的是
+    **时长**, 单张图常常只有几百毫秒, 秒级精度会把 0.4s 和 1.4s 记成同一件事。
+    两种时间观混用是"数据看着有、用时发现没用"的典型来源, 所以分开两个函数。
+    """
+    return time.time()
 
 
 # ---- tasks ----
@@ -734,6 +766,74 @@ def get_resources(task_id):
     return query("SELECT * FROM resources WHERE task_id=? ORDER BY id", (task_id,))
 
 
+# ---- 资源级遥测 ----
+
+def resource_timing(task_id, slowest=5):
+    """这个任务的**逐资源**耗时画像, 回答"慢在哪"。
+
+    没有它时只有任务级总时长: 一个 120 秒的任务可能是"120 张图各 1 秒", 也可能是
+    "119 张各 0.2 秒 + 1 张卡了 95 秒", 而这两种情况的处置完全不同(前者调间隔,
+    后者查那一个资源)。`attempts` 一并给出, 用来区分"慢"与"在重试链里空转"。
+
+    只统计 finished_at 与 started_at 都有的行 —— 未完成的资源没有时长可言,
+    拿 0 充数会把平均值拉低成一个假象。
+    """
+    rows = query(
+        "SELECT id, type, filename, local_path, status, attempts, started_at,"
+        " finished_at FROM resources WHERE task_id=? AND started_at IS NOT NULL"
+        " AND finished_at IS NOT NULL",
+        (task_id,),
+    )
+    items = []
+    for r in rows:
+        try:
+            ms = max(0.0, (float(r["finished_at"]) - float(r["started_at"])) * 1000.0)
+        except (TypeError, ValueError):
+            continue
+        items.append(
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "status": r["status"],
+                "attempts": int(r["attempts"] or 0),
+                "ms": round(ms, 1),
+                "name": r["filename"] or r["local_path"] or "",
+            }
+        )
+    if not items:
+        return {"measured": 0, "avg_ms": 0.0, "max_ms": 0.0, "slowest": [],
+                "retried": 0}
+    total = sum(i["ms"] for i in items)
+    items.sort(key=lambda x: x["ms"], reverse=True)
+    return {
+        "measured": len(items),
+        "avg_ms": round(total / len(items), 1),
+        "max_ms": round(items[0]["ms"], 1),
+        # 有重试的资源数: 单独给一条, 因为"平均很快但一堆资源重试过"是另一种病
+        "retried": sum(1 for i in items if i["attempts"] > 1),
+        "slowest": items[: max(1, int(slowest))],
+    }
+
+
+def done_resources_for_scan(task_id=None, limit=None):
+    """巡检用: 取出"库里说它下好了"的资源(带路径), 供逐条核对磁盘。
+
+    ⚠️ 只取 status='done' —— 失败/已删的行没有文件可核, 把它们算进分母会让
+    "缺失率"这个指标失去意义。`limit` 是为了让大库上的巡检可以分批跑。
+    """
+    sql = ("SELECT * FROM resources WHERE status='done'"
+           " AND local_path IS NOT NULL AND local_path <> ''")
+    args = []
+    if task_id:
+        sql += " AND task_id=?"
+        args.append(task_id)
+    sql += " ORDER BY id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return query(sql, tuple(args))
+
+
 def library_filters(q=None, kind=None, task_id=None, album=None, status="done"):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
@@ -858,6 +958,34 @@ def resource_refs(local_path):
 
 def get_resource(resource_id):
     return query_one("SELECT * FROM resources WHERE id=?", (resource_id,))
+
+
+def delete_resource(resource_id):
+    """删除单条资源记录(资源库批量删除用)。返回是否真的删掉了一行。
+
+    ⚠️ 只删记录, 不碰文件 —— "这份文件还有没有别人在用"是 `resource_refs` 的
+    判断, 属于调用方的语义, 不能藏在这里(藏进来的话, 将来任何调用点都会
+    "顺手"把文件删了, 而删文件是不可逆的)。
+    """
+    return execute("DELETE FROM resources WHERE id=?", (resource_id,)).rowcount
+
+
+def begin_resource_attempt(resource_id):
+    """标记"这一条资源开始下载了", 返回起始时刻。
+
+    ⚠️ 用一条 SQL 自增 `attempts`, 不要"先读出来 +1 再写回": 同一个资源被手动重试
+    与自动流程同时碰到时, 读-改-写会丢掉一次计数 —— 而次数正是判断"是不是一直
+    在重试链里空转"的唯一依据, 丢一次结论就反了。
+    同时把 finished_at 清空: 它此刻代表的是上一次的结束, 留着会让界面显示一个
+    已经"完成"的资源又回到下载中(见 resource_timing 的口径)。
+    """
+    ts = now_ts()
+    execute(
+        "UPDATE resources SET started_at=?, finished_at=NULL,"
+        " attempts=COALESCE(attempts,0)+1 WHERE id=?",
+        (ts, resource_id),
+    )
+    return ts
 
 
 def update_resource(resource_id, **fields):

@@ -188,6 +188,33 @@ const failedSkippedCount = computed(
     ).length
 );
 
+// ---- 资源级遥测 ----
+// 后端在下载起止时写 started_at/finished_at(epoch 秒)与 attempts, 详情接口
+// 顺带聚合出 resource_timing。没有它时"慢"只能看到一个任务总时长, 而
+// 「120 张各 1 秒」与「119 张各 0.2 秒 + 1 张卡了 95 秒」的处置完全不同:
+// 前者调 domain_min_interval, 后者查那一个资源。
+const timing = computed(() => task.value?.resource_timing || null);
+
+//: 重试过的资源数(attempts > 1)。单独看这个值是因为"平均很快但一堆资源重试过"
+//: 是另一种病 —— 平均耗时会把它掩盖掉。
+const retriedCount = computed(() => timing.value?.retried || 0);
+
+function fmtMs(ms) {
+  const v = Number(ms) || 0;
+  if (v < 1000) return `${Math.round(v)} ms`;
+  if (v < 60000) return `${(v / 1000).toFixed(1)} s`;
+  const m = Math.floor(v / 60000);
+  return `${m} 分 ${Math.round((v % 60000) / 1000)} 秒`;
+}
+
+//: 单条资源的耗时; 没有起止时刻就返回 null(未完成/早退路径不记遥测)。
+function resMs(r) {
+  const a = Number(r.started_at);
+  const b = Number(r.finished_at);
+  if (!isFinite(a) || !isFinite(b) || !a || !b) return null;
+  return Math.max(0, (b - a) * 1000);
+}
+
 // 失败原因聚合: 按后端的 `error_kind` 归类, 而不是解析 note 文案。
 //
 // ⚠️ 这里原来是正则匹配 note 字符串(/403|forbidden/、/timeout/ ...)。那是拿人看的
@@ -453,7 +480,30 @@ onUnmounted(() => {
               <span class="fr-n">{{ f.n }}</span>
             </div>
           </div>
+          <!-- 耗时画像: 回答"慢在哪"。只在真有数据时出现 ——
+               未完成的资源没有起止时刻, 拿 0 充数会把平均值拉成一个假象。 -->
+          <div class="timing-report" v-if="timing && timing.measured">
+            <div class="fr-head">
+              耗时画像 <em>已测 {{ timing.measured }} 项</em>
+              <span class="grow"></span>
+              <span class="tm-avg">平均 {{ fmtMs(timing.avg_ms) }}</span>
+              <span class="tm-max">最慢 {{ fmtMs(timing.max_ms) }}</span>
+            </div>
+            <div class="tm-row" v-for="t in timing.slowest" :key="t.id">
+              <span class="tm-ms">{{ fmtMs(t.ms) }}</span>
+              <span class="tm-name" :title="t.name">{{ t.name || "—" }}</span>
+              <span v-if="t.attempts > 1" class="tm-att" :title="`这张重试了 ${t.attempts} 次`">
+                重试 ×{{ t.attempts }}
+              </span>
+              <span class="tm-st" :class="badgeClass(t.status)">{{ statusLabel(t.status, "resource") }}</span>
+            </div>
+            <p class="tm-note" v-if="retriedCount">
+              有 <b>{{ retriedCount }}</b> 项重试过。若平均耗时不高但重试很多，
+              通常不是速率问题，而是少数资源反复失败（看上表里带「重试」的行）。
+            </p>
+          </div>
           <div class="view-tabs" v-if="task.resources.length">
+
             <button
               v-for="t in STATUS_TABS"
               :key="t.key"
@@ -489,6 +539,13 @@ onUnmounted(() => {
                   title="解码器无法读取该文件, 可能已损坏; 文件已保留"
                 >可能已损坏</span>
                 <span class="sz" v-if="r.size">{{ fmtSize(r.size) }}</span>
+                <!-- 耗时只在"值得说"的时候显示(>1 秒或重试过) ——
+                     每张图都挂一个 "180 ms" 会把网格塞满噪声。 -->
+                <span
+                  class="sz tm-hint"
+                  v-if="resMs(r) !== null && (resMs(r) > 1000 || r.attempts > 1)"
+                  :title="r.attempts > 1 ? `尝试 ${r.attempts} 次` : ''"
+                >{{ fmtMs(resMs(r)) }}<template v-if="r.attempts > 1"> ×{{ r.attempts }}</template></span>
                 <button
                   v-if="canRetryResource && ['failed', 'skipped', 'filtered', 'gone'].includes(r.status)"
                   class="ghost mini"
@@ -500,7 +557,7 @@ onUnmounted(() => {
           </div>
           <table class="res-list" v-else-if="visible.length && viewMode === 'list'">
             <thead>
-              <tr><th>状态</th><th>文件</th><th>类型</th><th>大小</th><th>操作</th></tr>
+              <tr><th>状态</th><th>文件</th><th>类型</th><th>大小</th><th>耗时</th><th>操作</th></tr>
             </thead>
             <tbody>
               <tr v-for="r in visible" :key="r.id">
@@ -517,6 +574,13 @@ onUnmounted(() => {
                 </td>
                 <td>{{ typeIcon[r.type] || "📄" }} {{ r.type }}</td>
                 <td>{{ r.size ? fmtSize(r.size) : "—" }}</td>
+                <!-- 耗时: 未完成/早退的资源没有起止时刻, 显示 "—" 而不是 0ms ——
+                     0ms 会被读成"秒下完了", 而真相是"根本没开始"。 -->
+                <td class="tmcell">
+                  <span v-if="resMs(r) !== null">{{ fmtMs(resMs(r)) }}</span>
+                  <span v-else class="dim">—</span>
+                  <span v-if="r.attempts > 1" class="tm-att" :title="`重试 ${r.attempts} 次`">×{{ r.attempts }}</span>
+                </td>
                 <td>
                   <button
                     v-if="canRetryResource && ['failed', 'skipped', 'filtered', 'gone'].includes(r.status)"
@@ -654,6 +718,35 @@ onUnmounted(() => {
 .fr-bar { height: 7px; border-radius: 4px; background: var(--panel); overflow: hidden; }
 .fr-fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #e0654f, #c94a35); transition: width .3s ease; }
 .fr-n { text-align: right; color: var(--text); }
+/* 耗时画像(V34): 回答"慢在哪"。与失败分布同构, 但配色用中性的蓝灰 ——
+   它不是异常, 是观测。 */
+.timing-report {
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+  margin-bottom: 10px; background: var(--panel-2);
+}
+.timing-report .fr-head em { color: var(--muted); }
+.tm-avg, .tm-max { color: var(--muted); font-variant-numeric: tabular-nums; }
+.tm-max { color: var(--text); }
+.tm-row {
+  display: flex; align-items: baseline; gap: 8px; font-size: 12px; margin: 3px 0;
+}
+.tm-ms {
+  flex: none; width: 66px; text-align: right; font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.tm-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.tm-att {
+  flex: none; font-size: 10px; padding: 1px 5px; border-radius: 5px;
+  background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn);
+}
+.tm-st { flex: none; font-size: 11px; color: var(--muted); }
+.tm-note { margin: 7px 0 0; font-size: 11px; color: var(--muted); line-height: 1.5; }
+.tm-note b { color: var(--text); }
+/* 列表里的耗时列, 与上面同一套数字排版 */
+.tmcell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tmcell .dim { color: var(--muted); }
+.tmcell .tm-att { margin-left: 4px; }
+.tm-hint { color: var(--accent); }
 /* 字节级实时速率曲线 */
 .spark-box {
   border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;

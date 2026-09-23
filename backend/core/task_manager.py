@@ -407,9 +407,10 @@ class TaskManager:
         for r in db.get_resources(task_id):
             if r["status"] in ("pending", "failed", "skipped", "downloading"):
                 # error_kind 一并清掉: 它是"上一次为什么失败"的结论, 重下之前
-                # 留着会让界面显示过期的原因
+                # 留着会让界面显示过期的原因。finished_at 同样要清 —— 它此刻
+                # 代表上一次的结束, 留着会让遥测把"重新开始的那次"算成 0 耗时。
                 db.update_resource(r["id"], status="pending", note=None,
-                                   error_kind=None)
+                                   error_kind=None, finished_at=None)
         db.update_task(task_id, error=None, progress=0)
         if not db.transition_task(task_id, TaskStatus.PENDING, TaskStatus.PAUSED):
             return False, "task state changed concurrently"
@@ -529,8 +530,11 @@ class TaskManager:
         if r["status"] not in ("failed", "skipped", "filtered", "gone"):
             return False, f"resource status is {r['status']}"
 
-        # 重试要把上一次的失败分类清掉, 否则 error_kind 会一直挂着旧结论
-        db.update_resource(resource_id, status="pending", note=None, error_kind=None)
+        # 重试要把上一次的失败分类清掉, 否则 error_kind 会一直挂着旧结论。
+        # finished_at 同理: 不清的话, 新一次尝试还没结束, 遥测就已经把旧的结束时刻
+        # 当成它的耗时算进去了。
+        db.update_resource(resource_id, status="pending", note=None, error_kind=None,
+                           finished_at=None)
         out_dir = self._root_dir(task_id)
         self._safe_log(task_id, f"resource retry: {r['url']}")
         # 单资源重试视为用户"强制下载"这一个资源, 不再套用过滤规则
@@ -1214,6 +1218,10 @@ class TaskManager:
                       proxy_pool=None):
         rid = r["id"]
         filters = filters or Filters()
+        # 遥测闸门: 只有真的发起过下载才写 finished_at(见下面的 finally)。
+        # 初始化必须在 try **之外** —— finally 一定会读它, 而早退路径上
+        # 那个赋值语句根本不会被执行到, 会直接 NameError 把任务带崩。
+        began = False
         if self._cancelled(task_id):
             db.update_resource(rid, status="skipped")
             self._publish_resource(task_id, rid, "skipped")
@@ -1296,6 +1304,13 @@ class TaskManager:
             # 磁盘水位: 满盘之后再下就是纯空转(每个资源都要走完一整条重试链)
             ensure_free(out_dir)
 
+            # 资源级遥测: 从这一刻起算这条资源的耗时与尝试次数。
+            # ⚠️ 放在这里而不是函数开头: 上面那些早退(取消/磁盘满/被过滤/无下载器)
+            # 根本没有发起下载, 给它们记"花了 0ms"会把平均值拉低成一个假象 ——
+            # 遥测只该统计**真的下过**的那些。
+            began = True
+            db.begin_resource_attempt(rid)
+
             db.update_resource(rid, status="downloading")
             self._publish_resource(task_id, rid, "downloading")
             # 下载层回填实际生效的下载点与响应类型, 供 manifest 溯源
@@ -1311,6 +1326,14 @@ class TaskManager:
             if proxy_pool is not None and not proxy_pool.empty:
                 picked = proxy_pool.pick(rid)
                 dl_kwargs["session"] = make_proxy_session(picked)
+            # 条件请求凭据: 有历史 etag 才带, 没下过就不带(带了也只会拿到 200)。
+            # 同 `session` 的道理, 一律走 dl_kwargs 按需注入。
+            etag = self._row_field(r, "etag")
+            last_modified = self._row_field(r, "last_modified")
+            if etag:
+                dl_kwargs["etag"] = etag
+            if last_modified:
+                dl_kwargs["last_modified"] = last_modified
             path, sha = downloader.download(
                 r["url"],
                 referer=referer,
@@ -1324,8 +1347,18 @@ class TaskManager:
                 **dl_kwargs,
             )
             meta = {"resolved_url": info.get("resolved_url"),
-                    "content_type": info.get("content_type")}
+                    "content_type": info.get("content_type"),
+                    # 记下本轮拿到的校验器, 供下一次重试走 304 —— 以及比对
+                    # "同一个 URL 的内容被源站换掉了"(见 _note_etag_change)
+                    "etag": info.get("etag"),
+                    "last_modified": info.get("last_modified")}
             meta = {k: v for k, v in meta.items() if v}
+            # 源站内容变了: 老凭据与新凭据不一致, 说明"同一个 URL 背后是另一份内容"。
+            # 增量模式只按 URL 判断"下过就复用", 对这件事本来完全无感 —— 现在是
+            # 一条看得见的日志, 而不是等到用户打开文件才发现物是人非。
+            self._note_etag_change(task_id, rid, r["url"], etag, meta.get("etag"))
+            if info.get("not_modified"):
+                self._safe_log(task_id, f"未变更(304), 复用本地副本: {r['url']}")
             # 代理健康: 这个资源下成功了, 说明这条线是通的 —— 清零它的失败计数
             # (半开状态下即"恢复")。放这里而不是 try 之后, 是因为要区分
             # "下载失败" 与 "写库失败"。
@@ -1451,6 +1484,15 @@ class TaskManager:
                          traceback.format_exc())
         finally:
             self._unregister_closer(task_id, closer)
+            # 遥测收尾: **一条资源只写一次 finished_at**, 无论它是怎么结束的
+            # (成功/失败/gone/损坏/取消/跳过)。放在 finally 而不是每个 except 分支
+            # 里逐处补 —— 分支有 8 个, 漏一个的症状是"那类失败永远没有耗时",
+            # 而这类漏法在 code review 里几乎看不出来。
+            if began:
+                try:
+                    db.update_resource(rid, finished_at=db.now_ts())
+                except Exception:
+                    pass    # 遥测写不进去不该影响任务本身
 
     def _mark_perceptual_dup(self, task_id, rid, path, url, threshold):
         """算 dHash, 并在**本任务内**找出最接近的一张, 只做标记。
@@ -1505,6 +1547,27 @@ class TaskManager:
             raise
         except Exception:
             return
+
+    def _note_etag_change(self, task_id, rid, url, old_etag, new_etag):
+        """发现"同一个 URL 背后换了一份内容"时留一条痕迹。
+
+        ⚠️ 只记录, 不采取任何动作 —— 与 `phash` 的"只标记不删除"同一原则。内容变了
+        不等于新内容更好, 也不等于旧的该丢: 用户可能正是为了留存某一版才采的。
+
+        这件事原本完全不可见: 增量模式只看"这个 URL 下过没有", 于是"源站把图换了"
+        与"内容一模一样"表现完全相同, 直到用户打开文件才发现物是人非。
+        """
+        if not old_etag or not new_etag or old_etag == new_etag:
+            return
+        try:
+            db.update_resource(rid, note=f"源站内容已变更({old_etag} -> {new_etag})")
+            self._safe_log(
+                task_id,
+                f"源站内容已变更: {url} ({old_etag} -> {new_etag})",
+                "warn",
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _infer_name(resources):

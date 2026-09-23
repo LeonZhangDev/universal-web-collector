@@ -76,6 +76,44 @@ export function listLibrary(opts = {}) {
 export function listLibraryAlbums() {
   return api.get("/library/albums").then((r) => r.data);
 }
+// 资源库批量删除。⚠️ withFiles 默认 false = 只删记录、不动文件:
+// 资源库里同一张图可能被多个任务 sha256 去重复用, 真删文件是不可逆的,
+// 后端还会按引用数复查一遍(refs>1 时保留文件并在 kept_files 里回报)。
+export function libraryBulkDelete(ids, withFiles = false) {
+  return api
+    .post("/library/bulk-delete", { ids, with_files: withFiles })
+    .then((r) => r.data);
+}
+// 选中资源打包下载。这里只给 URL —— zip 是流式的, 交给浏览器直接导航,
+// 走 axios 反而要把整个包读进内存。
+export function libraryArchiveUrl(ids) {
+  return `/library/archive?ids=${encodeURIComponent((ids || []).join(","))}`;
+}
+// 落盘后完整性巡检: 库里有记录、磁盘上却不在或被截断的那些。只标记不删除。
+export function libraryVerify(payload = {}) {
+  return api.post("/library/verify", payload).then((r) => r.data);
+}
+// ---- 文件访问 ----
+// 资源库是跨任务视图, 条目上只有 local_path —— 所以走按路径定位的 /files/raw,
+// 而不是按任务定位的 /files/{task_id}/{file}。
+export function rawFileUrl(path) {
+  return `/files/raw?path=${encodeURIComponent(path || "")}`;
+}
+// 缩略图: 网格里铺原图会让一个 40 项的页面下载几百 MB(图集站的图常有几 MB)。
+// 后端生成不了时会**回退原图**, 所以这里永远可以放心用。
+export function thumbUrl(path, size = 320) {
+  return `/files/thumb?path=${encodeURIComponent(path || "")}&size=${size}`;
+}
+// ---- 全局带宽上限 ----
+// 0 = 不限速。对应下载层的字节令牌桶(见 downloaders/ratelimit.py)。
+export function getBandwidth() {
+  return api.get("/config/bandwidth").then((r) => r.data);
+}
+export function setBandwidth(bytesPerSec) {
+  return api
+    .post("/config/bandwidth", { bytes_per_sec: bytesPerSec })
+    .then((r) => r.data);
+}
 // 任务级代理池的实时健康(熔断/失败次数)。任务结束后 running=false。
 export function getTaskProxy(id) {
   return api.get(`/tasks/${id}/proxy`).then((r) => r.data);

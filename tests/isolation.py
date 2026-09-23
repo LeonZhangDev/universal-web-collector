@@ -95,3 +95,62 @@ def snapshot_real():
         except OSError:
             out[key] = None
     return out
+
+
+# ---- "别打开真实库"的即时守卫 ------------------------------------------
+#
+# ⚠️ 为什么指纹守卫(上面那个)不够, 还需要这一道:
+#
+# 1. 指纹只能**事后**发现"文件变了", 而且**同一次变更只能发现一次**。
+#    `database._migrate()` 是幂等的: 加一列之后真实库就永久"正确"了, 之后
+#    再犯同样的错也看不出来 —— 而"每次加列都可能悄悄改用户的库"这件事本身,
+#    比某一次被逮到严重得多。
+# 2. 报错信息里只有"db 变了", 没有**是谁改的**。复盘时得重新反推, 极费时间。
+#
+# 根因很清楚: `monkeypatch.undo()` 会把 `DB_PATH` 还原成真实路径, 于是在
+# "某个用例 teardown 之后、下一个用例 setup 之前"那段窗口里, 任何 DB 访问都会
+# 落到真实库上。能在那段窗口里干活的: 背景线程(看门狗的 hb 心跳)、没被 close 的
+# TestClient 的 portal 线程、别处 fixture 的终结器。
+#
+# 所以判据下沉到**打开的那一刻**并带上调用栈 —— 静默变红, 且一眼看得出是谁。
+_REAL_DB_GUARD_ON = False
+_ORIG_GET_CONN = None
+
+
+def install_real_db_guard():
+    """把"测试期间打开真实库"从静默改成带调用栈的失败。幂等。
+
+    由 `tests/conftest.py` 的会话夹具调用一次。设 `UWC_TEST_ALLOW_REAL_WRITE=1`
+    时整道守卫关闭(与指纹守卫同一个开关, 对着真实环境跑是同一个意图)。
+    """
+    global _REAL_DB_GUARD_ON, _ORIG_GET_CONN
+
+    import core.database as db
+
+    if _REAL_DB_GUARD_ON:
+        return
+    _ORIG_GET_CONN = db.get_conn
+
+    real_db = real_paths()["db"]
+
+    def guarded():
+        try:
+            hit = Path(str(db.DB_PATH)).resolve() == real_db.resolve()
+        except (OSError, ValueError):
+            hit = False
+        if hit:
+            import traceback
+
+            raise AssertionError(
+                "测试期间要打开**用户真实库**了: "
+                f"{db.DB_PATH}\n"
+                "原因通常不是这条用例写错了, 而是 DB_PATH 被 monkeypatch 还原成"
+                "真实路径之后, 还有别的东西在访问数据库(背景线程 / 没关闭的 "
+                "TestClient / 另一个 fixture 的终结器)。\n"
+                "请在 tests/isolation.py 登记新的共享状态, 或让访问发生在用例内部。\n"
+                "调用栈:\n" + "".join(traceback.format_stack()[-8:])
+            )
+        return _ORIG_GET_CONN()
+
+    db.get_conn = guarded
+    _REAL_DB_GUARD_ON = True

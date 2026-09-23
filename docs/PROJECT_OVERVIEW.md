@@ -145,26 +145,36 @@ Windows 使用 `./start.ps1`，开发模式使用 `./start.ps1 --dev`；Linux/ma
 | 内容完整性终检 | 已实现：`core/mediacheck.py` 算术判据（RIFF/BMP 长度、ISOBMFF box 链、JPEG/PNG/GIF 尾标记）+ 直链 ffprobe 时长校验 |
 | 坏文件信号可见 | 已实现：`phash.decode_gray_ex` 区分「无解码器」与「解码失败」，后者标记 `error_kind='corrupt'`（保留文件） |
 | CDN 画像并发写 | 已实现：`cdn_profile` 读者/写者共用 `RLock`，`tmp.replace` 加 5 次退避重试 —— 修掉并发采集时命中记录静默丢一半 |
+| 资源级遥测 | 已实现：`resources` 加 `started_at`/`finished_at`/`attempts`，任务详情展示耗时与重试次数 |
+| 缩略图 | 已实现：`core/thumbs.py` + `/files/thumb`（`_meta/thumb/{sha}.jpg` 缓存）；顺带修掉前端引用的 `/files/raw` **根本不存在**（图片全是 404） |
+| 条件请求 | 已实现：下载带 `If-None-Match`/`If-Modified-Since`，304 且本地在 → 复用不传字节；有 `Range` 时让位（否则收尾路径永远走不到） |
+| 全局字节速率上限 | 已实现：全局共享字节令牌桶 + `max_download_bytes_per_sec` / `UWC_MAX_BPS`，节流点保持可取消 |
+| 资源库批量操作 | 已实现：`/library/bulk-delete`（按 `refs` 决定是否真删文件）与 `/library/archive`（zip 流），前端多选工具条 |
+| Pexels 集合/搜索页 | 已实现：`/v1/search` 与 `/v1/collections/{id}` 分页，兼容 `photos`/`media` 两种返回形状 |
+| 熔断状态持久化 | 已实现：`core/proxy_health.py`（跨任务全局、按代理 URL 分桶），与 CDN 画像共用 `core/jsonstore.py` 的并发纪律 |
+| 落盘后完整性巡检 | 已实现：`POST /library/verify` 用 `mediacheck` 巡检缺失/截断，只标记不删；新增 `missing` 分类 |
+| 测试隔离即时守卫 | 已实现：`isolation.install_real_db_guard()` 在**打开真实库的那一刻**带调用栈失败（指纹守卫只能事后发现，且 `_migrate` 幂等） |
 
 ## 后续可做
 
-截至 V33，前面几轮列出的建议已**全部实施**，无遗留项。V33 是四条**缺陷修复**
-（不是新功能）：失败分类（4xx 不再拖慢全站、资源新增 `gone` 状态与 `error_kind`）、
-直链内容终检（`core/mediacheck.py` + ffprobe）、坏文件信号落库（`DECODE_FAILED`），
-以及附带收掉的 CDN 画像并发丢更新（它同时是本仓库测试套件偶发变红的原因）。
+截至 V34，前面几轮列出的建议已**全部实施**，无遗留项。V34 把 V33 列出的
+八项 backlog **一次做完**（见上表后八行），并顺带修掉两个"看不见"的问题：
 
-若之后继续扩展，优先级较高且方向明确的有：
+- 前端资源库引用的 `/files/raw` **这个接口从来不存在** —— 图片网格全是 404，
+  但因为是 `<img>` 加载失败（onerror 把图藏掉），界面看起来只是"没有缩略图"。
+- 测试套件里存在一个**窗口期**：`monkeypatch.undo()` 会把 `DB_PATH` 还原成真实
+  路径，在那之后、下一个用例 setup 之前访问数据库，就会写到**用户的真库**上。
+  V34 加了即时守卫（带调用栈），因为 `_migrate` 是幂等的 —— 靠事后比对指纹，
+  同样的错只能被抓到一次。
+
+若之后继续扩展，方向明确的有：
 
 | 优先级 | 建议 | 价值与范围 |
 | --- | --- | --- |
-| P1 | 资源级遥测 | `resources` 加 `started_at`/`finished_at`/`attempts`，是"这个任务为什么慢"的**前提**；没有它只能看到聚合后的总时长 |
-| P1 | 缩略图 | 资源库与详情页网格当前用 `/files/raw` 铺**原图**，几十 MB 的图列表会卡；加 `_meta/thumb/` + `/files/thumb` |
-| P2 | 条件请求（ETag/Last-Modified） | 增量现在只按 URL 判断"下过就复用"，同一 URL 的内容被源站替换了发现不了；记 ETag 还能让重试走 304 省字节 |
-| P2 | 全局字节速率上限 | 现在只有"请求数/秒"，没有"字节/秒"，想边下边看视频就没法控 |
-| P2 | 集合/关键词批量采集 | Pexels 集合页与关键词搜索已识别但未实现（关键词需 `PEXELS_API_KEY`），可补分页爬取 |
-| P2 | 资源库批量操作 | 资源库目前只读浏览，可加框选下载/删除（需复用 `count_place_refs` 引用计数） |
-| P3 | 熔断状态持久化 | 熔断计数当前只在内存，重启即重算；如需跨会话记忆可落 `options` |
-| P3 | 落盘后完整性巡检 | 库里的 `local_path` 可能已被外部删除或截断；`mediacheck` 已能判，缺一个批量巡检入口 |
+| P1 | 断点续传的持久化 | 现在 `.part` 只活在当次任务里，任务删除即清；跨任务复用同一 URL 的半成品还做不到 |
+| P2 | 站点级并发配额 | 现在靠 `domain_min_interval` 单点控速，多任务同站会互相排队而没有"这个站最多几个在跑"的显式约束 |
+| P2 | 资源库标签/收藏 | 资源库已是全局视图，但只能按相册/类型筛；打标签后能支持"我要的那批" |
+| P3 | 巡检结果落库 | `/library/verify` 目前是即时返回，刷新即丢；可把结论写 `error_kind='missing'` 持久化 |
 | 按需求 | 更多站点插件 | 契约已稳定（`GallerySite` + `@register`），新增站点只需声明 + `match_score` 把关 |
 
 > ⚠️ 新增站点时注意：纯 ID 样本存在跨站歧义，`match_score` 必须用自己的 `gid_shape`

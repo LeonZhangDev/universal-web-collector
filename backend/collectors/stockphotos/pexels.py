@@ -112,8 +112,11 @@ PEXELS = GallerySite(
         "图片直链 https://images.pexels.com/photos/{id}/pexels-photo-{id}.jpeg",
         "照片页 https://www.pexels.com/photo/{slug}-{id}/",
         "照片 ID 本身(如 1234567)",
-        # 集合/搜索页由独立采集器处理(见 spider.py), 不属于本站声明的输入形态:
-        # 它的资源来自页面解析, 不是序号枚举。
+        # 列表页(搜索/集合)由 `stockphotos/spider.py` 处理 —— 它们的资源来自
+        # API 分页解析, 不是序号枚举, 所以不属于本站"序号枚举"这套声明的输入形态。
+        # (曾经这里写着"不支持集合页", 那是实现没跟上; 现在两条都支持。)
+        "搜索页 https://www.pexels.com/search/{关键词}/ (需 PEXELS_API_KEY)",
+        "集合页 https://www.pexels.com/collections/{slug}-{id}/ (需 PEXELS_API_KEY)",
     ],
     album_url_template="https://www.pexels.com/photo/{gid}/",
     # pexels 的 <title> 形如 "Free stock photo of ..." / "A Cat Sitting · Free Stock Photo"

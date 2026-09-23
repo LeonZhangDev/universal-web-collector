@@ -67,6 +67,12 @@ class Config:
     # 令牌桶容量: 允许短簇突发。⚠️ 它**不改变长程平均速率**, 只是在攒下来的配额里
     # 花 —— 让"刚下完一个大文件"这类空档后面的几个请求不必干等。
     domain_burst: int = 3
+    # ---- 全局字节速率上限(bytes/s, 0 = 不限) ----
+    # ⚠️ 与 domain_min_interval 是**两个正交的维度**: 前者限"请求数/秒"(保护站点,
+    # 防封禁), 这个限"字节/秒"(保护本机带宽)。图集站上 1000 张小图可以请求数很低
+    # 却把带宽占满; 一个大视频则相反。想"边下边看视频"要压住的正是这一项。
+    # 进程内全局共享一个桶 —— 按站点分会让"3 个任务 = 3 倍带宽", 那就不叫上限了。
+    max_download_bytes_per_sec: int = 0
     # 主 URL 失败后是否自动切换到备用下载点(mirrors)
     mirror_fallback: bool = True
     # 枚举探测(HEAD)的间隔: 探测是轻量请求, 不必套用下载级的慢速节奏。
@@ -119,6 +125,44 @@ class Config:
 
 _PATH_FIELDS = {"db_path", "download_dir", "browser_state_dir"}
 
+#: 带宽上限的单位后缀 -> 倍数。**按 1024 而不是 1000** —— 用户说"5MB/s"时
+#: 心里的参照是文件管理器里显示的 MB(1024 进), 用 1000 会显得"限了还是超"。
+_BPS_UNITS = {
+    "": 1, "b": 1,
+    "k": 1024, "kb": 1024, "kib": 1024,
+    "m": 1024 ** 2, "mb": 1024 ** 2, "mib": 1024 ** 2,
+    "g": 1024 ** 3, "gb": 1024 ** 3, "gib": 1024 ** 3,
+}
+
+
+def parse_bytes_per_sec(value):
+    """把 `5MB` / `5m` / `512k` / `1048576` 解析成 bytes/s; 认不出返回 0(不限速)。
+
+    ⚠️ 认不出时退回"不限速"而**不是抛异常**: 带宽上限写错的表现必须是"没限住",
+    不能是"服务起不来" —— 否则一个可选优化项会把整个程序挡在门外, 而用户根本
+    想不到是那一行 yaml 的问题。
+    """
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    text = str(value).strip().lower().replace("/s", "").replace("ps", "")
+    if not text:
+        return 0
+    num = ""
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        else:
+            break
+    unit = text[len(num):].strip()
+    if unit not in _BPS_UNITS:
+        return 0
+    try:
+        return max(0, int(float(num) * _BPS_UNITS[unit]))
+    except (TypeError, ValueError):
+        return 0
+
 
 def load(path: Path = None) -> Config:
     cfg = Config()
@@ -149,6 +193,11 @@ def load(path: Path = None) -> Config:
     cfg.proxy = os.environ.get("UWC_PROXY", cfg.proxy)
     cfg.video_engine = os.environ.get("UWC_VIDEO_ENGINE", cfg.video_engine)
     cfg.ffmpeg_path = os.environ.get("UWC_FFMPEG", cfg.ffmpeg_path)
+    # 带宽上限: 允许写 "5MB"/"5m" 这类人话, 由解析器换算成 bytes/s
+    if os.environ.get("UWC_MAX_BPS"):
+        cfg.max_download_bytes_per_sec = parse_bytes_per_sec(
+            os.environ["UWC_MAX_BPS"]
+        )
     # ffmpeg_path 允许写相对项目根的路径(如 tools/ffmpeg.exe)
     if cfg.ffmpeg_path:
         fp = Path(cfg.ffmpeg_path)

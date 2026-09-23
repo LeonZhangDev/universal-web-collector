@@ -8,6 +8,7 @@ from .base import (
     download_with_mirrors,
     resolve_target,
     task_session,
+    validators_for,
 )
 from .browser_session import browser_session_for
 
@@ -36,7 +37,7 @@ class ImageDownloader:
 
     def download(self, url, referer=None, save_dir="downloads", headers=None,
                  progress_cb=None, mirrors=None, log=None, filename=None, info=None,
-                 session=None):
+                 session=None, etag=None, last_modified=None):
         h = build_headers(referer, headers, accept=IMAGE_ACCEPT)
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         path = resolve_target(save_dir, url, filename, ".jpg")
@@ -53,6 +54,9 @@ class ImageDownloader:
                 url, path, h, session=self.session, progress_cb=progress_cb,
                 mirrors=mirrors, log=log, require_image=True, info=info,
                 request_timeout=TASK_IO_TIMEOUT,
+                # 条件请求: 有上次的校验器就带上, 源站可能回 304(省一整张图的
+                # 传输), 也可能露出"同一 URL 换了内容"这个证据。
+                validators=validators_for(etag, last_modified),
             )
             # ⚠️ 长度对得上 ≠ 内容可用。`_stream_one` 只比字节数, 挡不住"长度正确、
             # 内容被中间设备截断/是 CDN 占位图"的响应 —— 那种文件会以"下载成功"落盘,

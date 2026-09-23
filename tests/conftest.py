@@ -10,6 +10,13 @@
 2. 数据库与下载目录。这个比画像危险: 里面装的是用户真实的任务记录。任何忘了加
    夹具的用例调一次 `db.create_task`, 用户的任务列表里就多一条假数据, 界面上
    看不出是谁写的。
+3. 代理健康(`core/proxy_health.py`)。与 (1) **同型**: 记住"哪条代理最近不行",
+   一个用例把某条线打到熔断, 下个用例的候选顺序就变了。它的特殊性在于状态是
+   **跨任务全局**的(按代理 URL 分桶, 不按任务), 所以更容易串。
+
+另外两个小 JSON 状态文件现在共用 `core/jsonstore.py` 的四条并发纪律 ——
+"读写都进 RLock + replace 退避重试 + 写不进去不假装成功"只有一份实现,
+新增状态文件不该再手写一遍(手写一遍 = 少一条纪律 = 又是静默丢一半)。
 
 所以隔离靠**机制**而不靠自觉: 这里对每个用例自动把共享状态指到它自己的临时目录,
 写脏了真实目录则整会话判红。清单集中在 `isolation.py`, 新增共享状态只改那一个文件。
@@ -29,12 +36,17 @@ import isolation  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolate_shared_state(tmp_path, monkeypatch):
-    """把 CDN 画像 / 数据库 / 下载目录 / 浏览器态都指到本次用例的临时目录。
+    """把 CDN 画像 / 代理健康 / 数据库 / 下载目录 / 浏览器态都指到本次用例的临时目录。
 
-    CDN 画像用环境变量而不是 setattr —— 它是**按 env 读取**设计的(支持 `off`),
-    与 path 字段走的不是一套机制。
+    CDN 画像与代理健康用环境变量而不是 setattr —— 它们是**按 env 读取**设计的
+    (支持 `off`), 与 path 字段走的不是一套机制。
+
+    ⚠️ 代理健康必须隔离, 理由与 CDN 画像同型: 一个用例把某条代理打到熔断, 下个
+    用例的 `pick()` 顺序就变了 —— 症状是"另一个用例莫名其妙挑中了别的代理",
+    与真实原因隔了两层, 且单跑绿、全跑红。
     """
     monkeypatch.setenv("UWC_CDN_PROFILE", str(tmp_path / "cdn_profile.json"))
+    monkeypatch.setenv("UWC_PROXY_HEALTH", str(tmp_path / "proxy_health.json"))
     isolation.isolate(monkeypatch, tmp_path / "state")
     yield
 
@@ -47,11 +59,16 @@ def _no_writes_to_real_dirs():
     这道守卫把"漏登记"从**静默**变成红 —— 上面 autouse 的夹具保证正常情况下它
     永远绿, 红了就说明隔离失效, 而不是某个用例写错了。
 
+    这里同时装上**即时守卫**: 一旦真要打开真实库, 当场带调用栈失败。指纹比对
+    只能事后发现"变了", 而 `_migrate` 幂等 —— 加一列之后真实库就永久变绿,
+    同型的错再看不出第二次。两道闸各管一段, 缺一个都会漏。
+
     例外: 确实要对着真实环境跑时 ``UWC_TEST_ALLOW_REAL_WRITE=1 pytest``。
     """
     if os.getenv("UWC_TEST_ALLOW_REAL_WRITE"):
         yield
         return
+    isolation.install_real_db_guard()
     before = isolation.snapshot_real()
     yield
     after = isolation.snapshot_real()

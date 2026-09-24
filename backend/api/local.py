@@ -102,7 +102,7 @@ def add_root(payload: LocalRootIn):
     """登记一个目录。**只登记不扫描** —— 扫描可能要走几万个文件, 不该在一次
     POST 里做; 前端拿到返回后立刻拉 `/local/albums`, 那一步才会真正扫。"""
     try:
-        root = la.add_root(payload.path, payload.name)
+        root = la.add_root(payload.path, payload.name, exclude=payload.exclude)
     except la.RootError as exc:
         raise _fail(exc)
     return {"root": root}
@@ -110,8 +110,20 @@ def add_root(payload: LocalRootIn):
 
 @router.patch("/local/roots/{root_id}")
 def rename_root(root_id: int, payload: LocalRootRenameIn):
+    """改名 / 改排除模式。
+
+    ⚠️ 两个字段是**同一个接口**而不是两个: 它们在界面上是同一张编辑卡里的两个
+    输入框, 分成两个接口就得让前端决定"先提交哪个" —— 而改名之后立刻改排除
+    模式会作废两次索引。传哪个改哪个, 都不传就是空操作。
+    """
     try:
-        return {"root": la.rename_root(root_id, payload.name)}
+        if payload.exclude is not None:
+            la.set_exclude(root_id, payload.exclude)
+        # ⚠️ `name is None` 表示"这次不改名字", 与 `name == ""`(清空)必须分开。
+        # 一律调 rename_root 的话, 只提交排除模式就会顺手把名字抹掉。
+        row = (la.rename_root(root_id, payload.name)
+               if payload.name is not None else la.get_root(root_id))
+        return {"root": row}
     except la.RootError as exc:
         raise _fail(exc)
 
@@ -233,6 +245,54 @@ def serve_thumb(
 
 
 # ---- 收藏 / 统计 -----------------------------------------------------------
+@router.get("/local/on-this-day")
+def on_this_day(
+    root_id: int = Query(None, description="只看某一个相册集; 不传就是全部"),
+    per_year: int = Query(6, ge=1, le=30),
+    limit: int = Query(60, ge=1, le=120),
+):
+    """"往年的今天" —— 同月同日、但不是今年的照片, 按年份分组。
+
+    ⚠️ 口径是**文件修改时间**, 不是拍摄时间(见 `la.on_this_day` 的说明)。
+    接口刻意**不接受** `today` 参数: 那只是给测试用的注入点, 暴露出去会让
+    "今天"变成可以伪造的输入, 而这个功能唯一的锚点就是真实的今天。
+    """
+    try:
+        data = la.on_this_day(root_id=root_id, per_year=per_year, limit=limit)
+    except la.RootError as exc:
+        raise _fail(exc)
+    for group in data["years"]:
+        group["photos"] = [_photo_urls(p["root_id"], p) for p in group["photos"]]
+    return data
+
+
+@router.get("/local/duplicates")
+def list_duplicates(
+    root_id: int = Query(..., description="相册集 id"),
+    rel: str = Query("", description="相册相对路径; 空串 = 根目录下那些照片"),
+    threshold: int = Query(None, ge=0, le=64, description="海明距离阈值, 默认 4"),
+    limit: int = Query(la.MAX_DUPLICATE_SCAN, ge=1, le=la.MAX_DUPLICATE_SCAN),
+):
+    """一个相册里**疑似重复**的照片对。**只标记, 绝不删任何文件。**
+
+    返回里的 `reason` 必须被前端当真: `no-decoder` 表示"本机没有 ffmpeg, 一张
+    都没算" —— 那是"没验过", 不是"没有重复"。界面上这两种情况要显示不同的话。
+    """
+    try:
+        data = la.duplicates(root_id, rel, threshold=threshold, limit=limit)
+    except la.RootError as exc:
+        raise _fail(exc)
+    data["pairs"] = [
+        {
+            "distance": p["distance"],
+            "a": _photo_urls(root_id, p["a"]),
+            "b": _photo_urls(root_id, p["b"]),
+        }
+        for p in data["pairs"]
+    ]
+    return data
+
+
 @router.get("/local/favorites")
 def list_favorites(offset: int = Query(0, ge=0),
                    limit: int = Query(la.MAX_PAGE_SIZE, ge=1, le=la.MAX_PAGE_SIZE),

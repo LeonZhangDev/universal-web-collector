@@ -1048,7 +1048,7 @@ HLS/DASH 的分片缓存原来只躺在**目标路径旁边**(`.<stem>.parts/`)�
 用户唯一的感知是"这几秒怎么跳过去了" —— 所以最后一行日志会写清"成功 N 片 / 其中 M 片
 没取到"。初始化段只下一份(排在它所属时段的分片前面), 中途换 init 会记一行日志。
 
-## 本地相册集: 把自己电脑上的目录当相册集(V40)
+## 本地相册集: 把自己电脑上的目录当相册集(V40, V41 补四个能力)
 
 采集侧解决的是"网上有什么、怎么搬下来"; 但用户手上早就有一堆**已经在本地**的照片
 (手机导出、旧收藏、别的工具存下来的)。它们散在若干目录里, 想看只能开文件管理器一张张翻。
@@ -1058,8 +1058,8 @@ HLS/DASH 的分片缓存原来只躺在**目标路径旁边**(`.<stem>.parts/`)�
 
 ```bash
 GET    /local/roots                  # 已登记的目录 + 统计
-POST   /local/roots   {path,name}     # 登记(只登记, **不扫描**)
-PATCH  /local/roots/{id} {name}       # 只改显示名
+POST   /local/roots   {path,name,exclude}  # 登记(只登记, **不扫描**)
+PATCH  /local/roots/{id} {name,exclude}    # 改显示名 / 改排除模式(传哪个改哪个)
 POST   /local/roots/{id}/scan         # 强制重扫(绕开索引缓存)
 DELETE /local/roots/{id}              # 取消登记(**磁盘上的文件一个都不动**)
 GET    /local/albums                  # 相册列表(带封面/张数/体积/索引时刻)
@@ -1067,6 +1067,8 @@ GET    /local/photos?root_id=&rel=     # 一个相册里的照片(**实时**列�
 GET    /local/random?count=&seed=&page=&mode=&min_bytes=&favorites_only=
 GET    /local/photo?root_id=&rel=      # 原图
 GET    /local/thumb?root_id=&rel=&size= # 缩略图(生成不了就**回退原图**)
+GET    /local/on-this-day?root_id=&per_year=&limit=   # 往年今日(按年分组)
+GET    /local/duplicates?root_id=&rel=&threshold=&limit=  # 疑似重复的照片对
 GET    /local/favorites                # 收藏(失效的单独列出来, 带原因代号)
 POST   /local/favorite                 # 收藏 / 取消
 POST   /local/favorite/forget          # 删掉一条**失效**的收藏
@@ -1092,6 +1094,10 @@ POST   /local/thumbs/prune             # 清掉"现在看不见的照片"的缩�
 | 张数上限 | 单个根 `UWC_LOCAL_ALBUM_MAX_PHOTOS`(默认 5 万)。超了**会说**"只登记了前一部分" —— 静默截断会让用户以为照片丢了 |
 | 收藏记在哪 | 按**绝对路径**(不是 `根+相对路径`)。代价说清楚: 用户把文件改名/移走之后收藏就断了 —— 反过来在目录整体挪位置时断得更彻底 |
 | 索引保质期 | `UWC_LOCAL_ALBUM_TTL`(默认 30s)。它只影响随机池, 不影响"打开相册" |
+| 排除模式 | 每个根可配 glob(一行一条或 JSON 数组), 最多 50 条。写目录名就排除整个目录(`Raw`)、`*_edited*` 按文件名、**无需**写成 `Raw/**`。扫描结果里带 `excluded`(跳过了多少)与 `exclude_dropped`(超限丢了几条) |
+| 往年今日 | 同月同日、但不是今年的照片, 按年份分组。⚠️ 口径是**文件修改时间**(返回里 `basis="mtime"`), 不是拍摄时间 —— 复制/重新导出会刷新它。同一天反复调用给同一批 |
+| 查重复 | 一个相册内两两比对 dHash(复用 `core/phash`)。**只标记, 绝不删**。⚠️ 返回里三个数必须分开设: `reason="no-decoder"` = **本机没有 ffmpeg、一张都没算**("没验过", 不是"没有重复"); `undecodable` = 有几张解不开(文件的事); `flat` = 有几张是纯色/无梯度图 —— dHash 只看相邻像素谁更亮, 纯红与纯蓝的指纹**完全相同**, 所以这类图**不进比对池** |
+| 扫描对账 | 每次扫描返回 `delta`: `null` = 没有可比对象(第一次扫), `{"added":n,"removed":n}` = 比过了。`null` 与 `{0,0}` 是两个结果 |
 
 ### 只读边界
 
@@ -1144,7 +1150,7 @@ POST   /local/thumbs/prune             # 清掉"现在看不见的照片"的缩�
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (1290 用例, 本机 Windows 收集数; CI/Linux 收集 1291 —— POSIX 上 test_posix_signal_cleans_owned_child_descriptor_and_lock 多一个 SIGHUP 参数, 跳过项也随之互换。含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针与它的产出守卫 / 加站门禁 / 漂移分档 / 双传输与它的源码门禁 / 跳过项策略 / 仓库门禁与假绿 / 本地相册集)
+make test           # pytest (1309 用例, 本机 Windows 收集数; CI/Linux 收集 1310 —— POSIX 上 test_posix_signal_cleans_owned_child_descriptor_and_lock 多一个 SIGHUP 参数, 跳过项也随之互换。含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针与它的产出守卫 / 加站门禁 / 漂移分档 / 双传输与它的源码门禁 / 跳过项策略 / 仓库门禁与假绿 / 本地相册集 / 排除模式·往年今日·重复标记·扫描对账)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)

@@ -22,6 +22,8 @@ import Lightbox from "./Lightbox.vue";
 import {
   addLocalRoot,
   forgetLocalFavorite,
+  getLocalDuplicates,
+  getLocalOnThisDay,
   getLocalRandom,
   listLocalAlbums,
   listLocalFavorites,
@@ -31,10 +33,14 @@ import {
   removeLocalRoot,
   scanLocalRoot,
   setLocalFavorite,
+  updateLocalRootExclude,
 } from "../api";
 import { toast } from "../toast";
 
-const tab = ref("random");              // random | albums | favorites
+// random | albums | memories | favorites。
+// 「往年今日」是一等公民而不是相册里的一个筛选项: 它的入口价值就在于**不用你记得
+// 任何事** —— 一旦要点进某个相册再筛日期, 它就退化成了一个普通搜索。
+const tab = ref("random");
 const stats = ref(null);
 const roots = ref([]);
 const loading = ref(false);
@@ -56,6 +62,18 @@ const albumOpts = ref({ q: "", sort: "mtime", order: "desc" });
 const opened = ref(null);               // { root_id, rel, name, root_name }
 const photos = ref([]);
 const photosTotal = ref(0);
+
+// ---- 往年今日 ----
+const memories = ref(null);             // { date, years, total, basis }
+// ---- 查重复 ----
+// ⚠️ 结果里那个 `reason` 一定要显示出来: 没有 ffmpeg 时后端会返回
+// "no-decoder"(一张都没算), 而把它当成"没有重复"就是最典型的一次假绿 ——
+// 界面上什么都不显示, 用户只会以为自己这个相册很干净。
+const dupes = ref(null);
+const dupLoading = ref(false);
+// ---- 排除模式 ----
+const editing = ref(null);              // 正在编辑排除模式的那个 root
+const editText = ref("");
 
 // ---- 收藏 ----
 const favs = ref([]);
@@ -192,11 +210,80 @@ async function loadFavorites() {
   }
 }
 
+async function loadMemories() {
+  loading.value = true;
+  try {
+    memories.value = await getLocalOnThisDay({ root_id: "", per_year: 6, limit: 60 });
+  } catch (e) {
+    errorMsg.value = errText(e);
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function findDuplicates() {
+  if (!opened.value) return;
+  dupLoading.value = true;
+  dupes.value = null;
+  try {
+    dupes.value = await getLocalDuplicates({
+      root_id: opened.value.root_id,
+      rel: opened.value.rel,
+    });
+  } catch (e) {
+    toast(errText(e), "err");
+  } finally {
+    dupLoading.value = false;
+  }
+}
+
+// ⚠️ 库里存的是 **JSON 字符串**(后端按 TEXT 存), 不是一个数组。以为它是数组就会
+// 在这里写下 `.join` 然后拿到 `undefined is not a function` —— 而且只在"编辑一个
+// 已经配过规则的目录"时才发作, 第一次打开永远是空的。
+function excludeLines(root) {
+  const raw = root && root.exclude;
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [String(parsed)];
+  } catch (e) {
+    return String(raw).split("\n").map((s) => s.trim()).filter(Boolean);
+  }
+}
+
+function openExclude(root) {
+  editing.value = root;
+  // 编辑框里给"一行一条" —— 人在输入框里最自然的写法; 后端两种形态都收。
+  editText.value = excludeLines(root).join("\n");
+}
+
+async function saveExclude() {
+  const root = editing.value;
+  if (!root) return;
+  const lines = editText.value
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  busy.value = true;
+  try {
+    await updateLocalRootExclude(root.id, lines);
+    editing.value = null;
+    await refreshAll();
+    toast(lines.length ? `已保存 ${lines.length} 条排除规则` : "已清空排除规则", "ok");
+  } catch (e) {
+    toast(errText(e), "err");
+  } finally {
+    busy.value = false;
+  }
+}
+
 function refreshAll() {
   // ⚠️ 先清空再拉, 否则"切过去看到的是上一次 tab 的内容"会让人以为数据乱了。
   const jobs = [loadRoots()];
   if (tab.value === "random") jobs.push(loadWall());
   if (tab.value === "albums") jobs.push(loadAlbums());
+  if (tab.value === "memories") jobs.push(loadMemories());
   if (tab.value === "favorites") jobs.push(loadFavorites());
   return Promise.all(jobs);
 }
@@ -204,6 +291,7 @@ function refreshAll() {
 function switchTab(next) {
   tab.value = next;
   opened.value = null;
+  dupes.value = null;
   errorMsg.value = "";
   refreshAll();
 }
@@ -230,9 +318,18 @@ async function rescan(root) {
     const r = await scanLocalRoot(root.id);
     await refreshAll();
     const idx = r.index;
+    // ⚠️ 三件都要报: 排除了多少(证明规则生效了)、相对上一次多了/少了多少
+    // (证明"有东西不见了"这件事能被看见, 而不是只表现为总数变小)、以及读不到的
+    // 子目录(那与"这个目录是空的"长得一样)。
+    const ex = idx.excluded || {};
     toast(
       `重新扫描完成: ${idx.albums} 个相册 / ${idx.photos} 张` +
-        (idx.truncated ? " (已达张数上限, 只登记了前一部分)" : "") +
+        (ex.dirs || ex.files ? ` · 按规则跳过 ${ex.dirs || 0} 个目录 / ${ex.files || 0} 个文件` : "") +
+        (idx.delta
+          ? ` · 比上次 +${idx.delta.added} / -${idx.delta.removed}`
+          : " · 没有可对比的上一次快照") +
+        (idx.exclude_dropped ? ` · ${idx.exclude_dropped} 条规则超限被丢掉` : "") +
+        (idx.truncated ? " · 已达张数上限, 只登记了前一部分" : "") +
         (idx.unreadable ? ` · ${idx.unreadable} 个子目录读不到` : ""),
       idx.error ? "err" : "ok"
     );
@@ -330,9 +427,32 @@ function toggleSlides() {
   if (playing.value) stopSlides();
   else startSlides();
 }
-// ⚠️ 离开组件必须清掉定时器。不清的后果不是"报错", 而是**关掉面板之后后台还在
-// 偷偷翻页并继续请求** —— 那种现象没人会归因到一个已经在屏幕上消失的组件上。
-onUnmounted(stopSlides);
+// 空格 = 播放/暂停。放在**这一层**而不是灯箱里: 灯箱不知道"幻灯片"这回事,
+// 而 `playing` 是这个面板的状态。
+function onPanelKey(e) {
+  if (e.key !== " " && e.code !== "Space") return;
+  if (!lb.value.show) return;
+  // ⚠️ 别抢输入框的空格: 在搜索框里打一个空格就把幻灯片开起来, 是键盘快捷键
+  // 最典型的踩法。判据是"焦点在不在可输入元素上", 不是"当前 tab 是什么"。
+  const t = e.target;
+  const tag = ((t && t.tagName) || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select" || (t && t.isContentEditable)) {
+    return;
+  }
+  e.preventDefault();
+  toggleSlides();
+}
+
+// ⚠️ 离开组件必须清掉定时器与监听。不清的后果不是"报错", 而是**关掉面板之后后台
+// 还在偷偷翻页并继续请求** —— 那种现象没人会归因到一个已经在屏幕上消失的组件上。
+onMounted(() => {
+  window.addEventListener("keydown", onPanelKey);
+  refreshAll();
+});
+onUnmounted(() => {
+  window.removeEventListener("keydown", onPanelKey);
+  stopSlides();
+});
 
 function fmtBytes(n) {
   if (!n) return "0 B";
@@ -359,7 +479,6 @@ function fullPath(p) {
   return root ? `${root}/${rel}` : rel;
 }
 
-onMounted(refreshAll);
 </script>
 
 <template>
@@ -389,6 +508,7 @@ onMounted(refreshAll);
         <span class="err mini" v-if="r.error" :title="r.error">读不到</span>
         <span class="grow"></span>
         <button class="ghost mini" :disabled="busy" @click="rescan(r)">重新扫描</button>
+        <button class="ghost mini" :disabled="busy" @click="openExclude(r)">排除</button>
         <button class="ghost mini" @click="forgetting = r">忘记</button>
       </div>
       <div v-if="!roots.length" class="empty">
@@ -399,6 +519,9 @@ onMounted(refreshAll);
     <div class="view-switch local-tabs" v-if="roots.length">
       <button class="vtab" :class="{ on: tab === 'random' }" @click="switchTab('random')">随机</button>
       <button class="vtab" :class="{ on: tab === 'albums' }" @click="switchTab('albums')">相册</button>
+      <button class="vtab" :class="{ on: tab === 'memories' }" @click="switchTab('memories')">
+        往年今日
+      </button>
       <button class="vtab" :class="{ on: tab === 'favorites' }" @click="switchTab('favorites')">收藏</button>
     </div>
 
@@ -501,10 +624,59 @@ onMounted(refreshAll);
           {{ opened.root_name }} · 已加载 {{ photos.length }} / {{ photosTotal }} 张
         </span>
         <span class="grow"></span>
+        <button class="ghost" :disabled="dupLoading" @click="findDuplicates">
+          {{ dupLoading ? "正在比对…" : "查重复" }}
+        </button>
         <button class="ghost" v-if="playing" @click="stopSlides">停止播放</button>
         <button class="ghost" v-else :disabled="!photos.length" @click="openLb(0); startSlides()">
           幻灯片
         </button>
+      </div>
+
+      <!-- 查重复的结果。**只标记, 不删任何文件** —— 文案必须说清这一点。 -->
+      <div v-if="dupes" class="dupe-block">
+        <div class="lbl">查重复的结果</div>
+        <p v-if="dupes.reason === 'no-decoder'" class="err mini">
+          <b>这一轮没有真的比对</b> —— 本机没有找到 ffmpeg, 一张指纹都没算出来。
+          这不是"没有重复", 是<b>没验过</b>。装好 ffmpeg 再查一次才有结论。
+        </p>
+        <template v-else>
+          <p class="muted mini">
+            比对了 {{ dupes.scanned }} 张
+            <template v-if="dupes.skipped">
+              (超出单次上限, 还有 {{ dupes.skipped }} 张没比)
+            </template>
+            <template v-if="dupes.undecodable">
+              · {{ dupes.undecodable }} 张解不开, 未参与比对
+            </template>
+            <template v-if="dupes.flat">
+              · {{ dupes.flat }} 张是纯色/无内容的图, 指纹对它们没有意义, 已排除
+            </template>
+            · 阈值 {{ dupes.threshold }} 位
+          </p>
+          <div v-if="dupes.pairs.length">
+            <div v-for="(pr, i) in dupes.pairs" :key="i" class="dupe-pair">
+              <div class="dupe-cell">
+                <img :src="pr.a.thumb_url" :alt="pr.a.name" loading="lazy" />
+                <div class="mini">{{ pr.a.name }}</div>
+              </div>
+              <div class="dupe-mid">
+                <span class="mini muted">差 {{ pr.distance }} 位</span>
+              </div>
+              <div class="dupe-cell">
+                <img :src="pr.b.thumb_url" :alt="pr.b.name" loading="lazy" />
+                <div class="mini">{{ pr.b.name }}</div>
+              </div>
+            </div>
+            <p class="muted mini">
+              只列出来, <b>没有动过任何文件</b> —— 指纹会误判(连拍、纯色图都可能
+              撞车), 删哪张由你决定。
+            </p>
+          </div>
+          <div v-else class="muted mini">
+            这个范围里没有找到疑似重复 —— 这次是真的比过了。
+          </div>
+        </template>
       </div>
       <div class="resource-grid" v-if="photos.length">
         <div v-for="(p, i) in photos" :key="p.rel" class="resource-item">
@@ -525,6 +697,47 @@ onMounted(refreshAll);
       <p class="muted mini" v-if="photos.length">
         这一页是<b>实时</b>列目录的结果 —— 看得见的一定打得开。
       </p>
+    </div>
+
+    <!-- ============ 往年今日 ============ -->
+    <div v-if="roots.length && tab === 'memories'">
+      <p class="muted mini">
+        同月同日、但不是今年的照片, 按年份分组。
+        <b>口径是文件的修改时间, 不是拍摄时间</b> —— 复制或重新导出会刷新它,
+        所以整批导入的照片会挤在同一天。
+      </p>
+      <div v-if="memories && memories.years.length">
+        <div v-for="g in memories.years" :key="g.year" class="mem-year">
+          <div class="lbl">{{ g.year }} 年 · {{ g.age }} 年前</div>
+          <div class="resource-grid">
+            <div
+              v-for="(p, i) in g.photos"
+              :key="`${p.root_id}|${p.rel}`"
+              class="resource-item"
+            >
+              <img
+                :src="p.thumb_url"
+                :alt="p.name"
+                loading="lazy"
+                @click="openLb(i)"
+              />
+              <div class="meta">
+                <div class="name" :title="`${p.root_name} / ${p.album} / ${p.name}`">
+                  {{ p.name }}
+                </div>
+                <div>{{ fmtBytes(p.size) }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="muted mini">
+          同一天里反复打开, 看到的是同一批 —— 这是刻意的(每次都换一批就没有"回忆"了)。
+        </p>
+      </div>
+      <div v-else class="empty">
+        今天没有往年的照片。这个结果本身就是答案: 没有过滤条件被忽略, 也没有
+        任何东西被藏起来 —— 只是 {{ memories ? memories.date : "" }} 那天没有。
+      </div>
     </div>
 
     <!-- ============ 收藏 ============ -->
@@ -585,6 +798,33 @@ onMounted(refreshAll);
       <button class="ghost mini" :disabled="busy || !stats?.thumb_cache?.files" @click="doPrune">
         清理缩略图缓存({{ stats?.thumb_cache?.files || 0 }} 个文件)
       </button>
+    </div>
+
+    <!-- 排除规则。⚠️ 一定要把"跳过了多少"显示出来: 一条写错的规则**什么都不排除**,
+         而界面上唯一能证明它生效过的就是这个数字 —— 不显示, 就没有任何东西能让你
+         发现规则是失效的。 -->
+    <div v-if="editing" class="modal-mask" @click.self="editing = null">
+      <div class="modal">
+        <h3>排除规则</h3>
+        <p class="muted">
+          <code>{{ editing.path }}</code>
+        </p>
+        <p class="muted mini">
+          一行一条, 用 glob(<code>*</code> 匹配任意字符)。写目录名就能排除整个目录:
+          <code>Raw</code>、<code>*_edited*</code>、<code>2024/不要</code>。
+        </p>
+        <textarea v-model="editText" rows="6" class="exc-input" spellcheck="false"></textarea>
+        <p class="muted mini">
+          保存后<b>下一次扫描</b>生效。点「重新扫描」, 完成后的提示会告诉你按规则
+          跳过了多少 —— <b>那个数字是判断规则有没有生效的唯一依据</b>(写错的规则
+          什么都不排除, 而结果看起来和"没有规则"一模一样)。
+        </p>
+        <div class="modal-foot">
+          <span class="grow"></span>
+          <button class="ghost" @click="editing = null">取消</button>
+          <button :disabled="busy" @click="saveExclude">保存</button>
+        </div>
+      </div>
     </div>
 
     <FolderPicker
@@ -661,4 +901,29 @@ input.num { flex: 0 0 72px; min-width: 0; }
 .resource-item .fav.on { color: #e0a458; }
 
 .stale-block { margin-top: 16px; display: grid; gap: 8px; }
+
+/* 往年今日: 一年一组, 组与组之间要能看出"这是另一年" */
+.mem-year { margin-top: 14px; display: grid; gap: 6px; }
+.mem-year .lbl { font-weight: 600; }
+
+/* 查重复: 两张并排, 中间写距离。⚠️ 绝不提供"删除"按钮 —— 这个功能只标记。 */
+.dupe-block {
+  margin: 12px 0; padding: 10px 12px; display: grid; gap: 8px;
+  border: 1px solid var(--border, #2b3440); border-radius: 8px;
+}
+.dupe-pair { display: flex; align-items: center; gap: 10px; }
+.dupe-cell { display: grid; gap: 4px; justify-items: center; max-width: 140px; }
+.dupe-cell img {
+  width: 120px; height: 90px; object-fit: cover;
+  border-radius: 6px; background: #161b22;
+}
+.dupe-cell .mini { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
+.dupe-mid { color: var(--muted, #8b96a2); }
+
+/* 排除规则输入框: 等宽字体, 因为写的是 glob 模式 */
+.exc-input {
+  width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace;
+  background: var(--bg, #0d1117); color: var(--text, #e6edf3);
+  border: 1px solid var(--border, #2b3440); border-radius: 6px; padding: 8px;
+}
 </style>

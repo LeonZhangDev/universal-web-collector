@@ -18,6 +18,7 @@
 import ast
 import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -952,3 +953,406 @@ def test_a_garbage_scan_knob_falls_back_to_the_default(monkeypatch):
     monkeypatch.setenv("UWC_LOCAL_ALBUM_DEPTH", "不是数字")
     loaded = cfg.load()
     assert loaded.local_album_depth == cfg.Config().local_album_depth
+
+
+# --------------------------------------------------------------------------
+# ⑨ 对标产品吸收的四个能力(V41)
+#
+# 来源: Immich 的 External Library(与我们同一契约: 只读索引现有目录) 的
+# Exclusion Patterns / Memories / duplicate detection, 以及它的"文件消失先标
+# offline 再清理"。这组用例的重点与前面不同 —— 前面防的是"写坏了用户的盘",
+# 这里防的是**假绿**: 三个新能力里有两个在环境缺失时可能返回"没有结果",
+# 而"没验过"和"验过了没有"必须是两个返回值。
+# --------------------------------------------------------------------------
+
+def test_exclude_patterns_are_parsed_out_of_both_shapes():
+    """一个列表、一个 JSON 串、一个"一行一条"的串, 都要归一成同一个元组。
+
+    为什么接受三种形态: 前端给的是列表, 而用户手输的是字符串, 库里存的是 JSON。
+    三种输入走同一个解析, 才不会出现"从库里读出来的规则不生效"这种只在
+    第二次加载时才发作的问题。
+    """
+    assert la.parse_exclude(["*.tif", "Raw"]) == ("*.tif", "Raw")
+    assert la.parse_exclude('["*.tif", "Raw"]') == ("*.tif", "Raw")
+    assert la.parse_exclude("*.tif\nRaw") == ("*.tif", "Raw")
+    assert la.parse_exclude(None) == ()
+    assert la.parse_exclude("   ") == ()
+
+
+def test_a_garbage_exclude_value_never_breaks_the_scan():
+    """一条写错的规则不许让整个相册集扫不出来 —— 与 `parse_bytes_per_sec` 同族:
+    可选能力出错的表现只能是"这条没生效"。"""
+    assert la.parse_exclude("{不是 JSON") == ("{不是 JSON",)   # 当一行一条读
+    assert la.parse_exclude(["", "  ", "a"]) == ("a",)          # 空串丢掉
+
+
+def test_exclude_drops_a_whole_directory_and_reports_how_many(tmp_path):
+    """`Raw` 这种随手写法要能排除整个目录 —— 严格的 glob 语义下它什么都不排除,
+
+    而"规则静静地失效"是本功能唯一真正的风险: 用户以为排除了, 界面上唯一能
+    证明它生效过的东西就是 `excluded` 这个计数。**所以这条用例断言的是计数,
+    不是"照片少了几张"** —— 后者在规则没生效时也可能成立(比如目录本来就是空的)。
+    """
+    base = _make_tree(tmp_path / "photos")
+    (base / "Raw").mkdir()
+    (base / "Raw" / "big.tif").write_bytes(b"t" * 20)
+    (base / "Raw" / "big.jpg").write_bytes(b"t" * 30)
+    (base / "旅行" / "edited.jpg").write_bytes(b"e" * 40)
+
+    before = la.build_index(la.add_root(str(base))["id"], force=True)
+    assert before["excluded"] == {"dirs": 0, "files": 0}
+
+    root_id = before["root_id"]
+    la.set_exclude(root_id, ["Raw", "*edited*"])
+    after = la.build_index(root_id, force=True)
+
+    assert after["excluded"]["dirs"] == 1          # Raw 整个子树
+    assert after["excluded"]["files"] == 1         # edited.jpg
+    assert not any(a["rel"] == "Raw" for a in after["albums"])
+    assert not any(f["name"] == "edited.jpg" for f in after["order"]["旅行"])
+    # 没被排除的照旧在
+    assert any(a["rel"] == "旅行" for a in after["albums"])
+
+
+def test_the_exclude_report_separates_declared_from_effective():
+    """`exclude_report` 要能把"配了但没生效"的条数报出来。
+
+    ⚠️ `MAX_EXCLUDE_PATTERNS` 是唯一会让条数变少的地方; 断言它, 是为了让
+    "界面上显示的规则数比用户输入的少"这件事有一个可核对的来源, 而不是
+    一句"可能没存上"。
+    """
+    pats, dropped = la.exclude_report(["a", "b"])
+    assert (pats, dropped) == (["a", "b"], 0)
+    many = ["p%d" % i for i in range(la.MAX_EXCLUDE_PATTERNS + 7)]
+    pats, dropped = la.exclude_report(many)
+    assert len(pats) == la.MAX_EXCLUDE_PATTERNS
+    assert dropped == 7
+
+
+def test_on_this_day_groups_previous_years_and_ignores_this_year(tmp_path):
+    """往年今日: 同月同日、但**不是今年**的照片按年份分组, 且**可注入日期**。
+
+    ⚠️ `today` 是显式传入的 —— 这是第 25 条的直接应用: 拿墙钟当判据就得靠
+    "把系统时间改掉"或"造一个恰好是今天的文件", 两者都会让用例在别人的机器上红。
+    """
+    base = tmp_path / "photos"
+    (base / "旅行").mkdir(parents=True)
+    files = {
+        "a.jpg": (2021, 3, 4),
+        "b.jpg": (2021, 3, 4),
+        "c.jpg": (2019, 3, 4),
+        "d.jpg": (2021, 5, 6),     # 同月不同日 -> 不该出现
+        "e.jpg": (2026, 3, 4),     # 今年 -> 不该出现
+    }
+    for name, (y, m, d) in files.items():
+        p = base / "旅行" / name
+        p.write_bytes(b"x")
+        os.utime(p, (time.mktime((y, m, d, 12, 0, 0, 0, 0, 0)),) * 2)
+
+    root = la.add_root(str(base))
+    today = time.struct_time((2026, 3, 4, 10, 0, 0, 0, 0, 0))
+    got = la.on_this_day(root_id=root["id"], today=today)
+
+    assert got["date"] == "03-04"
+    assert got["basis"] == "mtime"          # 口径必须随数据一起交出去
+    years = {g["year"]: len(g["photos"]) for g in got["years"]}
+    assert years == {2021: 2, 2019: 1}
+    assert [g["year"] for g in got["years"]] == [2021, 2019]   # 倒序
+    assert got["years"][0]["age"] == 5
+    assert all(p["year"] != 2026 for g in got["years"] for p in g["photos"])
+
+
+def test_on_this_day_is_stable_within_one_day(tmp_path):
+    """同一天反复调用要给同一批 —— "今天看到的该是同一批"是 Memories 的形态。
+
+    反过来说: 每次刷新都换一批, 这个功能就没有记忆点, 而"随机"在这里是最容易
+    被当成优点写进去的错。
+    """
+    base = tmp_path / "photos"
+    (base / "a").mkdir(parents=True)
+    for i in range(8):
+        p = base / "a" / ("%02d.jpg" % i)
+        p.write_bytes(b"x")
+        os.utime(p, (time.mktime((2020, 7, 1, 12, 0, 0, 0, 0, 0)),) * 2)
+    root = la.add_root(str(base))
+    today = time.struct_time((2026, 7, 1, 10, 0, 0, 0, 0, 0))
+
+    first = la.on_this_day(root_id=root["id"], per_year=3, today=today)
+    second = la.on_this_day(root_id=root["id"], per_year=3, today=today)
+    assert [p["rel"] for p in first["years"][0]["photos"]] == \
+           [p["rel"] for p in second["years"][0]["photos"]]
+
+
+def test_on_this_day_without_roots_is_empty_not_an_error(tmp_path):
+    """没有登记任何相册集 -> 空结果, 而不是抛异常。"""
+    got = la.on_this_day(today=time.struct_time((2026, 3, 4, 10, 0, 0, 0, 0, 0)))
+    assert got["years"] == []
+    assert got["total"] == 0
+
+
+def _stub_decode(monkeypatch, table=None, reason=None, flat=False):
+    """把"解码"这一层换成替身, 但**保留** `dhash_from_gray` 与 `distance` 的真代码。
+
+    `table` 是 `{文件名: 想要的 dHash}`; `reason` 非 None 就一律返回解码失败。
+    ⚠️ 为什么不直接替掉 `dhash_from_gray`: 那样 `phash.distance` 这段真逻辑就
+    不跑了, 用例验到的就成了替身自己 —— 替身不诚实是 E 类, 比没有测试更糟。
+    所以这里**反推**出一组灰度字节, 让真的 dHash 算出来正好等于想要的值。
+    """
+    from core import phash
+
+    w, h = phash._W, phash._H
+    plain = bytes([0]) * (w * h) if flat else None
+
+    def _decode(path, *a, **k):
+        if reason:
+            return None, reason
+        if flat:
+            return plain, None
+        return _raw_for_dhash((table or {}).get(Path(path).name, "0" * 16)), None
+
+    monkeypatch.setattr(phash, "decode_gray_ex", _decode)
+
+
+def _raw_for_dhash(value):
+    """反推一组灰度字节, 使它算出来的 dHash 恰好是 `value`(十六进制, 64 位)。
+
+    dHash 的定义就是"相邻像素谁更亮", 所以只要让每一步的明暗方向对上那一位即可。
+    从 128 出发每次 ±3: 9 列走完 8 步, 极差远大于 `_FLAT_RANGE`, 于是这张"图"
+    不会被当成纯色排除掉。
+    """
+    from core import phash
+
+    w, h = phash._W, phash._H
+    bits = int(value, 16)
+    raw = bytearray()
+    for y in range(h):
+        level = 128
+        row = [level]
+        for x in range(w - 1):
+            bit = (bits >> (64 - 1 - (y * (w - 1) + x))) & 1
+            level = level + 3 if bit else level - 3
+            row.append(level)
+        raw.extend(row)
+    return bytes(raw)
+
+
+def test_duplicates_says_it_could_not_check_instead_of_saying_none_found(tmp_path, monkeypatch):
+    """**这组里最要紧的一条**: 一台没有 ffmpeg 的机器上, "查重复"必须说
+
+    "没验过", 不能返回"没有重复"。返回空列表是最漂亮的假绿 —— 界面上什么都不
+    显示, 用户只会以为自己这个相册确实没有重复。
+
+    所以判据不是 `pairs == []`, 而是 `reason == "no-decoder"`。
+    """
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+
+    _stub_decode(monkeypatch, reason="no_decoder")
+    got = la.duplicates(root["id"], "旅行")
+
+    assert got["pairs"] == []
+    assert got["reason"] == "no-decoder"
+    assert got["scanned"] == 0
+
+
+def test_a_broken_file_is_not_blamed_on_the_machine(tmp_path, monkeypatch):
+    """**"解不开"归文件, "没解码器"归机器** —— 这两个不许混(第 26 条)。
+
+    第一版图省事写成了 `reason = "no-decoder" if not hashes`, 于是"相册里全是坏图"
+    会被报成"本机没有 ffmpeg"。后果很具体: 界面照着 `no-decoder` 提示"请安装
+    ffmpeg", 而用户明明装了 —— 于是他再也信不了这个提示, **真正的环境缺失也
+    就一起被淹掉了**。
+
+    抓到它的是一次冒烟(假 JPEG 全解不开), 不是单元测试。
+    """
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+
+    _stub_decode(monkeypatch, reason="decode_failed")
+    got = la.duplicates(root["id"], "旅行")
+
+    assert got["reason"] is None              # 不是机器的错
+    assert got["undecodable"] > 0             # 而是这些文件解不开
+    assert got["pairs"] == []
+
+
+def test_flat_pictures_do_not_accuse_each_other(tmp_path):
+    """**纯色图不许互指成重复** —— 一条只有真图跑出来才看得见的假阳性。
+
+    dHash 只比较相邻像素谁更亮, 所以纯红与纯蓝的指纹**完全相同**(距离 0)。
+    一次冒烟里三张纯色图(红/红/蓝)被两两配成 3 对, 全是假的 —— 放到真实场景里,
+    一个装满纯色截图/占位图的文件夹会整片互指。
+
+    ⚠️ 抓到它的不是单元测试: 单测用的是 monkeypatch 掉的假指纹, 永远走不到
+    "真解码出一片纯色"那条路。所以这条用例自己**直接喂灰度字节**给
+    `phash.is_flat_gray`, 不依赖 ffmpeg —— 判据挂在数据上, 不挂在环境上。
+    """
+    from core import phash
+
+    w, h = phash._W, phash._H
+    assert phash.is_flat_gray(bytes([0]) * (w * h)) is True          # 全黑
+    assert phash.is_flat_gray(bytes([255]) * (w * h)) is True        # 全白
+    assert phash.is_flat_gray(bytes([7]) * (w * h)) is True          # 任意纯色
+    noisy = bytes((i * 37) % 256 for i in range(w * h))
+    assert phash.is_flat_gray(noisy) is False                        # 有内容
+
+
+def test_duplicates_leaves_flat_pictures_out_of_the_pool(tmp_path, monkeypatch):
+    """纯色图**不进比对池**, 并且这个事实要报出来(`flat`)。
+
+    `flat` 为什么要报: 不报的话, "相册里全是纯色截图"和"查过了没有重复"
+    在界面上长得一模一样 —— 又是第 26 条那个形状。
+    """
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+
+    _stub_decode(monkeypatch, {}, flat=True)
+    got = la.duplicates(root["id"], "旅行")
+
+    assert got["reason"] is None
+    assert got["scanned"] == 0
+    assert got["flat"] > 0
+    assert got["pairs"] == []
+
+
+def test_duplicates_marks_but_never_deletes(tmp_path):
+    """只标记不删(phash 约束 1): 查完重复, 磁盘必须一个字节都没变。
+
+    用的还是 `_tree` 指纹 —— 只读边界是这个功能唯一的硬承诺, 每加一个新能力
+    都要重新证明一次, 而不是相信"上一个能力没写、所以这个也不会写"。
+    """
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+    before = _tree(base)
+
+    la.duplicates(root["id"], "旅行")
+    assert _tree(base) == before
+
+
+def test_duplicates_returns_pairs_when_the_pictures_are_the_same(tmp_path, monkeypatch):
+    """两张指纹相同的图要被报成一对, 并带上距离。"""
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+
+    # 替身只按文件名给指纹, 不真去解码 —— 这一组要验的是**比对与返回**,
+    # 不是 ffmpeg 能不能用(那属于 phash 自己的用例)。
+    table = {"a.jpg": "0" * 16, "10.jpg": "0" * 16, "2.jpg": "f" * 16}
+    _stub_decode(monkeypatch, table)
+
+    got = la.duplicates(root["id"], "旅行")
+    assert got["reason"] is None
+    assert got["scanned"] == 3
+    assert len(got["pairs"]) == 1
+    pair = got["pairs"][0]
+    assert pair["distance"] == 0
+    assert {pair["a"]["name"], pair["b"]["name"]} == {"a.jpg", "10.jpg"}
+
+
+def test_duplicates_honours_the_scan_cap(tmp_path, monkeypatch):
+    """一次最多解 MAX_DUPLICATE_SCAN 张 —— 超出部分要报 `skipped`, 不许静默截断。"""
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+    _stub_decode(monkeypatch, {})
+    got = la.duplicates(root["id"], "旅行", limit=2)
+    assert got["scanned"] == 2
+    assert got["skipped"] == 1
+
+
+def test_the_scan_reports_what_changed_since_the_last_snapshot(tmp_path):
+    """与上一次快照对账: 新增/消失各报一个数。
+
+    ⚠️ 两条必须分开断言:
+      * 第一次扫(没有可比对象) -> `delta is None`, 不是 `{0, 0}`;
+      * 删掉一张之后重扫 -> `removed == 1`。
+    把"没得比"写成 0, 界面就永远显示"没有变化", 而用户永远看不出有东西不见了。
+    """
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+
+    first = la.build_index(root["id"], force=True)
+    assert first["delta"] is None                  # 没有可比对象
+
+    (base / "旅行" / "new.jpg").write_bytes(b"n" * 5)
+    second = la.build_index(root["id"], force=True)
+    assert second["delta"] == {"added": 1, "removed": 0}
+
+    (base / "旅行" / "a.jpg").unlink()
+    third = la.build_index(root["id"], force=True)
+    assert third["delta"] == {"added": 0, "removed": 1}
+
+
+def test_renaming_a_root_invalidates_the_index(tmp_path):
+    """改名要作废索引 —— 根目录那一层的相册名**就是**登记名。
+
+    "改了没反应"是最难归因的一类现象, 而它的成因在这里只是"缓存没清"。
+    """
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base), "旧名字")
+    view = la.albums(root_id=root["id"])
+    assert _album(view, "")["name"] == "旧名字"
+
+    la.rename_root(root["id"], "新名字")
+    view = la.albums(root_id=root["id"])
+    assert _album(view, "")["name"] == "新名字"
+
+
+def test_setting_exclude_invalidates_the_index(tmp_path):
+    """改排除模式也必须作废索引, 否则用户会以为规则没生效(其实是还没重扫)。"""
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+    la.build_index(root["id"], force=True)
+    row = la.set_exclude(root["id"], ["旅行"])
+    assert row["exclude"]
+    assert la.build_index(root["id"])["excluded"]["dirs"] == 1
+
+
+def test_the_new_endpoints_take_no_absolute_path(tmp_path):
+    """接口签名这条纪律对新路由同样成立: 没有任何一个参数叫 `path` / `file`。
+
+    ⚠️ 这条是**结构化**的(AST 扫形参), 因为"多接一个参数"这种事在 review 里
+    看不出来: 它只在本文件多一行, 而它的后果(任意文件读取)在别处。
+    """
+    from api import local as api_local
+    src = Path(api_local.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for arg in list(node.args.args) + list(node.args.kwonlyargs):
+                if arg.arg in ("path", "file", "filepath"):
+                    if node.name == "forget_favorite":
+                        continue        # 唯一例外: 只删库里一行, 不碰磁盘
+                    bad.append((node.name, arg.arg))
+    assert bad == []
+
+
+def test_on_this_day_and_duplicates_are_reachable_over_http(tmp_path):
+    """两个新路由要真的接上了(而不仅仅是函数存在)。
+
+    不验内容, 只验**状态码与字段形状** —— 内容判据在上面的核心层用例里, 重复
+    一遍只会让两条用例一起改。
+    """
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+    from api.local import router
+
+    base = _make_tree(tmp_path / "photos")
+    root = la.add_root(str(base))
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    r1 = client.get("/local/on-this-day", params={"root_id": root["id"]})
+    assert r1.status_code == 200
+    assert r1.json()["basis"] == "mtime"
+    assert "years" in r1.json()
+
+    r2 = client.get("/local/duplicates", params={"root_id": root["id"], "rel": "旅行"})
+    assert r2.status_code == 200
+    body = r2.json()
+    assert "pairs" in body and "reason" in body and "scanned" in body
+
+    # 越界的根仍要按代号报错, 不能因为"这是新接口"就忘了
+    r3 = client.get("/local/duplicates", params={"root_id": 99999})
+    assert r3.status_code == 404
+    assert r3.json()["detail"]["kind"] == la.KIND_UNKNOWN_ROOT

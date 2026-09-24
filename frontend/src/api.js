@@ -260,6 +260,30 @@ export function addLocalRoot(path, name) {
 export function renameLocalRoot(id, name) {
   return api.patch(`/local/roots/${id}`, { name }).then((r) => r.data);
 }
+// 改排除模式。`patterns` 是数组或"一行一条"的字符串 —— 后端两种都收
+// (见 core/localalbums.parse_exclude)。⚠️ 传空数组是"清空规则", 与不传不同。
+export function updateLocalRootExclude(id, patterns) {
+  return api.patch(`/local/roots/${id}`, { exclude: patterns }).then((r) => r.data);
+}
+// "往年的今天"。⚠️ 口径是文件修改时间, 不是拍摄时间 —— 界面上不许写成"拍摄于"。
+export function getLocalOnThisDay(opts = {}) {
+  const params = {};
+  if (opts.root_id) params.root_id = opts.root_id;
+  if (opts.per_year) params.per_year = opts.per_year;
+  if (opts.limit) params.limit = opts.limit;
+  return api.get("/local/on-this-day", { params }).then((r) => r.data);
+}
+// 查重复。**只标记不删**: 返回的 pairs 是给人看的, 后端一个字节都没动。
+// ⚠️ `reason` 必须被当真: "no-decoder" 表示本机没有 ffmpeg、一张都没算 ——
+// 那是"没验过", 不是"没有重复"。
+export function getLocalDuplicates(opts = {}) {
+  const params = { root_id: opts.root_id, rel: opts.rel || "" };
+  if (opts.threshold !== undefined && opts.threshold !== null) {
+    params.threshold = opts.threshold;
+  }
+  if (opts.limit) params.limit = opts.limit;
+  return api.get("/local/duplicates", { params }).then((r) => r.data);
+}
 export function removeLocalRoot(id) {
   return api.delete(`/local/roots/${id}`).then((r) => r.data);
 }

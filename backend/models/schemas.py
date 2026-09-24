@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -506,10 +506,15 @@ class LocalRootIn(BaseModel):
 
     path: str
     name: Optional[str] = None      # 留空就用目录名
+    # 排除模式: glob 列表, 或"一行一条"的字符串。见 core/localalbums.parse_exclude。
+    # ⚠️ 类型是 Any 而不是 List[str]: 前端给的是字符串, 而 pydantic 的严格 List
+    # 会把一个字符串拆成一个个字符 —— 那种错误只在运行时才看得见。
+    exclude: Optional[Any] = None
 
 
 class LocalRootRenameIn(BaseModel):
     name: Optional[str] = None      # 只改显示名, 不动 path
+    exclude: Optional[Any] = None   # 改排除模式(会作废索引, 下一轮重扫)
 
 
 class LocalFavoriteIn(BaseModel):

@@ -45,6 +45,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import os
 import random
 import threading
@@ -66,20 +68,27 @@ __all__ = [
     "KIND_NOT_IMAGE",
     "KIND_UNKNOWN_ROOT",
     "RootError",
+    "MAX_EXCLUDE_PATTERNS",
     "add_root",
     "albums",
     "build_index",
+    "duplicates",
+    "exclude_report",
     "favorite_keys",
     "favorites",
     "favorites_view",
     "forget_favorite",
     "get_root",
+    "on_this_day",
+    "parse_exclude",
+    "photos",
     "prune_thumbs",
     "random_photos",
     "remove_root",
     "rename_root",
     "roots",
     "safe_photo",
+    "set_exclude",
     "set_favorite",
     "stats",
     "thumb_base",
@@ -187,6 +196,82 @@ def _is_image(name):
     return Path(str(name)).suffix.lower() in IMAGE_SUFFIXES
 
 
+#: 一个相册集最多配多少条排除模式。不是为了省内存, 是为了让"配了 500 条规则"
+#: 这种用法在门口就被拒, 而不是变成一次慢到没人愿意等的扫描。
+MAX_EXCLUDE_PATTERNS = 50
+
+
+def _split_exclude(raw):
+    """把各种输入形态拆成"非空字符串的列表" —— **截断之前**的条数。
+
+    ⚠️ 解析逻辑只有这一份: `parse_exclude`(要截断)与 `exclude_report`(要报
+    "丢了几条")都需要它。写成两份的话, 两边会各自漂移, 而漂移的表现正是
+    `dropped` 恒为 0 —— 一个"看起来没坏"的静默失败。
+    """
+    if raw is None:
+        return []
+    items = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            loaded = json.loads(text)
+        except (ValueError, TypeError):
+            # 不是 JSON 就当"一行一条"读: 用户在输入框里最自然的写法就是换行。
+            loaded = text.replace(",", "\n").splitlines()
+        items = loaded if isinstance(loaded, (list, tuple)) else [loaded]
+    return [str(i).strip() for i in (items or []) if str(i or "").strip()]
+
+
+def parse_exclude(raw):
+    """把"排除模式"的各种输入形态归一成字符串元组(超上限的丢掉)。
+
+    接受 None / 字符串(JSON 数组或一行一条) / 列表。⚠️ **坏值一律跳过而不是
+    抛异常**: 一条写错的规则让整个相册集扫不出来, 是典型的"一个附件能力把主
+    流程搞挂"(见 core/phash.py 约束 2)。
+    """
+    return tuple(_split_exclude(raw)[:MAX_EXCLUDE_PATTERNS])
+
+
+def exclude_report(raw, patterns=None):
+    """把配置还原成"界面能如实转述"的形态: `(生效的, 被丢掉的条数)`。
+
+    ⚠️ 为什么要单独有这个函数: **"没有排除规则"和"规则写了但一条都没生效"
+    必须长得不一样。** 前者是用户的意图, 后者是用户以为自己在排除、其实一张
+    都没排除 —— 那是最难自查的一类静默失败(界面上唯一可见的差别就是"0 项被
+    跳过", 而这个数字如果不显示, 就没有任何东西能让你发现它)。
+    """
+    pats = parse_exclude(raw) if patterns is None else tuple(patterns)
+    return list(pats), max(0, len(_split_exclude(raw)) - len(pats))
+
+
+def _excluded(rel_path, patterns):
+    """这个相对路径(文件或目录)是否被排除。
+
+    三条判据, 命中任一即排除。之所以是三条而不是严格照 glob 语义只判一条:
+    用户随手写的一个词(`Raw`、`*_edited*`)是**最常见**的输入形态, 而严格的
+    glob 会让 `Raw` 这种写法**什么都不排除** —— 规则静静地失效。
+
+      1. 完整相对路径匹配(`2024/Raw/a.jpg` vs `**/Raw/*`);
+      2. 末段文件名匹配(`a.jpg` vs `*_edited*`);
+      3. **任一祖先目录**匹配(`Raw` 命中 `2024/Raw/a.jpg` 的祖先 `2024/Raw`)
+         —— 这一条让"排除整个目录"不必写成 `Raw/**`。
+    """
+    if not patterns:
+        return False
+    text = str(rel_path).replace("\\", "/")
+    head, _, tail = text.rpartition("/")
+    for pat in patterns:
+        if fnmatch.fnmatch(text, pat):
+            return True
+        if tail and fnmatch.fnmatch(tail, pat):
+            return True
+        if head and fnmatch.fnmatch(head.rpartition("/")[2], pat):
+            return True
+    return False
+
+
 def _within(path, root):
     """`path` 是否在 `root` 之内。两者都应当已经 resolve 过。"""
     try:
@@ -230,11 +315,13 @@ def get_root(root_id):
     return dict(row)
 
 
-def add_root(raw, name=None):
+def add_root(raw, name=None, exclude=None):
     """登记一个目录为相册集。**只登记, 不扫描** ——
 
     扫描可能要走几万个文件, 不该发生在一次 POST 里。前端拿到返回后立刻拉一次
     相册列表, 那一步才会真正扫描(`build_index` 冷缓存必然扫)。
+
+    `exclude` 是排除模式(glob 列表或一行一条的字符串), 见 `parse_exclude`。
     """
     text = str(raw or "").strip().strip('"')
     if not text:
@@ -263,11 +350,26 @@ def add_root(raw, name=None):
             raise RootError(KIND_DUPLICATE, "这个目录已经登记过了: %s" % path)
 
     cur = db.execute(
-        "INSERT INTO local_roots(path, name, created_at) VALUES(?,?,?)",
-        (str(path), (str(name).strip() or None) if name else None, db.now_ts()),
+        "INSERT INTO local_roots(path, name, created_at, exclude) VALUES(?,?,?,?)",
+        (
+            str(path),
+            (str(name).strip() or None) if name else None,
+            db.now_ts(),
+            json.dumps(list(parse_exclude(exclude))) if exclude else None,
+        ),
     )
     invalidate()
     return get_root(cur.lastrowid)
+
+
+def update_root_cache(root_id):
+    """登记行变了之后让索引下一轮重算, 并返回新的登记行。
+
+    ⚠️ 改名也要作废索引: 根目录那一层的相册名**就是**登记名(见 `_album_name`),
+    不改的话用户改完名立刻看到的还是旧名字 —— "改了没反应"。
+    """
+    invalidate(int(root_id))
+    return get_root(int(root_id))
 
 
 def rename_root(root_id, name):
@@ -277,7 +379,32 @@ def rename_root(root_id, name):
         "UPDATE local_roots SET name=? WHERE id=?",
         ((str(name).strip() or None) if name else None, row["id"]),
     )
+    return update_root_cache(row["id"])
+
+
+def set_exclude(root_id, exclude):
+    """改排除模式。⚠️ 改完必须**作废索引** ——
+
+    否则界面会拿着排除前的索引继续报账, 表现为"我加了规则, 但那些照片还在",
+    而用户只会怀疑规则没写对(其实是还没重扫)。
+    """
+    row = get_root(root_id)
+    pats = parse_exclude(exclude)
+    db.execute(
+        "UPDATE local_roots SET exclude=? WHERE id=?",
+        (json.dumps(list(pats)) if pats else None, row["id"]),
+    )
+    invalidate(row["id"])
     return get_root(row["id"])
+
+
+def update_root_cache(root_id):
+    """登记行变了但**路径没变**时, 只让索引下一轮重算, 返回新行。
+
+    (改名字不影响扫描结果, 所以这里不 invalidate —— 但改 `exclude` 必须, 见
+    `set_exclude`。)
+    """
+    return get_root(int(root_id))
 
 
 def remove_root(root_id):
@@ -304,11 +431,15 @@ def _album_name(root, rel, display=None):
     return str(rel).replace("\\", "/").rsplit("/", 1)[-1]
 
 
-def _stack_scan(root, depth, max_photos, display=None):
-    """走一遍目录树, 返回 (albums, order, photos, bytes, truncated, unreadable)。
+def _stack_scan(root, depth, max_photos, display=None, exclude=()):
+    """走一遍目录树, 返回 (albums, order, photos, bytes, truncated, unreadable, excluded)。
 
     `albums` 是相册元数据, `order` 是 `{相册rel: [照片...]}` —— 分成两份是为了
     让"相册列表"这条最热的接口不必把每张照片都拖出来。
+
+    `excluded` 是 `{"dirs": n, "files": n}` —— 被排除模式跳过的目录/文件数。
+    ⚠️ 它必须被数出来并报上去: 排除规则**没生效**和**没有排除规则**在结果上
+    长得一模一样(都是"这些照片不见了"), 而只有这个数字能把两者分开。
     """
     albums = []
     order = {}
@@ -316,6 +447,7 @@ def _stack_scan(root, depth, max_photos, display=None):
     total_bytes = 0
     truncated = False
     unreadable = 0
+    excluded = {"dirs": 0, "files": 0}
 
     stack = [("", 0)]
     while stack:
@@ -333,11 +465,14 @@ def _stack_scan(root, depth, max_photos, display=None):
         for entry in entries:
             try:
                 if entry.is_dir():
+                    child_rel = "%s/%s" % (rel, entry.name) if rel else entry.name
+                    if _excluded(child_rel, exclude):
+                        excluded["dirs"] += 1
+                        continue
                     if entry.name.startswith(".") or entry.name.lower() in SKIP_DIR_NAMES:
                         continue
                     if level < depth:
                         child = here / entry.name
-                        child_rel = "%s/%s" % (rel, entry.name) if rel else entry.name
                         # 软链接指向根外: 跟进去的话, 相册里会列出一批
                         # `safe_photo` 必然拒掉的路径 —— "看得见、点不开"比
                         # "看不见"更让人困惑, 也会让"这个相册有几张"变成假数字。
@@ -348,6 +483,11 @@ def _stack_scan(root, depth, max_photos, display=None):
                     if not _is_image(entry.name):
                         continue
                     if entry.name.lower() in JUNK_FILE_NAMES:
+                        continue
+                    if _excluded(
+                        ("%s/%s" % (rel, entry.name) if rel else entry.name), exclude
+                    ):
+                        excluded["files"] += 1
                         continue
                     st = entry.stat()
                     files.append({
@@ -382,7 +522,45 @@ def _stack_scan(root, depth, max_photos, display=None):
             break
 
     albums.sort(key=lambda a: _natural_key(a["rel"]))
-    return albums, order, total, total_bytes, truncated, unreadable
+    return albums, order, total, total_bytes, truncated, unreadable, excluded
+
+
+def _snapshot_keys(index):
+    """索引里全部照片的身份集合, 形如 `{"旅行/a.jpg", "cover.jpg"}`。
+
+    ⚠️ 用"相册 rel + 文件名"而不是绝对路径: 对账要比的是"这张照片还在不在",
+    而根被改名/移动时绝对路径会**整体变一次** —— 那会被算成"全部消失 + 全部
+    新增", 而实际上一张都没动。
+    """
+    out = set()
+    for rel, files in (index or {}).get("order", {}).items():
+        for f in files:
+            out.add("%s/%s" % (rel, f["name"]) if rel else f["name"])
+    return out
+
+
+def _prev_snapshot(root_id, path):
+    """上一次索引快照 —— 只在**还是同一个目录**时才算数。"""
+    with _cache_lock:
+        old = _cache.get(int(root_id))
+    return old if old and old.get("path") == path else None
+
+
+def _diff_keys(prev, order):
+    """与上一次快照对账; 返回 None 或 `{"added": n, "removed": n}`。
+
+    ⚠️ **None 的含义是"没得比"**(进程刚启动 / 从没扫过 / 根被换成了另一个目录),
+    与 `{"added": 0, "removed": 0}`(**比过了, 一张没变**)是两件必须分得开的事。
+    合并成 0 的话, 界面永远显示"没有变化", 而"这次其实没有可比对象"这个事实
+    被抹掉了 —— 那正是 Immich 那种"先标 offline 再清理"要解决的问题: 用户得能
+    看出"有东西不见了", 而不是只看到一个总数变小。
+    """
+    if prev is None:
+        return None
+    old = _snapshot_keys(prev)
+    new = _snapshot_keys({"order": order})
+    return {"added": len(new - old), "removed": len(old - new)}
+
 
 def build_index(root_id, force=False):
     """取这个根的索引快照; 缓存过期或不存在就现扫。
@@ -401,19 +579,23 @@ def build_index(root_id, force=False):
 
     depth = max(0, int(getattr(settings, "local_album_depth", 3)))
     cap = max(1, int(getattr(settings, "local_album_max_photos", 50000)))
+    patterns, dropped = exclude_report(row.get("exclude"))
     error = None
     try:
         if not root.is_dir():
             albums, order, total, total_bytes, truncated, unreadable = [], {}, 0, 0, False, 0
+            excluded = {"dirs": 0, "files": 0}
             error = "目录不存在或不是目录: %s" % root
         else:
-            albums, order, total, total_bytes, truncated, unreadable = _stack_scan(
-                root, depth, cap, display=row.get("name")
+            (albums, order, total, total_bytes, truncated,
+             unreadable, excluded) = _stack_scan(
+                root, depth, cap, display=row.get("name"), exclude=patterns
             )
     except OSError as exc:
         # `_stack_scan` 内部已经按目录粒度兜住了 OSError; 走到这里说明是更外面
         # 的失败(例如 root / rel 拼出来的路径非法)。同样要**留痕**。
         albums, order, total, total_bytes, truncated, unreadable = [], {}, 0, 0, False, 0
+        excluded = {"dirs": 0, "files": 0}
         error = "扫描失败: %s" % exc
 
     index = {
@@ -428,6 +610,12 @@ def build_index(root_id, force=False):
         "truncated": truncated,
         "unreadable": unreadable,
         "error": error,
+        # 排除规则"配了什么 / 真的生效了吗" —— 见 exclude_report
+        "exclude": list(patterns),
+        "exclude_dropped": dropped,
+        "excluded": excluded,
+        # 与上一次快照的对账, 见 _diff_keys
+        "delta": _diff_keys(_prev_snapshot(row["id"], row["path"]), order),
     }
     with _cache_lock:
         _cache[row["id"]] = index
@@ -454,6 +642,10 @@ def index_brief(index):
         "truncated": index["truncated"],
         "unreadable": index["unreadable"],
         "error": index["error"],
+        "exclude": index.get("exclude", []),
+        "exclude_dropped": index.get("exclude_dropped", 0),
+        "excluded": index.get("excluded", {"dirs": 0, "files": 0}),
+        "delta": index.get("delta"),
     }
 
 
@@ -789,6 +981,187 @@ def random_photos(count=60, root_id=None, album=None, mode="album", page=0, seed
         "has_more": cursor + len(items) < len(pool),
         "at": at,
         "truncated": truncated,
+    }
+
+
+# ---- 往年今日 --------------------------------------------------------------
+def on_this_day(root_id=None, per_year=6, limit=60, today=None):
+    """"去年的今天、前年的今天" —— 同月同日、但**不是今年**的照片, 按年份分组。
+
+    对标的 Immich `Memories` / Google Photos 的 "On This Day": 两者都把它当作
+    "离开之后最想念的那一个功能"。理由不难理解 —— 一个相册集越是庞大, 人越不会
+    翻到三年前那个文件夹; 而"今天"这个锚点不需要用户记得任何事。
+
+    ⚠️ **口径是文件的修改时间(mtime), 不是拍摄时间。** 这是刻意的取舍:
+    拍照片的 EXIF 需要新增依赖(且大量下载来的图片根本没有 EXIF), 而 mtime 是
+    文件系统白给的。代价必须说清楚 —— 复制/移动/重新导出会**刷新 mtime**, 于是
+    "整批导入的照片"会挤在同一天, 而不是分散在它们的拍摄日。所以界面上要写
+    "按文件修改时间", 不能写成"按拍摄时间"。宁可少说, 不可说错。
+
+    ⚠️ `today` 参数是为了**不拿墙钟当判据**(第 25 条): 测试要能传入一个确定的
+    日期, 而不是靠"把系统时间改掉"或"造一个恰好是今天的文件"。
+
+    返回 `{date, years, total, roots}`: `years` 按年份倒序, 每年最多 `per_year`
+    张(用当天日期做种子抽, 于是**同一天刷新页面看到的是同一批**, 不会每次都不一样)。
+    """
+    now = today or time.localtime()
+    month, day, this_year = now.tm_mon, now.tm_mday, now.tm_year
+    rows = [get_root(root_id)] if root_id else roots()
+
+    by_year = {}
+    briefs = []
+    for row in rows:
+        index = build_index(row["id"])
+        briefs.append(index_brief(index))
+        root_path = Path(row["path"])
+        for rel, files in index["order"].items():
+            for f in files:
+                shot = time.localtime(f["mtime"])
+                if shot.tm_mon != month or shot.tm_mday != day or shot.tm_year == this_year:
+                    continue
+                item = {
+                    "root_id": row["id"],
+                    "root_name": row.get("name") or root_path.name or row["path"],
+                    "name": f["name"],
+                    "rel": "%s/%s" % (rel, f["name"]) if rel else f["name"],
+                    "album": rel,
+                    "size": f["size"],
+                    "mtime": f["mtime"],
+                    "year": shot.tm_year,
+                }
+                by_year.setdefault(shot.tm_year, []).append(item)
+
+    years = []
+    total = 0
+    # ⚠️ 种子用"今天"而不是"每次随机": 一年内可能有一千张符合, 每次刷新换一批
+    # 就等于这个功能没有记忆点 —— 而"今天看到的该是同一批"正是 Memories 的形态。
+    rng = random.Random("%04d-%02d-%02d" % (this_year, month, day))
+    for year in sorted(by_year, reverse=True):
+        picks = by_year[year]
+        rng.shuffle(picks)
+        if total >= max(1, int(limit or 60)):
+            break
+        room = max(1, int(limit or 60)) - total
+        page = picks[: min(max(1, int(per_year or 6)), room)]
+        if not page:
+            continue
+        total += len(page)
+        years.append({"year": year, "age": this_year - year, "photos": page})
+    return {
+        "date": "%02d-%02d" % (month, day),
+        "years": years,
+        "total": total,
+        "roots": briefs,
+        "basis": "mtime",
+    }
+
+
+# ---- 重复标记 --------------------------------------------------------------
+#: 一次查重复最多解码多少张。每张要起一次 ffmpeg 子进程(见 core/phash),
+#: 500 张就是 500 次 —— 放在一次 HTTP 请求里跑完 5 万张是不现实的, 所以宁可
+#: **明确截断并报出来**, 也不要让请求挂到超时(挂到超时的后果是用户以为坏了)。
+MAX_DUPLICATE_SCAN = 400
+
+
+def duplicates(root_id, rel="", threshold=None, limit=MAX_DUPLICATE_SCAN):
+    """找出一个相册里**疑似重复**的照片对。只标记, 绝不删(见 core/phash 约束 1)。
+
+    对标的 Immich duplicate detection / Billfish 的重复检测。它们的价值不在
+    "省空间"(删文件才省), 而在**指着告诉你哪几张是同一张** —— 人自己看不出来
+    两个不同尺寸/不同压缩的同源图是不是一张。
+
+    ⚠️ 三个必须分开的结果(合并任何一个都会造出假绿):
+
+      * `reason="no-decoder"` —— 本机没有 ffmpeg, **一张都没算**。这时候返回空
+        列表等于说"没有重复", 而真实情况是"没验过"。这是本函数最要紧的一条:
+        一个附件能力在环境缺失时**假装成功**, 比失败糟糕得多。
+      * `undecodable=n` —— 有那么几张解不开(坏文件/冷门格式), 其余照常比。
+      * `pairs=[]` 且 reason 为 None —— 真比过了, 确实没找到重复。
+
+    返回 `{pairs, scanned, skipped, undecodable, flat, threshold, reason}`。`pairs`
+    里每项 `{a, b, distance}`, `distance` 是 64 位指纹的海明距离(越小越像)。
+
+    ⚠️ `flat` 是**纯色/无梯度**的照片数: dHash 只比较相邻像素谁更亮, 所以一张纯红
+    和一张纯蓝的指纹完全相同。让它们参与比对, 结果是一个文件夹里的纯色截图彼此
+    互指成"全是重复" —— 所以这类图**不进比对池**, 并且把数量报出来(理由同
+    `excluded`: 没有计数的话, "一张都没比"和"没有重复"长得一样)。
+    """
+    from core import phash
+
+    row = get_root(root_id)
+    root = Path(row["path"]).resolve()
+    rel = str(rel or "").replace("\\", "/").strip("/")
+    found = _list_album(root, rel, row["id"])
+
+    cap = max(1, min(int(limit or MAX_DUPLICATE_SCAN), MAX_DUPLICATE_SCAN))
+    scanned_items = found[:cap]
+    skipped = max(0, len(found) - len(scanned_items))
+    limit_dist = phash.DEFAULT_THRESHOLD if threshold is None else int(threshold)
+
+    hashes = []
+    undecodable = 0
+    flat = 0
+    # ⚠️ `no_decoder` 与 `undecodable` **必须分开计数**, 而且 reason 只能由前者决定。
+    # 第一版图省事写成了 `reason = "no-decoder" if not hashes`, 于是"相册里全是坏图"
+    # (每张都 DECODE_FAILED)会被报成"本机没有 ffmpeg" —— 这正是第 26 条要防的那种
+    # 混淆: 一个关于**文件**的结论, 被说成了关于**机器**的结论。
+    no_decoder = 0
+    for item in scanned_items:
+        try:
+            path = safe_photo(row["id"], item["rel"])
+        except RootError:
+            continue
+        raw, why = phash.decode_gray_ex(str(path))
+        if not raw:
+            if why == phash.NO_DECODER:
+                no_decoder += 1      # 机器的事: 这一张**根本没机会被验**
+            else:
+                undecodable += 1     # 文件的事: 验了, 解不开
+            continue
+        # 纯色/无梯度图: 它们的指纹恒等, 参与了就会互相指认成一整片假重复。
+        # 所以这里不是"算出来再过滤", 而是**根本不让它们进比对池**。
+        if phash.is_flat_gray(raw):
+            flat += 1
+            continue
+        value = phash.dhash_from_gray(raw)
+        if not value:
+            undecodable += 1
+            continue
+        hashes.append((item, value))
+
+    reason_out = "no-decoder" if no_decoder else None
+    if not hashes:
+        return {
+            "pairs": [],
+            "scanned": 0,
+            "skipped": skipped,
+            "undecodable": undecodable,
+            "flat": flat,
+            "threshold": limit_dist,
+            "reason": reason_out,
+            "album": {"root_id": row["id"], "rel": rel},
+        }
+
+    pairs = []
+    for i in range(len(hashes)):
+        a_item, a_hash = hashes[i]
+        for j in range(i + 1, len(hashes)):
+            b_item, b_hash = hashes[j]
+            dist = phash.distance(a_hash, b_hash)
+            if dist is None or dist > limit_dist:
+                continue
+            pairs.append({"a": a_item, "b": b_item, "distance": dist})
+    # 距离小的排前面: 最像的那几对才是用户想看的
+    pairs.sort(key=lambda p: (p["distance"], _natural_key(p["a"]["rel"])))
+    return {
+        "pairs": pairs,
+        "scanned": len(hashes),
+        "skipped": skipped,
+        "undecodable": undecodable,
+        "flat": flat,
+        "threshold": limit_dist,
+        "reason": reason_out,
+        "album": {"root_id": row["id"], "rel": rel},
     }
 
 

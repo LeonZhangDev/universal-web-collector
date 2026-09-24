@@ -68,6 +68,11 @@ DEFAULT_THRESHOLD = 4
 #: 一个坏文件导致解码器卡死"。超时后返回 None, 不重试 —— 指纹算不出来就算了。
 _TIMEOUT = 20.0
 
+#: 判定"几乎没有梯度"的灰度极差阈值。实测: 一张纯色图极差 0, 一张带文字的白底
+#: 截图极差 200+。取 8 是为了放过"轻微噪点/渐变", 只挡真正的纯色块。
+#: ⚠️ 这个数是用真图比出来的, 不是文献值 —— 见 `is_flat_gray`。
+_FLAT_RANGE = 8
+
 
 def _no_window_kwargs():
     """Windows 上别弹出控制台窗口。
@@ -146,6 +151,29 @@ def decode_gray_ex(path, width=_W, height=_H):
         # ⚠️ 这里**不能**返回 DECODE_FAILED: OSError("文件被占用") 是我们的环境
         # 问题, 拿它去指认"文件已损坏"就是冤枉。
         return None, NO_DECODER
+
+
+def is_flat_gray(raw, width=_W, height=_H) -> bool:
+    """这张图是不是**几乎没有梯度**的(纯色 / 大块同色)。
+
+    ⚠️ dHash 只看**相邻像素谁更亮**, 不看绝对亮度。所以一张纯红和一张纯蓝的图,
+    指纹**完全相同**(距离 0)—— 因为两者每一对相邻像素都是"不大于"。纯色截图、
+    占位图、Logo 同理: 它们会被判成"彼此都是重复", 而且是一整片互指。
+
+    判据用"灰度的极差": 极差小于 `_FLAT_RANGE` 就认为这张图的指纹**不携带信息**。
+    误报的代价(第 ③ 条心法)决定这里要偏保守 —— 这类图一律**不参与比对**,
+    而不是参与之后给出一堆假配对。
+    """
+    if not raw or len(raw) < width * height:
+        return True
+    low = 255
+    high = 0
+    for value in raw[: width * height]:
+        if value < low:
+            low = value
+        if value > high:
+            high = value
+    return (high - low) < _FLAT_RANGE
 
 
 def dhash_from_gray(raw, width=_W, height=_H) -> Optional[str]:

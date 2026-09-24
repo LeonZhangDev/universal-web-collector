@@ -189,7 +189,12 @@ CREATE TABLE IF NOT EXISTS local_roots(
     photo_count INTEGER NOT NULL DEFAULT 0,
     -- 扫描时的异常(目录被拔了/权限不足)。**留着不吞**: 一个读不到的根如果
     -- 只表现为"0 张照片", 用户会以为是自己目录是空的。
-    error TEXT
+    error TEXT,
+    -- V41: 排除模式(glob 列表, JSON 数组字符串)。对标的 Immich 把它列为
+    -- "几乎每套配置里都该有的两条"(`**/@eaDir/**`、`**/*_edited*`): 硬编码的
+    -- 黑名单只能挡住我们**已经见过**的垃圾目录, 挡不住用户自己的 `Raw/`、
+    -- 编辑件、导出件。存 JSON 而不是拼逗号: 路径里真的会有逗号。
+    exclude TEXT
 );
 
 -- 本地照片的收藏。⚠️ 按**绝对路径**记账, 不按 (root_id, rel):
@@ -260,6 +265,8 @@ _ADD_COLUMNS = [
     ("resources", "width", "INTEGER"),
     ("resources", "height", "INTEGER"),
     ("resources", "duration", "REAL"),
+    # V41: 相册集的排除模式(glob 列表, JSON 数组)。见 localalbums.parse_exclude
+    ("local_roots", "exclude", "TEXT"),
 ]
 
 

@@ -79,7 +79,7 @@ cancel 留文件；pause 在资源边界退出；resume 不重采不重下。看
 `~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；curl 对 127.0.0.1 加 `--noproxy '*'`；起服务用 `run_in_background`。
 ⚠️ 别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）；同一文件多处 Edit **不要并行发**。
 ⚠️ 本机 venv 已补装 `curl-cffi`；全量 **1146 条全绿**（1140 passed / 6 skipped，212s）。
-⚠️ **用例数口径**：本文件写的是**收集总数**（passed + skipped）。改完文档前**先跑一遍数**——本轮又差点写错（把 1140 passed 当总数）。**差分不闭合就先怀疑自己**：1146 = 上版 1139 + `test_transport` 7。
+⚠️ **用例数口径**：写的是**收集总数**（passed + skipped），**且是本机 Windows 口径**：CI(Linux) 收集 **1147** —— `POSIX_TERMINATION_SIGNALS` 在非 Windows 上多一个 SIGHUP 参数；跳过项互换（本机 6 = POSIX×5+信号×1，CI 8 = 无 ffmpeg×7+Windows 锁×1），两边都闭合（1140+6 / 1139+8）。改完文档前**先跑一遍数**；**差分不闭合先怀疑自己**：1146 = 上版 1139 + `test_transport` 7。
 ⚠️ **`img.xchina.io` 从本机整段 403**（`text/plain`，不是 CF 挑战页；裸 curl + 浏览器 UA、`impersonate=chrome` 都一样）→ 这条网络的问题，**不是站点改版、不是回归**。别拿它当靶子。
 ⚠️ 别前置 `export PATH="/usr/bin:/bin:$PATH"` —— 会把裸 `python` 换成 3.13.12（没 pytest）。coreutils 全无（`cat`/`grep`/`tail`），但 `echo`、`git`、`python` 可用。
 ⚠️ 宿主包装器 `windows-child-process-containment.cjs` 偶发缺失 → 长命令直接 `MODULE_NOT_FOUND`（**压根没跑**）；加 `run_in_background=true` 绕过。

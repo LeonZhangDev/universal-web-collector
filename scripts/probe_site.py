@@ -128,6 +128,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings  # noqa: E402
 from core import imageinfo  # noqa: E402
+from core import transport  # noqa: E402
 from core.filters import Filters  # noqa: E402
 from core.jsonstore import JsonStore  # noqa: E402
 from collectors import resolve_collector  # noqa: E402
@@ -170,31 +171,10 @@ def ctype_for(ext):
 def make_session(proxy=None, impersonate=None):
     """建会话; 返回 (session, 传输说明)。
 
-    `impersonate` 走 curl-cffi(浏览器 TLS 指纹)。它在 CI/最小环境里可能**没装** ——
-    那是环境问题, 不该让整个探针挂掉: 降级成 requests 并**把降级说出来**,
-    否则用户会以为"指纹这条路也试过了"(静默降级必须留痕)。
+    实现在 `core.transport`(`--impersonate` 需要 curl-cffi, 没装时降级成 requests
+    并**把降级说出来** —— 否则用户会以为"指纹这条路也试过了")。
     """
-    if impersonate:
-        try:
-            from curl_cffi import requests as curl_requests
-
-            s = curl_requests.Session(impersonate=impersonate)
-            transport = "curl-cffi (impersonate=%s)" % impersonate
-        except Exception as e:
-            import requests
-
-            s = requests.Session()
-            transport = ("requests —— !! curl-cffi 不可用(%s), 没能用上 %s 指纹"
-                         % (type(e).__name__, impersonate))
-    else:
-        import requests
-
-        s = requests.Session()
-        transport = "requests (默认 TLS 指纹)"
-    p = proxy if proxy is not None else settings.proxy
-    if p:
-        s.proxies.update({"http": p, "https": p})
-    return s, transport
+    return transport.build(proxy, impersonate)
 
 
 def head(session, url, headers, timeout=None):
@@ -442,6 +422,11 @@ def page_tail_evidence(page_urls, gid):
 #: 这些状态码说明"不是这条 URL 的问题, 而是我们被挡在门外了" —— 值得换指纹再试一次。
 _REACH_RETRY_STATUS = (401, 403, 406, 429, 503)
 
+#: 换指纹**有收益**的处置代号(见 `diagnose_block` 的 `step`)。只有这些才自动重试 ——
+#: 写成白名单而不是"排除某一种": 每个新成因都会重新问一次"换指纹有没有用",
+#: 而不是默默继承一个默认值。(`escalate` = "按成本从低到高试", 第一条就是换指纹。)
+_RETRY_STEPS = ("impersonate", "escalate")
+
 #: Cloudflare 挑战页的指纹。命中任何一个就说明"我们被当成爬虫挡在 JS 挑战前面" ——
 #: 这不是请求头写得不像, 而是 TLS/JS 指纹层面的拦截。
 _CF_MARKERS = (
@@ -455,11 +440,21 @@ def sniff(session, url, headers, timeout=None, limit=1024):
 
     与 `head()` 一样, 失败返回 `(None, None, b"")`, **绝不当成"不存在"**。
     只读前 1KB: 判定 403 的成因够用了, 没必要为一次诊断把整张图拖下来。
+
+    ⚠️ 用 `transport.streamed` 而不是 `with session.get(...)`: 后者在 curl-cffi
+    (`--impersonate`) 下直接抛 `TypeError`, 被下面的 `except` 吞成"没有正文" ——
+    而这一步**只在被挡住时**才跑, 换指纹那条路又正好是 CF 站点的必经之路。
+    真实后果: CF 挑战页被判成"看不出具体成因", 用户丢掉"要去开真浏览器"这条线索。
+
+    ⚠️ `iter_content(512)` 的 512 在 curl-cffi 下**被忽略**(它按 curl 自己的分块给),
+    `CurlCffiWarning: chunk_size is ignored`。这里真正管住读多少的是下面的 `limit`,
+    所以两种传输的结果一致 —— 别把 512 当成"只读 512 字节"的保证。
     """
     try:
-        with session.get(url, headers=headers, allow_redirects=True,
-                         timeout=timeout or settings.request_timeout,
-                         stream=True) as resp:
+        with transport.streamed(
+            session, "get", url, headers=headers, allow_redirects=True,
+            timeout=timeout or settings.request_timeout, stream=True,
+        ) as resp:
             body = b""
             for chunk in resp.iter_content(512):
                 if chunk:
@@ -472,7 +467,7 @@ def sniff(session, url, headers, timeout=None, limit=1024):
 
 
 def diagnose_block(status, ctype, hdrs, body):
-    """把"被挡在门外"分成**处置完全不同**的几种; 返回 `(kind, why, fix)`。
+    """把"被挡在门外"分成**处置完全不同**的几种; 返回 `(kind, step, why, fix)`。
 
     这一步的价值全在"下一步该做什么"上 —— 下面几种成因的处置互不通用, 笼统说一句
     "换个指纹试试"等于没说, 而 403 恰好是最常见也最容易误判的一种:
@@ -489,6 +484,13 @@ def diagnose_block(status, ctype, hdrs, body):
     从这台机器整段 403 且正文是 `text/plain`, **换 TLS 指纹与浏览器 UA 都没有用** ——
     那是出口 IP 被挡, 换指纹只是白跑一次。把它们混成一条建议, 用户就会照着错的那条
     一直试下去。
+
+    **`step` 是给机器看的代号, 与 `kind` 分开**: `kind` 说"是什么", `step` 说
+    "该做什么"。加这一项是为了让"这两种成因处置相反"变成一条**可断言的判据** ——
+    否则只能拿 `fix` 里的中文去 grep, 而 `ip_block` 的文案里**必须**写明"换指纹没用"
+    并给出实测证据, 那就必然写到一个指纹名: 查 `"chrome" not in fix` 会把它读成
+    "推荐了换指纹", 一条**正确**的实现被判红(本项目真实踩过)。
+    代号是契约, 文案只是它的说明 —— 判据只能挂在代号上。
     """
     h = {k.lower(): v for k, v in (hdrs or {}).items()}
     low = (body or b"")[:1024].decode("utf-8", "ignore").lower()
@@ -499,39 +501,39 @@ def diagnose_block(status, ctype, hdrs, body):
     cf_mitigated = "cf-mitigated" in h
 
     if any(m in low for m in _CF_MARKERS) or cf_mitigated:
-        return ("cf_challenge",
+        return ("cf_challenge", "impersonate",
                 "Cloudflare 挑战页(正文/响应头里有 `just a moment`、`cf-mitigated` 之类标记)",
                 "换浏览器 TLS 指纹(`--impersonate chrome`); 还不行就走 `scripts/probe.py` "
                 "让真浏览器打开 —— 需要跑 JS 的挑战, 裸 HTTP 永远过不去")
 
     if status == 401 or "www-authenticate" in h:
-        return ("auth",
+        return ("auth", "login",
                 "要登录(401 / WWW-Authenticate)",
                 "这条路本就不适用: 本项目不做登录态采集。换一个公开的下载点, 或换站点")
 
     if status == 429:
-        return ("rate",
+        return ("rate", "wait",
                 "被限速(429)",
                 "等几分钟再跑; 或 `--proxy` 换一个出口 IP")
 
     if status == 403 and ctype.startswith("text/plain"):
-        return ("ip_block",
+        return ("ip_block", "proxy",
                 "403 且正文是 `text/plain` —— 典型的 **IP 段/地域封禁**(不是 WAF 挑战页)",
                 "`--proxy` 换出口。**换 TLS 指纹对这种没用**(2026-09-23 在 xchina 上实测: "
                 "裸 curl、浏览器 UA、`impersonate=chrome` 全是同一个 `text/plain` 403)")
 
     if status and 500 <= status < 600:
-        return ("down",
+        return ("down", "wait",
                 "站点自己返回 %s" % status,
                 "过几分钟再跑; 持续这样就先去浏览器确认站点是否正常")
 
     if status in (403, 406):
-        return ("blocked",
+        return ("blocked", "escalate",
                 "%s, 但看不出具体成因(既不是 CF 挑战页, 也不是 text/plain 封禁)" % status,
                 "按成本从低到高试: ① `--impersonate chrome` ② `--proxy` "
                 "③ 浏览器里打开这条直链确认它还有效")
 
-    return ("unknown", "状态码 %s, 无法归类" % (status,),
+    return ("unknown", "inspect", "状态码 %s, 无法归类" % (status,),
             "先在浏览器里打开这条直链, 确认它本身还有效(签名过期 / 图集被删都会这样)")
 
 
@@ -571,7 +573,7 @@ def probe_reachability(session, info, timeout):
         r_status, r_hdrs = head(session, info["url"], dict(headers, Referer=ref), timeout)
         r_ct = (r_hdrs.get("Content-Type") or "").lower() if r_hdrs else ""
         if r_status == 200 and r_ct.startswith(ctype_for(info["ext"])):
-            diag = ("referer",
+            diag = ("referer", "referer",
                     "带上 `Referer: %s` 就通了 —— 这是**防盗链**(裸请求没有来源页)" % ref,
                     "⚠️ 基类目前**不带 Referer**(`gallery_base` 里没有这个字段): 要么给 "
                     "`GallerySite` 加一个 referer 声明, 要么单独记一笔待办 —— "
@@ -579,8 +581,8 @@ def probe_reachability(session, info, timeout):
             print("      (带 Referer 重试: %s %s)" % (r_status, r_ct or "-"))
 
     print("  => 不通 —— 后面的四项**都没跑**(它们全都要先能拿到资源)")
-    print("  => 成因: [%s] %s" % (diag[0], diag[1]))
-    print("  => 下一步: %s" % diag[2])
+    print("  => 成因: [%s] %s" % (diag[0], diag[2]))
+    print("  => 下一步 [%s]: %s" % (diag[1], diag[3]))
     return False, status, ct, diag
 
 
@@ -1303,9 +1305,13 @@ def probe_smoke(session, info, urls, timeout, out_dir=None):
         http_headers = {"User-Agent": settings.user_agent, "Accept": accept_for(ext)}
         detail, ok = "", False
         try:
-            with session.get(u, headers=http_headers, allow_redirects=True,
-                             timeout=timeout or settings.request_timeout,
-                             stream=True) as resp:
+            # 与 `sniff` 同理: 必须用 `transport.streamed`。冒烟本来就常在
+            # `--impersonate` 下跑(被 CF 挡住的站点才需要它), 手写 `with` 会让
+            # 冒烟**在唯一需要它的场合**恒失败, 而且失败得像"站点不允许下载"。
+            with transport.streamed(
+                session, "get", u, headers=http_headers, allow_redirects=True,
+                timeout=timeout or settings.request_timeout, stream=True,
+            ) as resp:
                 if resp.status_code != 200:
                     detail = "HTTP %s" % resp.status_code
                 else:
@@ -1406,12 +1412,15 @@ def main():
     # (`reachable: False`) 恰是 drift_check 最想看到的漂移。
     snap.update(build_snapshot(info, False, None, "", (), None, (), (), (), {}, (), 0))
 
-    session, transport = make_session(args.proxy, args.impersonate or None)
+    # ⚠️ 这个局部变量叫 `transport_name` 而不是 `transport` —— 后者会**遮蔽**上面
+    # `from core import transport` 的模块名。本项目真踩过这一族(第 13 条: `_download_m3u8`
+    # 的参数 `info` 被局部变量顶掉, 于是某个字段恒缺)。同一个名字干两件事, 迟早出事。
+    session, transport_name = make_session(args.proxy, args.impersonate or None)
 
     print("=" * 74)
     print("新站点探针 (只探测, 不落盘)")
     print("=" * 74)
-    print("传输      : %s" % transport)
+    print("传输      : %s" % transport_name)
     print("资源直链  : %d 条, 采信 %s" % (len(media), short(info["url"], 66)))
     print("页面 URL  : %d 条" % len(pages))
     print("推断结果  : base=%s  gid=%s  序号=%s  后缀=%r"
@@ -1420,12 +1429,15 @@ def main():
 
     ok, status, ct_seen, diag = probe_reachability(session, info, args.timeout)
     if not ok and not args.impersonate and status in _REACH_RETRY_STATUS:
-        if diag and diag[0] == "ip_block":
-            # 换指纹只对**一部分**成因有用: CF 挑战页有用, 而 IP 段封禁(-- 上面判出来的
-            # `text/plain` 403)是白跑一次。自动重试的前提是"这条路的收益 > 成本", 对
-            # IP 封禁不成立 —— 那就该把它换成一条**正确的**建议, 而不是多一次请求。
-            print("  => 成因是 IP 段封禁 —— 换指纹对它**没用**, 所以不自动重试; "
-                  "要的是 `--proxy`(见上面的下一步)")
+        # 自动重试的判据是"这一步的处置**就是**换指纹", 而不是"不是 IP 封禁"。
+        # 前者是白名单(只做有收益的那种), 后者是黑名单 —— 黑名单会随着新增成因不断
+        # 漏人: 429 限速与 5xx 都不是换指纹能解决的(它们按出口 IP / 按站点状态算),
+        # 换一次只是白跑。`blocked`(403 但看不出成因)算进来, 因为它自己的首要建议
+        # 就是换指纹, 属于"有收益但不确定"。
+        step = diag[1] if diag else ""
+        if step not in _RETRY_STEPS:
+            print("  => 成因是 [%s] —— 换指纹对它**没用**, 所以不自动重试;"
+                  "该做什么见上面的「下一步 [%s]」" % (diag[0] if diag else "?", step))
         else:
             # "站点在 Cloudflare 后面"是最常见的一种"谁都没做错、就是进不去"。既然换
             # 指纹这条现成的路就在手边, 就不该让用户先看见 403、再手动加参数重跑一遍 ——
@@ -1438,7 +1450,7 @@ def main():
                     session.close()
                 except Exception:
                     pass
-                session, transport = alt_session, alt_transport
+                session, transport_name = alt_session, alt_transport
                 ok, status, ct_seen, diag = ok2, status2, ct2, diag2
             else:
                 try:

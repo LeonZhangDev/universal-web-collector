@@ -51,6 +51,88 @@ _ALBUM = "葡萄 一番街"
 
 
 # --------------------------------------------------------------------------
+# 闸的结论: **结构化**, 不是"一串给人看的文案"
+# --------------------------------------------------------------------------
+#
+# 两条规矩, 各治一种"绿/红是假的"的病:
+#
+# ① 每道闸必须报 `checked`(实际核了几项)。`checked == 0` **不许算绿**。
+#    治的是**假绿**里最常见的一种: 闸跑通了、印了一行 ok, 但它一项都没核 ——
+#    因为它要核的东西压根不存在(没有样本 / 拼不出 URL / 站点没注册)。
+#    "没验到" 与 "验过了没问题" 是两件事, 混在一行 ok 里就是撒谎。
+#
+# ② 问题带 `kind`(代号), 测试断言 `kind`, 不断言中文文案。
+#    治的是**假红**: 本项目真实踩过一条 —— 断言写 `"chrome" not in ip`, 而那句
+#    文案里提到 Chrome 是在说"**换指纹没用**"(IP 封禁只能换出口), 于是一条**正确**
+#    的文案把测试判红了。文案是给人看的: 会改措辞、会有反讽、会被翻译; 判据必须是代号。
+#    (同族: `core/errors.py` 用 `error_kind` 归类, 而不是 match 中文标签。)
+
+
+NOTHING_CHECKED = "nothing-checked"      # 闸跑了, 但一项都没核 -> 一律算红
+
+
+class Problem:
+    """一条问题: `kind` 给机器判, `message` 给人看。"""
+
+    __slots__ = ("kind", "message")
+
+    def __init__(self, kind, message):
+        self.kind = kind
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+    def __repr__(self):
+        return "Problem(%r, %r)" % (self.kind, self.message)
+
+
+class Gate:
+    """一道闸的结论。
+
+    `checked` 是**必填**且**必须是实际数目** —— 它是这整套门禁里唯一能防"空转绿"
+    的字段。写新闸时忘了填, 这闸就是永远绿的, 而没人看得出来。
+    """
+
+    __slots__ = ("title", "checked", "problems", "rows")
+
+    def __init__(self, title, checked=0, problems=(), rows=()):
+        self.title = title
+        self.checked = int(checked)
+        self.problems = list(problems)
+        self.rows = list(rows)
+
+    @property
+    def empty(self):
+        """空转: 一项都没核 —— 这不是"通过"。"""
+        return self.checked == 0
+
+    def effective_problems(self):
+        """对外的问题清单: **空转也算一条问题**。
+
+        放在这里(而不是散在各个 `section()` 分支里)的理由: 让"空转不许算绿"成为
+        `Gate` 自己的性质, 那么 `ok` / `verify()` / 测试三处读的是同一个判据 ——
+        不会出现"脚本记得拦、测试忘了拦"这种半拉子护栏。
+        """
+        if self.empty and not self.problems:
+            return [_p(NOTHING_CHECKED,
+                       "这道闸**一项都没核到**(要核的对象不存在)。"
+                       "「没验到」与「验过了没问题」是两件事 —— 前者不许算绿。")]
+        return list(self.problems)
+
+    @property
+    def ok(self):
+        return not self.effective_problems()
+
+    def kinds(self):
+        return {p.kind for p in self.effective_problems()}
+
+
+def _p(kind, message):
+    return Problem(kind, message)
+
+
+# --------------------------------------------------------------------------
 # 收集站点
 # --------------------------------------------------------------------------
 
@@ -98,13 +180,36 @@ def _first_gid(site):
     return ""
 
 
+def _media_names(site):
+    """`site.media_names()`, 但**声明本身写坏时**返回空 + 原因, 而不是抛出去。
+
+    `variants=[]` 这种声明会让 `GallerySite.media()` 在 `self.variants[0]` 上抛
+    `IndexError`。门禁的职责是**报出**这类问题 —— 崩在同一个地方等于没报, 而且更糟:
+    脚本跑不完, 前面几道闸已经核出来的结论也一起丢了。
+    (与 `core/errors.py` 的口径一致: 把异常变成一条可处置的事实。)
+    """
+    try:
+        return list(site.media_names()), ""
+    except Exception as e:
+        return [], "media_names() 抛异常 %s: %s" % (type(e).__name__, e)
+
+
 # --------------------------------------------------------------------------
 # 闸 1: 声明自洽(复用 check_site, 不另写一份判据)
 # --------------------------------------------------------------------------
 
 
 def gate_declaration(site):
-    return list(check_site(site))
+    """样本 -> gid 必须唯一且正确 (判据复用 `check_site`, 不另写一份)。
+
+    ⚠️ **零样本时必须算红, 不能算绿。** `check_site()` 在 `id_samples` 为空时
+    返回空列表(它的每条检查都被 `if ... and samples:` 挡掉了), 于是这闸会印一行
+    ok —— 而它一项都没核。这是本文件里**真实存在过的**假绿: 一个还没写样本的
+    新站点, 闸 1 直接放行。`checked` 字段就是为它加的。
+    """
+    problems = [_p("declaration", m) for m in check_site(site)]
+    return Gate("闸 1 声明自洽(样本 -> gid)",
+                checked=len(site.id_samples or []), problems=problems)
 
 
 # --------------------------------------------------------------------------
@@ -122,31 +227,37 @@ def gate_claim(site, name):
     problems = []
     samples = _url_samples(site)
     if not samples:
-        # 没声明 URL 样本就无从验证。这不是"通过", 而是"没验" —— 必须说出来。
-        return ["id_samples 里没有任何 URL 形态的样本, 认领这一闸**没有验到**"
-                "(纯 ID 样本走的是 check_site 的 gid_shape 检查)"]
+        # 这一闸要核的对象是 URL 形态的样本; 一条都没有 = 没验到, 不是通过。
+        return Gate("闸 2 认领(谁接走这条 URL)", checked=0, problems=[_p(
+            NOTHING_CHECKED,
+            "id_samples 里没有任何 URL 形态的样本, 认领这一闸**没有验到**"
+            "(纯 ID 样本走的是 check_site 的 gid_shape 检查)")])
     for raw, _want in samples:
         try:
             r = resolve_collector(raw)
         except Exception as e:
-            problems.append("%s -> 认领解析抛异常 %s: %s" % (raw, type(e).__name__, e))
+            problems.append(_p("resolve-raised",
+                               "%s -> 认领解析抛异常 %s: %s" % (raw, type(e).__name__, e)))
             continue
         who = r.get("collector")
         if not r.get("auto"):
-            problems.append(
+            problems.append(_p(
+                "unclaimed",
                 "%s -> **没有专用采集器认领**(会落到 %r); 多半是 id_patterns 不再"
-                "匹配这个 URL 形态 —— 站点改版了, 或者样本写错了" % (raw, who))
+                "匹配这个 URL 形态 —— 站点改版了, 或者样本写错了" % (raw, who)))
         elif who != name:
-            problems.append(
+            problems.append(_p(
+                "stolen",
                 "%s -> 被 %r 抢先认领(期望 %r)。同一个 URL 归谁必须是确定的, "
-                "否则今天走 A 明天走 B" % (raw, who, name))
+                "否则今天走 A 明天走 B" % (raw, who, name)))
         elif r.get("ambiguous"):
             others = ", ".join(c["name"] for c in r.get("candidates", [])
                                if c["score"] == r.get("score") and c["name"] != who)
-            problems.append(
+            problems.append(_p(
+                "ambiguous",
                 "%s -> %r 与 [%s] **并列同分**, 已按字典序取前者。正则写得太宽会"
-                "把别的站点也吃进来" % (raw, who, others))
-    return problems
+                "把别的站点也吃进来" % (raw, who, others)))
+    return Gate("闸 2 认领(谁接走这条 URL)", checked=len(samples), problems=problems)
 
 
 # --------------------------------------------------------------------------
@@ -163,8 +274,9 @@ def _sample_media_urls(site, seq=1):
     gid = _first_gid(site)
     if not gid:
         return []
+    names, _err = _media_names(site)
     out = []
-    for mname in site.media_names():
+    for mname in names:
         try:
             url = site.url_for(gid, seq, None, mname)
         except Exception:
@@ -186,21 +298,31 @@ def gate_filter(site):
     因为那正是用户不配任何过滤条件时的行为。
     """
     flt = Filters()
+    _names, broken = _media_names(site)
+    if broken:
+        # 声明本身就取不出媒体类型 -> 这是**能直接照做**的问题, 比"没验到"具体得多。
+        return Gate("闸 3 过滤(默认 RuleSet 会不会静默拦掉)", checked=0,
+                    problems=[_p("media-declaration-broken",
+                                 "取不出本站的媒体类型(声明写坏): %s" % broken)])
     urls = _sample_media_urls(site)
     if not urls:
-        return ["按声明拼不出任何资源 URL(url_for 返回空) —— 闸 3 **没有验到**"], []
+        return Gate("闸 3 过滤(默认 RuleSet 会不会静默拦掉)", checked=0, problems=[_p(
+            NOTHING_CHECKED,
+            "按声明拼不出任何资源 URL(url_for 返回空) —— 闸 3 **没有验到**")])
     problems = []
     rows = []
     for rtype, url in urls:
         reason = flt.match_resource(rtype, url)
-        rows.append((rtype, url, reason))
+        rows.append((rtype, url))
         if reason:
-            problems.append(
+            problems.append(_p(
+                "filtered-out",
                 "%s 资源被默认过滤规则拦下: %s\n        URL: %s\n"
                 "        修法: 该站点确实会把这类路径当资源 -> 把该段从 "
                 "filters._AD_SEGMENTS/_AD_STEMS 里去掉; 若只是文件名巧合, "
-                "改采集器的命名模板避开它" % (rtype, reason, url))
-    return problems, rows
+                "改采集器的命名模板避开它" % (rtype, reason, url)))
+    return Gate("闸 3 过滤(默认 RuleSet 会不会静默拦掉)",
+                checked=len(urls), problems=problems, rows=rows)
 
 
 # --------------------------------------------------------------------------
@@ -217,35 +339,47 @@ def gate_layout(site):
     """
     problems = []
     rows = []
-    for mname in site.media_names():
+    checked = 0
+    names, broken = _media_names(site)
+    if broken:
+        return Gate("闸 4 落盘/命名(用户按预期找得到吗)", checked=0,
+                    problems=[_p("media-declaration-broken",
+                                 "取不出本站的媒体类型(声明写坏): %s" % broken)])
+    for mname in names:
         try:
             mtype = site.media(mname)
         except Exception:
             continue
         if mtype is None:
             continue
+        checked += 1
         ext = mtype.default_ext or (".mp4" if mname == "video" else ".jpg")
         try:
             stem = (mtype.seq_format or "{seq:05d}").format(seq=1)
         except Exception as e:
-            problems.append("%s.seq_format 无法渲染: %s" % (mname, e))
+            problems.append(_p("seq-format-unrenderable",
+                               "%s.seq_format 无法渲染: %s" % (mname, e)))
             continue
         # 采集器给出的 filename 形态: 相册名/序号+扩展名(见 gallery_base.crawl)
         rel_in = "%s/%s%s" % (_ALBUM, stem, ext)
         path, album = place(mname, rel_in, _ALBUM)
         if not path:
-            problems.append("%s: place() 返回空路径(资源无处可落)" % mname)
+            problems.append(_p("place-empty",
+                               "%s: place() 返回空路径(资源无处可落)" % mname))
             continue
         if ".." in path.split("/"):
-            problems.append("%s: 落盘路径含 `..`, 能跳出下载目录: %r" % (mname, path))
+            problems.append(_p("escapes-root",
+                               "%s: 落盘路径含 `..`, 能跳出下载目录: %r" % (mname, path)))
         if mname == "video":
             if "/" in path:
-                problems.append("视频必须**平铺**在下载根目录, 却落到了 %r" % path)
+                problems.append(_p("video-not-flat",
+                                   "视频必须**平铺**在下载根目录, 却落到了 %r" % path))
         else:
             if "/" not in path or path.split("/")[0] != album:
-                problems.append(
+                problems.append(_p(
+                    "image-not-in-album",
                     "非视频资源必须落在 `相册名/文件名`, 却落到了 %r(相册名=%r)"
-                    % (path, album))
+                    % (path, album)))
         rows.append((mname, path))
 
     # 同名消解: 同一格被**另一个来源**占了, 必须换名而不是原样返回
@@ -253,11 +387,13 @@ def gate_layout(site):
     got = claim("%s/00001.jpg" % _ALBUM, _ALBUM, occupied.get,
                 "https://this.example.com/00001.jpg")
     if got == "%s/00001.jpg" % _ALBUM:
-        problems.append(
+        problems.append(_p(
+            "claim-not-deduped",
             "同名消解没生效: 目标已被**别处**的同名文件占用, claim() 却原样返回 —— "
-            "下载层会把它当半成品续传, 拼出一份内容坏掉的文件")
+            "下载层会把它当半成品续传, 拼出一份内容坏掉的文件"))
     rows.append(("claim", got))
-    return problems, rows
+    return Gate("闸 4 落盘/命名(用户按预期找得到吗)",
+                checked=checked, problems=problems, rows=rows)
 
 
 # --------------------------------------------------------------------------
@@ -273,45 +409,65 @@ def gate_smoke(site, timeout=None, proxy=None):
     答 `200 image/jpeg`, 正文却是 HTML 错误页 —— 那种坑只在下载完之后才暴露。
     """
     try:
-        import requests
-
         from core.config import settings
         from core.imageinfo import dimensions_from_bytes
+        from core import transport
     except Exception as e:                     # 依赖缺失不该让门禁崩掉
-        return ["冒烟无法执行(导入失败): %s" % e]
+        return Gate("闸 5 冒烟(真取正文头 64KB, 判魔术字节)", checked=0,
+                    problems=[_p("dependency-missing", "冒烟无法执行(导入失败): %s" % e)])
+    _names, broken = _media_names(site)
+    if broken:
+        return Gate("闸 5 冒烟(真取正文头 64KB, 判魔术字节)", checked=0,
+                    problems=[_p("media-declaration-broken",
+                                 "取不出本站的媒体类型(声明写坏): %s" % broken)])
     urls = _sample_media_urls(site)
     if not urls:
-        return ["按声明拼不出任何资源 URL —— 冒烟**没有验到**"]
+        return Gate("闸 5 冒烟(真取正文头 64KB, 判魔术字节)", checked=0, problems=[_p(
+            NOTHING_CHECKED, "按声明拼不出任何资源 URL —— 冒烟**没有验到**")])
     problems = []
     hdrs = {"User-Agent": settings.user_agent, "Accept": "*/*"}
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    for rtype, url in urls:
+    # ⚠️ 走 `core.transport` 而不是裸 `requests`: 后者不能换浏览器指纹, 而这一闸最常
+    # 需要它的场合(站点在 CF 后面)恰恰是"裸 HTTP 拿不到正文"的那种。顺便: 手写
+    # `with requests.get(...)` 会被 `tests/test_transport.py` 的源码门禁拦下 ——
+    # `curl_cffi` 的响应不支持上下文管理器, 所以这个写法只能有一个出口。
+    session, _label = transport.build(proxy)
+    try:
+        for rtype, url in urls:
+            try:
+                with transport.streamed(session, "get", url, headers=hdrs,
+                                        timeout=timeout or 15, stream=True) as resp:
+                    if resp.status_code != 200:
+                        problems.append(_p("http-error",
+                                           "%s: HTTP %s —— 声明拼出来的 URL 取不到正文"
+                                           % (url, resp.status_code)))
+                        continue
+                    buf = b""
+                    for chunk in resp.iter_content(8192):
+                        buf += chunk
+                        if len(buf) >= 65536:
+                            break
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+            except Exception as e:
+                problems.append(_p("fetch-failed",
+                                   "%s: 取正文失败 %s: %s" % (url, type(e).__name__, e)))
+                continue
+            dims = dimensions_from_bytes(buf)
+            print("    %s  %s" % ("ok " if dims else "!! ", url))
+            print("        Content-Type=%s  头部 %d 字节  尺寸=%s"
+                  % (ctype or "(无)", len(buf), dims or "解析不出(可能不是媒体)"))
+            if dims is None:
+                problems.append(_p(
+                    "not-media",
+                    "%s: 正文**认不出是媒体**(Content-Type=%s, 前 64KB 没有可识别的魔术字节)\n"
+                    "        站点可能对越界请求答 200 + 错误页; 直接下单会拿到一堆坏文件"
+                    % (url, ctype or "无")))
+    finally:
         try:
-            with requests.get(url, headers=hdrs, timeout=timeout or 15,
-                              proxies=proxies, stream=True) as resp:
-                if resp.status_code != 200:
-                    problems.append("%s: HTTP %s —— 声明拼出来的 URL 取不到正文"
-                                    % (url, resp.status_code))
-                    continue
-                buf = b""
-                for chunk in resp.iter_content(8192):
-                    buf += chunk
-                    if len(buf) >= 65536:
-                        break
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-        except Exception as e:
-            problems.append("%s: 取正文失败 %s: %s" % (url, type(e).__name__, e))
-            continue
-        dims = dimensions_from_bytes(buf)
-        print("    %s  %s" % ("ok " if dims else "!! ", url))
-        print("        Content-Type=%s  头部 %d 字节  尺寸=%s"
-              % (ctype or "(无)", len(buf), dims or "解析不出(可能不是媒体)"))
-        if dims is None:
-            problems.append(
-                "%s: 正文**认不出是媒体**(Content-Type=%s, 前 64KB 没有可识别的魔术字节)\n"
-                "        站点可能对越界请求答 200 + 错误页; 直接下单会拿到一堆坏文件"
-                % (url, ctype or "无"))
-    return problems
+            session.close()
+        except Exception:
+            pass
+    return Gate("闸 5 冒烟(真取正文头 64KB, 判魔术字节)",
+                checked=len(urls), problems=problems)
 
 
 # --------------------------------------------------------------------------
@@ -324,57 +480,35 @@ def verify(name, site, smoke=False, timeout=None, proxy=None):
     print("=" * 74)
     print("加站门禁: %s" % name)
     print("=" * 74)
+    names, broken = _media_names(site)
     print("声明      : base=%s  媒体=%s  样本=%d 条"
-          % (site.base, ",".join(site.media_names()) or "(无)",
+          % (site.base, ",".join(names) if names else ("(取不出: %s)" % broken if broken else "(无)"),
              len(site.id_samples or [])))
     print()
 
     total = 0
 
-    def section(title, problems, extra_rows=()):
+    def section(gate):
+        """印一道闸。⚠️ 空转**不许印 ok** —— 判据在 `Gate.effective_problems()`。"""
         nonlocal total
-        print("-- %s" % title)
-        if extra_rows:
-            for row in extra_rows:
-                print("     " + "  ".join(str(x) for x in row))
+        print("-- %s" % gate.title)
+        for row in gate.rows:
+            print("     " + "  ".join(str(x) for x in row))
+        problems = gate.effective_problems()
         if not problems:
-            print("   ok")
+            print("   核了 %d 项: ok" % gate.checked)
             return
         total += len(problems)
         for p in problems:
             print("   !! %s" % p)
         print()
 
-    section("闸 1 声明自洽(样本 -> gid)", gate_declaration(site))
-
-    section("闸 2 认领(谁接走这条 URL)", gate_claim(site, name))
-
-    flt = gate_filter(site)
-    if isinstance(flt, tuple):
-        f_problems, f_rows = flt
-        section("闸 3 过滤(默认 RuleSet 会不会静默拦掉)",
-                f_problems, [(r, u) for r, u, _ in f_rows])
-    else:
-        section("闸 3 过滤(默认 RuleSet 会不会静默拦掉)", flt)
-
-    lay = gate_layout(site)
-    if isinstance(lay, tuple):
-        l_problems, l_rows = lay
-        section("闸 4 落盘/命名(用户按预期找得到吗)",
-                l_problems, [("最终相对路径:", p) for _, p in l_rows])
-    else:
-        section("闸 4 落盘/命名(用户按预期找得到吗)", lay)
-
+    section(gate_declaration(site))
+    section(gate_claim(site, name))
+    section(gate_filter(site))
+    section(gate_layout(site))
     if smoke:
-        print("-- 闸 5 冒烟(真取正文头 64KB, 判魔术字节)")
-        s_problems = gate_smoke(site, timeout, proxy)
-        if not s_problems:
-            print("   ok")
-        else:
-            total += len(s_problems)
-            for p in s_problems:
-                print("   !! %s" % p)
-        print()
+        section(gate_smoke(site, timeout, proxy))
 
     print("-" * 74)
     if total == 0:

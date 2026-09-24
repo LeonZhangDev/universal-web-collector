@@ -16,11 +16,12 @@
 `core/filters.py`(`match_resource` = "有效资源"唯一定义) · `core/errors.py`(`classify`/`KIND_*`/`KIND_LABELS`) · `core/layout.py` · `core/disk.py`
 `core/phash.py`(只标记不删) · `core/mediacheck.py`(完整性**算术**判据) · `core/manifest.py` · `core/thumbs.py`(按 **sha** 不按路径)
 **`core/jsonstore.py` = JSON 状态存储唯一实现**（`cdn_profile`/`proxy_health` 共用四条并发纪律，**别手写第二遍**）
+**`core/transport.py` = HTTP 传输唯一实现**（会话工厂 + `streamed()`；`curl_cffi` 的响应**不支持 `with`**，有 AST 门禁盯着）
 `core/partials.py`(续传暂存区：**按 URL 寻址**) · `downloaders/dash.py`(MPD 解析，纯函数不碰网络) · `downloaders/video.py`(**HEAD 是 CRLF**)
 `collectors/gallery_base.py`(声明式契约；`check_site` = 声明唯一验收标准) · `collectors/hls.py` · `downloaders/base.py` · `downloaders/ratelimit.py`(请求桶 + **全局字节桶**) · `main.py`(lifespan)
 `tests/isolation.py`(隔离清单 + 真实库即时守卫) · `tests/conftest.py`
 `scripts/probe_site.py`(**新站点五项探针** + 声明草稿 + **三档证据门禁** + `--json`/`--snapshot`/`--smoke`；**回归**靶子=本地假站点、**找 bug** 靶子=真实站点) · `scripts/probe.py`(浏览器探针，两码事)
-`scripts/add_site.py`(**加站门禁**：`--list` 只挑带 `site` 声明的 `SequenceGallerySpider`；`--verify <名>` 跑四闸) · `scripts/drift_check.py`(对已注册站点重跑探针比快照，硬/软漂移分档) · `scripts/probe_feed.py`(第二类 API/分页型站点探针，只出报告不出声明)
+`scripts/add_site.py`(**加站门禁**：`--list` 只挑带 `site` 声明的 `SequenceGallerySpider`；`--verify <名>` 跑四闸，每闸报"核了几项"、`0` 一律算红) · `scripts/drift_check.py`(重跑探针比快照，硬/软漂移分档；**一个站点都没查成则退出 2**) · `scripts/probe_feed.py`(第二类 API/分页型探针，只出报告不出声明)
 
 ## ⚠️ 静默坑索引（1–18 + 同族 A–G；细节见 `PITFALLS.md`）
 **共同特征：不报错，只是结果错 —— 所以会在真实使用中活很久。**
@@ -46,6 +47,7 @@
 | 17 | 序号后跟**内容哈希** ≠ 序号枚举型 | `/data/<hash>/1-<sha256>.png` 改序号必然 404。看残留熵，**不看**"是否以数字开头" |
 | 18 | 测试断言的是"**我想到的行**" | 产出类改动的最后一步是**目视完整输出**：正则重复、截断方向只有看才发现 |
 | 19 | **import 期单例**会替你起后台线程 | `core/task_manager.py` 末尾 `task_manager = TaskManager()` → 一 import 就活，抢当前用例的 `DB_PATH`。判据：**隔离性失败先做单跑 vs 连跑对比**，连跑红、单跑绿＝有东西跨用例活着 |
+| 20 | **`curl_cffi` 的响应不支持 `with`** | `with session.get(..., stream=True)` 在 `requests` 下正常，换到 `--impersonate`/`browser_impersonation` 抛 `TypeError`，而调用点都包着 `except` → **静默拿不到正文**。只在"最需要换指纹"的场合出问题。判据：**同一段代码在两种传输下各跑一次**；统一走 `core/transport.streamed()` |
 | A | 条件请求 ⊥ 续传 | 有 `Range` 不能带 `If-None-Match`（回 304 而非 206） |
 | B | 隔离的窗口期 | `monkeypatch.undo()` 还原 `DB_PATH` → 谁在那时碰库就写**用户真库** |
 | C | 素材/断言的前提会失效 | 产品加了校验或能力 → 回头问 fixture 与旧断言（**也包括文档声称**） |
@@ -54,15 +56,16 @@
 | F | **通过但理由已经不对** | 新代码在**另一条**判据上报错、或在更早一步就炸。比失败更危险 |
 | G | 静默降级必须有痕 | `park*` 搬不动时不抛错，但"怎么永远攒不起来"得有人知道 → `stats()['last_error']` |
 
-**八条通用心法**（比记具体条目重要）：
+**九条通用心法**（比记具体条目重要）：
 ① 加一个状态，就有多处**口径**要同步（`_final_status`/`summarize_resources`/前端计数）。
 ② 凡"静默"处都问：**失败会发生吗？失败之后有人知道吗？** 两个都否 → 加重试或留痕。
 ③ **误报的代价**决定判据松紧：只下"能被证明"的结论（`mediacheck` 认不出的容器一律放行）。
 ④ **新功能接完，回头验旧的前提**（fixture / 断言 / 文档声称），别改产品去迁就旧的。
 ⑤ **卡死类问题第一动作是打调用栈**，不是猜 —— `faulthandler.dump_traceback_later(N, exit=True)`。
 ⑥ 写测试时问：**这条路径会不会起后台线程？**（第 14 条）—— 也包括**只 import 就起线程的模块级单例**（第 19 条）。
-⑦ **补丁 vs 规则**：同一个错出现第三遍，就把它抽成程序可执行的规则（第 18 条、V39 的门禁）。
+⑦ **补丁 vs 规则**：同一个错出现第三遍，就把它抽成程序可执行的规则（第 18 条/第 20 条都有 AST 门禁）。
 ⑧ **连跑红、单跑绿 ⇒ 有东西跨用例活着**。别急着重跑撞运气，先加一个 in-process 插件把"谁还活着"打出来。
+⑨ **判据只能挂在"代号"上，不能挂在"文案"上**。假绿＝判据挂在"没报错"（要能报"我核了几项"，`0` 一律算红）；假红＝判据挂在中文子串（产物自带 `kind`/`step`/`level`，测试断言代号）。"没验到"与"验过了没问题"**必须是两个结果**。
 
 ## 状态机 / 速度 / 去重
 `pending→running→extracting→downloading→success/partial/failed`，可 paused/cancelled；采集器返回空 → failed。
@@ -75,18 +78,16 @@ cancel 留文件；pause 在资源边界退出；resume 不重采不重下。看
 ## 本机验证
 `~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；curl 对 127.0.0.1 加 `--noproxy '*'`；起服务用 `run_in_background`。
 ⚠️ 别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）；同一文件多处 Edit **不要并行发**。
-⚠️ 本机 venv 已补装 `curl-cffi`；全量 **1105 条全绿**（1099 passed / 6 skipped，183s）。
-⚠️ **用例数口径**：本文件写的是**收集总数**（passed + skipped）。改完文档前**先跑一遍数**——
-本轮就写错过一次（把 1099 passed 当成总数，实际总数 1105）。
+⚠️ 本机 venv 已补装 `curl-cffi`；全量 **1146 条全绿**（1140 passed / 6 skipped，212s）。
+⚠️ **用例数口径**：本文件写的是**收集总数**（passed + skipped）。改完文档前**先跑一遍数**——本轮又差点写错（把 1140 passed 当总数）。**差分不闭合就先怀疑自己**：1146 = 上版 1139 + `test_transport` 7。
 ⚠️ **`img.xchina.io` 从本机整段 403**（`text/plain`，不是 CF 挑战页；裸 curl + 浏览器 UA、`impersonate=chrome` 都一样）→ 这条网络的问题，**不是站点改版、不是回归**。别拿它当靶子。
 ⚠️ 别前置 `export PATH="/usr/bin:/bin:$PATH"` —— 会把裸 `python` 换成 3.13.12（没 pytest）。coreutils 全无（`cat`/`grep`/`tail`），但 `echo`、`git`、`python` 可用。
 ⚠️ 宿主包装器 `windows-child-process-containment.cjs` 偶发缺失 → 长命令直接 `MODULE_NOT_FOUND`（**压根没跑**）；加 `run_in_background=true` 绕过。
 ⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50），三个实例（`verify_output.py` 的 `rmtree` / `vite build` 的 `emptyDir` / pytest 清 `tmp_path`）→ 无 `FAILED` 行、**连汇总行都没有**。判据：看进度行有没有 `F`。
-⚠️ 被守卫 kill 时重定向到文件的那份输出会丢 → 脚本要 `python -u`；想拿失败清单先 `--collect-only -q`（`pytest-randomly` 没装）再按 `F` 的**列位置**反查。
+⚠️ 被守卫 kill 时重定向到文件的那份输出会丢 → 脚本要 `python -u`；想拿失败清单先 `--collect-only -q` 再按 `F` 的**列位置**反查。
 ⚠️ 想拿到 pytest 汇总行：`--basetemp` 指**系统临时目录下一个还不存在的路径**（`.../Temp/uwcpt-$$`）。
-⚠️⚠️ **绝不把 `--basetemp` 指进项目目录**：垫片清 basetemp 抛 `OSError [Errno 53]` 且 FAIL_CLOSED → **每个用例 setup 都 ERROR**（实测 986 个）。**第二遍才炸**。
-⚠️ **行尾**：`Path.write_text()` 在 Windows 上把 `\n` 翻成 `\r\n` → 被 Python 改写过的文件**整份变 CRLF**。提交前必查；用 `newline=""` 或 `write_bytes`。
-⚠️ `downloaders/video.py` 与 `scripts/verify_output.py` 的 **HEAD 本来就是 CRLF**，别去"统一"。
+⚠️⚠️ **绝不把 `--basetemp` 指进项目目录**：垫片清 basetemp 抛 `OSError [Errno 53]` 且 FAIL_CLOSED → **每个用例 setup 都 ERROR**（实测 986 个）。
+⚠️ **行尾**：`Path.write_text()` 在 Windows 上把 `\n` 翻成 `\r\n` → 被 Python 改写过的文件**整份变 CRLF**。提交前必查；用 `newline=""` 或 `write_bytes`。`downloaders/video.py` 与 `scripts/verify_output.py` 的 **HEAD 本来就是 CRLF**，别去"统一"。
 
 ```bash
 make install|backend|frontend|build|test|docker
@@ -122,11 +123,9 @@ python scripts/probe_site.py <资源直链> [相册页URL]   # 新站点五项�
 | V36 | 分片缓存复用（按**清单 URL**寻址 + 指纹）· 标签层级 · DASH 字节区间；修第 13 条 | 997 |
 | V37 | 三条**被静默丢掉的建议**（元数据 / 下载顺序 / 死信重放）；抓出第 14 条 | — |
 | V38 | 嵌套 `sidx` · 直播录制（⚠️ 取消时**仍封文件**）；抓出第 15 条 | 1063 |
-| V39 | 新站点探针：五项探测 → **真实站点当靶子** → **三档证据门禁**。续：可达性分型 + `--json`/`--snapshot`/`--smoke` · `drift_check.py`(漂移巡检) · `probe_feed.py`(第二类站点) · `add_site.py`(**加站门禁**, 把加站四步串起来)；抓出第 16/17/18/19 条 | 1075 → 1082 → 1086 → **1105** |
+| V39 | 新站点探针：五项探测 → **真实站点当靶子** → **三档证据门禁**。续：可达性分型 + `--json`/`--snapshot`/`--smoke` · `drift_check.py` · `probe_feed.py` · `add_site.py`（**加站门禁**）；抓出第 16/17/18/19 条。V39.5：**让"绿/红"不再可能是假的**（`Gate.checked` + `Problem.kind` / `diagnose_block` 的 `step` / `drift_check` 空转非 0 退出 / 抓出第 20 条）；抓出第 20 条 | 1075 → 1082 → 1086 → 1105 → **1146** |
 
 - **V38 复核要点**：当初写的拒绝理由（"真实站点几乎不出现 / 与产物模型冲突"）**站不住** —— **"暂时不做"不许写成"不该做"。**
-- **V39 的关键判断**：**加站的成本在探测不在写声明**（声明本体约 70 行、基类零改动）；而"加站"多数时候真正的瓶颈是**可达性**（图集/漫画站多在 CF 后面）。
-- **V39 续（加站门禁的四闸）**：①可达性（200 + 媒体类型，不是状态码）②声明自洽（`check_site()` 就地 exec）③命名/落盘预演（含中文与空格相册名，走 `layout.claim`/`place`）④过滤命中（`filters.match_resource` 能认出资源）。
-  ⚠️ 闸的**选择器**必须是"带 `site` 声明的 `SequenceGallerySpider`" —— 早先按 `getattr(cls,'site')` 挑，把 pexels 那种**非序列枚举型**也纳进来，四闸全绿在一个**永不可能出现**的 URL 形态上（假绿）。
-- **V39 续抓出的第 19 条**：`core/task_manager.py` 末尾的模块级单例 `task_manager = TaskManager()` 一 import 就起看门狗/调度线程，抢**当前用例**的 `DB_PATH`。表现是「连跑红 / 单跑绿」。修法在 `tests/conftest.py`。修完全量**反而快了**（污染那轮 ≈274s → 修复后 183s）：杂散线程不再做无用功。
-- **下一步候选**：更多站点插件（**按需求，先跑 `probe_site.py`**）/ HLS 直播（`EVENT` 或无 `ENDLIST`，可复用 `_record_live` 骨架，缺真站样本）/ 直播断点续录（低）。
+- **V39 的两个关键判断**：**加站的成本在探测不在写声明**（声明本体约 70 行、基类零改动）；而"加站"真正的瓶颈多半是**可达性**（图集/漫画站多在 CF 后面）。
+- **V39.5 一句话**：假绿＝判据挂在"没报错"（要 `checked`，`0` 算红）；假红＝判据挂在中文子串（要 `kind`/`step`/`level` 代号）。修法是**先把它变成结构**，之后才可能"不小心也绿/红不了"。细节见 `docs/AGENT_DEVELOPMENT_GUIDE.md` §20。
+- **下一步候选**：更多站点插件（按需求，先跑 `probe_site.py`）/ HLS 直播（`EVENT` 或无 `ENDLIST`，缺真站样本）/ 直播断点续录（低）。

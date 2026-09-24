@@ -3456,4 +3456,177 @@ task_manager = TaskManager()      # 导入即创建, 并起看门狗 + 调度两
 ⑤心法：卡死类 / 隔离类问题第一动作是**打出实际状态**。
 
 
+## 20. 让"绿/红"不再可能是假的（2026-09-24 四）
+
+### 20.1 先分清两类，它们的根因是同一个
+
+第 18 条（该断言处没断言）与家族 F（通过但理由已经不对）是"结果不可信"的两面。
+把这一轮遇到的全摊开，其实是**同一个根因的两面**：
+
+> **判据挂在了错误的东西上。**
+
+| | 判据挂在哪 | 症状 | 为什么最贵 |
+| --- | --- | --- | --- |
+| **假绿** | "**没报错**" | 闸跑了、印了 ok，但它**一项都没核**（要核的对象根本不存在） | 把"没验过"当成"验过了没问题"。而它会在真实使用中活很久 —— 因为一切看起来都正常 |
+| **假红** | "**中文文案**" | 断言写 `"chrome" not in msg`，而那句文案提到 Chrome 是**说它没用** | 一条**正确**的实现被判红。修的人会去改产品来迁就断言 —— 这是把产品改坏 |
+
+两类都在本项目真实发生过，所以修法要**落在结构上**，不是"这次小心点"。
+
+### 20.2 修法一：每道闸必须能回答"我核了几项"
+
+`add_site.py` 从"返回问题列表"改成了结构化的 `Gate`：
+
+```python
+class Problem:                            # kind 给机器判, message 给人看
+    __slots__ = ("kind", "message")
+
+class Gate:
+    __slots__ = ("title", "checked", "problems", "rows")
+    @property
+    def empty(self):  return self.checked == 0
+    def effective_problems(self):
+        if self.empty and not self.problems:      # 空转兜底
+            return [_p(NOTHING_CHECKED, "这道闸**一项都没核到**…")]
+        return list(self.problems)
+    @property
+    def ok(self):     return not self.effective_problems()
+    def kinds(self):  return {p.kind for p in self.effective_problems()}
+```
+
+三个要点，缺一个这套就不成立：
+
+1. **`checked` 是必填且必须是实际数目**。写新闸时忘了填，那闸就是永远绿的，而没人看得出来 —— 所以它是这套机制里唯一防"空转绿"的字段。
+2. **"空转"作为 `Gate` 自己的性质**（放在 `effective_problems()` 里），而不是散在各处 `print` 分支里。这样脚本、`verify()`、测试三处读的是**同一个判据**，不会出现"脚本记得拦、测试忘了拦"这种半拉子护栏。
+3. **已经报了具体问题时，不许用"没验到"盖掉它**。否则排查时看到的是笼统的"一项都没核到"，而真正能照做的原因（比如 `seq_format` 渲染失败）被吞掉。
+
+**那条活的假绿**：`check_site()` 在 `id_samples` 为空时返回空列表（它的每条检查都被 `if … and samples:` 挡掉了），于是闸 1 会印一行 ok —— 一个还没写样本的新站点直接放行。这正是 `checked` 要治的东西。
+
+### 20.3 修法二：判据只能挂在**代号**上
+
+`diagnose_block` 本来就返回 `kind` 代号，但**建议**是散文，于是"这两种 403 处置相反"只能靠 grep 中文来断言：
+
+```python
+assert "chrome" not in ip        # ← 假红。ip_block 的文案里必须写"换指纹没用"，
+                                 #   那就必然出现一个指纹名，于是一条正确的实现被判红
+```
+
+改成给建议也发一个代号：
+
+```python
+def diagnose_block(status, ctype, hdrs, body):
+    """返回 (kind, step, why, fix)。kind 说"是什么", step 说"该做什么"。"""
+    ...
+    return ("ip_block", "proxy",  "403 且正文是 text/plain —— IP 段/地域封禁", "`--proxy` …")
+```
+
+判据于是变成一句**不可能因为改文案而失效**的话：
+
+```python
+assert ip[0] != cf[0] and ip[1] != cf[1]     # 两种 403 的处置不一样
+```
+
+同族的两个既有先例：`core/errors.py` 用 `error_kind` 归类而不是 match 中文标签；
+`drift_check.classify_drift` 返回 `{"level": "hard"|"soft", "field": …}` 而不是一句话。
+
+### 20.4 `step` 顺手修掉了一个白名单/黑名单问题
+
+自动换指纹重试原来的条件是 `kind != "ip_block"` —— **黑名单**。每加一种成因都会
+默认继承"重试"，于是 429 限速、5xx 也各白跑一次换了指纹的请求。现在按 `step` 白名单判：
+
+```python
+_RETRY_STEPS = ("impersonate", "escalate")   # 只有"处置就是换指纹"的才重试
+```
+
+黑名单会**随着新增成因不断漏人**；白名单逼每一个新成因显式回答"换指纹有没有用"。
+
+### 20.5 ⚠️ 目视输出抓出的真 bug：`curl_cffi` 的响应不支持 `with`
+
+改完上面的东西去**目视完整输出**（第 18 条的规矩），三种 403/429 形态并排一看，
+`cf` 那条的重点不对：
+
+```
+  => 成因: [cf_challenge] …          <- 第一遍: 判对了
+  => 403: 自动改用 chrome TLS 指纹重试一次(curl-cffi)
+  => 成因: [blocked] 403, 但看不出具体成因…   <- 第二遍: 线索丢了
+```
+
+根因一步就定位了：
+
+```python
+with session.get(url, stream=True) as resp:   # requests 支持；curl-cffi 抛 TypeError
+```
+
+`curl_cffi.requests.Response` **不支持上下文管理器协议**。而这个写法在本仓库里
+被抄了三遍（`gallery_base._head_status_headers` 的流式回退 / `probe_site.sniff` /
+`probe_site --smoke`），**每一处都包着 `except Exception`**，于是它从不报错 ——
+只是静默地什么都拿不到。
+
+真实后果：`sniff()` 拿不到 CF 挑战页正文 → `diagnose_block` 分不清 cf 与 blocked →
+用户丢掉"要去开真浏览器"这条线索。而且它**只在最需要换指纹的场合**出现（站点在 CF
+后面），失败又长得像"站点不允许下载"。
+
+修法：抽 `backend/core/transport.py`，把会话工厂与"两种传输都支持的流式请求"放在
+一起，三处调用统一走 `transport.streamed(...)`（显式 `close()`）。
+
+**顺手加的源码门禁**（⑦心法：同一个错出现第三遍就抽成程序可执行的规则）：
+
+```python
+# tests/test_transport.py —— 用 AST 找语法结构, 不用正则扫文本
+for node in ast.walk(ast.parse(src)):
+    if isinstance(node, ast.With):
+        for item in node.items:
+            fn = item.context_expr.func
+            if isinstance(fn, ast.Attribute) and fn.attr in {"get","head","post",...}:
+                offenders.append(...)
+```
+
+⚠️ 这条门禁**第一版用正则扫文本，第一天就红** —— 因为它把注释和文档字符串里那些
+反面教材（这个模块自己的文档里就写着错误写法）也当成违规。一条一开始就需要豁免的
+门禁，迟早会被加到失效。**判据要落在语法结构上。**
+
+### 20.6 ⚠️ 同一个错还有第二种形态：局部变量遮蔽模块名
+
+`core/transport.py` 一进来，`probe_site.main()` 里那句
+
+```python
+session, transport = make_session(args.proxy, args.impersonate)   # 遮蔽了 core.transport
+```
+
+就变成了第 13 条（`_download_m3u8` 的 `info` 被局部变量顶掉）的同族。改名为
+`transport_name`。**同名的东西干两件事，迟早出事** —— 尤其在加了新 import 之后。
+
+### 20.7 修法三：空转不许算绿 —— 也适用于"报告型"脚本
+
+`drift_check.py` 的 `checked == 0`（探针全失败 / 全被跳过）原来也印一句
+"无硬漂移"并 `exit 0`：
+
+```python
+if checked == 0:
+    print("结论: **一个站点都没查成** …")
+    sys.exit(2)              # 「没查到」与「查过没问题」是两件事
+```
+
+这是最坏的一种绿：**它把"巡检自己坏了"伪装成"站点没变"**，而挂进定时任务的人只会
+一直收到"一切正常"。顺带把 `ok  与基线一致(第一次见 —— 已记录基线)` 这句改掉 ——
+那一次**没有基线可比**，说它"一致"是同一条假绿的另一种写法。
+
+### 20.8 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/test_add_site.py` | 11 → **23 项**：每条闸都有故意造坏的输入；新增治假绿的 `checked` 段落、治假红的"同一条问题改三种文案判据不变"、以及"坏声明要报错不能崩" |
+| `tests/test_probe_site.py` | 31 → **34 项**：`diagnose_block` 改断言 `(kind, step)`；加 `block_mode="rate"` 钉住白名单那一侧 |
+| `tests/test_drift_check.py`（新） | **20 项**：`classify_drift` 纯函数两个方向（漏报硬漂移 = 假绿 / 多报软漂移 = 噪音）+ `checked == 0` 必须非 0 退出 |
+| `tests/test_transport.py`（新） | **7 项**：两种传输都跑一次 `streamed`；curl-cffi 缺装的降级要留痕；`_head_status_headers` 回退在浏览器指纹下不能再抛；**CF 挑战必须仍被判成 `cf_challenge`**；AST 源码门禁 |
+| 目视完整输出 | `add_site` 三种形态 + 零样本声明 + 坏声明 + 三种 403/429 —— **curl-cffi 那个 bug 就是这么发现的** |
+| 全量 pytest | **1146 用例全绿**（1140 passed / 6 skipped，211.9s）。1146 = 上个提交的 1139 + `test_transport` 7 |
+
+### 20.9 一句话总结这一套
+
+- **假绿**：每条判据都要能回答"我核了几项"；`0` 一律算红；"没验到"与"验过了没问题"分开成两个结果。
+- **假红**：产物自带**代号**（`kind` / `step` / `level` / `checked`），测试断言代号，只对代号做跨条目的不变量断言；文案随便改。
+- 两类的共同前提：**先把它变成结构**（`Gate` / `Problem` / `step`），然后才可能"不小心也绿/红不了"。
+
+
+
 

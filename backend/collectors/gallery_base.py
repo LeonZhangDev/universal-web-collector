@@ -52,11 +52,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
-import requests
-
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings
 from core.filters import fmt_size
 from core import layout
+from core import transport
 from core.naming import clean_segment, safe_relative
 from collectors.scores import SCORE_ALBUM_PAGE, SCORE_BARE_ID, SCORE_RESOURCE_URL
 
@@ -517,17 +516,12 @@ def _shape_sample(site):
 
 
 def _session(proxy=None, impersonate=None):
-    """Create the default transport, optionally with a browser TLS fingerprint."""
-    if impersonate:
-        from curl_cffi import requests as curl_requests
+    """Create the default transport, optionally with a browser TLS fingerprint.
 
-        s = curl_requests.Session(impersonate=impersonate)
-    else:
-        s = requests.Session()
-    p = proxy if proxy is not None else settings.proxy
-    if p:
-        s.proxies.update({"http": p, "https": p})
-    return s
+    实现在 `core.transport` —— 传输工厂与"两种传输都支持的流式请求"必须放在一起,
+    否则那段 `with` 会被反复抄(本项目已经抄过三遍, 见 `core/transport` 的模块文档)。
+    """
+    return transport.build(proxy, impersonate)[0]
 
 
 def _head_status_headers(session, url, headers, timeout):
@@ -547,8 +541,12 @@ def _head_status_headers(session, url, headers, timeout):
     resp = session.head(url, headers=headers, allow_redirects=True, timeout=timeout)
     if (resp.headers.get("Content-Type") or "").strip() or resp.status_code != 200:
         return resp.status_code, resp.headers
-    with session.get(
-        url, headers=headers, allow_redirects=True, timeout=timeout, stream=True
+    # ⚠️ 必须走 `transport.streamed` 而不是 `with session.get(...)`: 后者在
+    # `curl_cffi` 传输下抛 `TypeError`(响应对象不支持上下文管理器), 而这条回退恰好
+    # 只在用浏览器指纹时才有意义 —— 写错就等于"这个回退从来没生效过"。
+    with transport.streamed(
+        session, "get", url, headers=headers, allow_redirects=True,
+        timeout=timeout, stream=True,
     ) as raw:
         return raw.status_code, raw.headers
 

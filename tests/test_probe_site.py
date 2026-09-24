@@ -62,7 +62,9 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
     #:   ""      不拦
     #:   "plain" 403 + `text/plain`  -> IP 段/地域封禁 -> 换指纹**没用**, 要代理
     #:   "cf"    403 + CF 挑战页正文 -> TLS 指纹被拦     -> 换指纹**有用**, 该自动重试
-    #: 两种都返回 403 却要给**相反**的建议, 所以必须成对测 —— 只测一种会漏掉另一半。
+    #:   "rate"  429 + `text/plain`    -> 被限速          -> 换指纹**没用**(等一会儿/换出口)
+    #: 三种都会让第 0 段不通, 但只有 "cf" 该触发自动换指纹。所以必须逐个测 ——
+    #: 只测一种会漏掉另一半, 而"漏掉另一半"正是本项目记录过的老坑。
     block_mode = ""
     #: 非空则 HEAD 说"存在"、GET 直接 500 —— 用来验"HEAD 通 != 能落地"这一条。
     #: 它不是编出来的场景: 有的 CDN 只对 HEAD 放行, 真正取正文时才挡。
@@ -111,6 +113,9 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
                        b"<html><head><title>Just a moment...</title></head>"
                        b"<body><div id=\"challenge-platform\"></div></body></html>",
                        body)
+            return
+        if mode == "rate":
+            self._send(429, "text/plain; charset=UTF-8", b"too many requests", body)
             return
         path = self.path.split("?")[0]
         if self.opaque_hash and re.match(r"^/hashes/[0-9a-f]+/(.+)\.png$", path):
@@ -429,6 +434,7 @@ def test_probe_gives_up_early_when_the_link_is_unreachable(fake_site):
     assert "状态码可用" not in out                        # 绝不编结论
     # 分型 + 该给的那条建议
     assert "[ip_block]" in out
+    assert "下一步 [proxy]" in out                        # 代号: 该做什么
     assert "换指纹对它**没用**" in out
     assert "--proxy" in out                               # 还得给可行动的下一步
     assert "自动改用 chrome TLS 指纹重试一次" not in out   # 对 IP 封禁**不**重试
@@ -445,8 +451,26 @@ def test_probe_retries_with_a_tls_fingerprint_on_a_cf_challenge(fake_site):
     assert rc == 2, out
     assert "[cf_challenge]" in out
     assert "自动改用 chrome TLS 指纹重试一次" in out        # 自己试, 别让人手动重跑
+    assert "[cf_challenge]" in out
+    assert "下一步 [impersonate]" in out
     assert "换指纹对它**没用**" not in out
     assert "probe.py" in out                              # 需要真浏览器的那条路也说了
+
+
+def test_probe_does_not_auto_retry_the_fingerprint_on_a_rate_limit(fake_site):
+    """第三种成因: **429 限速** —— 换指纹同样没用, 所以也不许自动重试。
+
+    这条补的是黑名单的一个洞: 以前的条件是 `kind != "ip_block"`, 于是 429 与 5xx
+    都会白跑一次换指纹。它不会报错、也不会给出错建议, 只是**多一次注定失败的请求**,
+    同时给用户"指纹这条路已经试过了"的错觉 —— 静默的浪费最难被发现, 所以要钉住。
+    """
+    srv = fake_site(block_mode="rate")
+    out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID])
+    assert rc == 2, out
+    assert "[rate]" in out
+    assert "下一步 [wait]" in out
+    assert "自动改用 chrome TLS 指纹重试一次" not in out
+    assert "不自动重试" in out
 
 
 def test_probe_requires_a_direct_link(fake_site):
@@ -600,40 +624,57 @@ def test_probe_refuses_a_draft_with_no_sequence_evidence(fake_site):
 
 
 def test_diagnose_block_separates_causes_with_opposite_fixes():
-    """六种成因给**互不通用**的建议 —— 混成一条"都试试"等于没说。
+    """七种成因给**互不通用**的建议 —— 混成一条"都试试"等于没说。
 
     重点是前两种: `ip_block` 与 `cf_challenge` 都是 403, 但一个**换指纹没用**、另一个
     **只有换指纹有用**。把它们混起来, 用户就会照着错的那条一直试下去。
+
+    ⚠️ 判据读的是 `kind` 与 `step` 两个**代号**, 不是 `fix` 里的中文。这条用例以前
+    断言的是 `"chrome" not in ip` —— 而 `ip_block` 的文案里**必须**写明"换指纹没用"
+    并给出实测证据, 那就必然写到一个指纹名, 于是**一条正确的实现被判红**。
+    代号是契约, 文案只是它的说明。(同族: `core/errors.py` 用 `error_kind` 归类。)
     """
     cf_body = b"<html><title>Just a moment...</title>challenge-platform</html>"
     cases = [
-        ((403, "text/plain; charset=utf-8", {}, b"blocked"), "ip_block"),
-        ((403, "text/html; charset=utf-8", {}, cf_body), "cf_challenge"),
+        ((403, "text/plain; charset=utf-8", {}, b"blocked"), "ip_block", "proxy"),
+        ((403, "text/html; charset=utf-8", {}, cf_body), "cf_challenge", "impersonate"),
         ((403, "text/html; charset=utf-8", {"cf-mitigated": "challenge"}, b""),
-         "cf_challenge"),
-        ((401, "text/html", {}, b""), "auth"),
-        ((403, "text/html", {"www-authenticate": "Basic"}, b""), "auth"),
-        ((429, "text/plain", {}, b""), "rate"),
-        ((503, "text/html", {}, b""), "down"),
-        ((403, "text/html", {}, b"<html>nope</html>"), "blocked"),
-        ((0, "", {}, b""), "unknown"),
+         "cf_challenge", "impersonate"),
+        ((401, "text/html", {}, b""), "auth", "login"),
+        ((403, "text/html", {"www-authenticate": "Basic"}, b""), "auth", "login"),
+        ((429, "text/plain", {}, b""), "rate", "wait"),
+        ((503, "text/html", {}, b""), "down", "wait"),
+        ((403, "text/html", {}, b"<html>nope</html>"), "blocked", "escalate"),
+        ((0, "", {}, b""), "unknown", "inspect"),
     ]
-    for (status, ctype, hdrs, body), want in cases:
-        kind, why, fix = probe_site.diagnose_block(status, ctype, hdrs, body)
-        assert kind == want, (kind, want)
+    for (status, ctype, hdrs, body), want_kind, want_step in cases:
+        kind, step, why, fix = probe_site.diagnose_block(status, ctype, hdrs, body)
+        assert (kind, step) == (want_kind, want_step), (kind, step, want_kind, want_step)
         assert why and fix                       # 两件事都必须说清: 为什么 + 怎么办
 
-    ip = probe_site.diagnose_block(403, "text/plain", {}, b"blocked")[2]
-    cf = probe_site.diagnose_block(403, "text/html", {}, cf_body)[2]
-    # 判的是**第一条建议是什么**, 不是"文本里出现没出现过 chrome"。
-    # 差别很实在: `ip_block` 的正文里**必须**提到"换指纹没用"并给出实测证据,
-    # 那就必然会写到一个指纹名 —— 拿子串去查会把它当成"推荐了换指纹", 于是要么
-    # 误报, 要么逼着把证据从给用户看的文案里删掉。两种都是在改产品迁就断言。
-    assert ip.startswith("`--proxy`"), ip            # IP 封禁: 第一条就是换出口
-    assert "换 TLS 指纹" in ip and "没用" in ip      # 并且明说另一条没用
-    assert cf.startswith("换浏览器 TLS 指纹"), cf     # CF 挑战: 第一条就是换指纹
-    assert "chrome" in cf
-    assert ip != cf
+    ip = probe_site.diagnose_block(403, "text/plain", {}, b"blocked")
+    cf = probe_site.diagnose_block(403, "text/html", {}, cf_body)
+    # 真正要断言的不变量: **两种 403 的处置不一样**。用代号说这句话, 而不是用中文 ——
+    # 文案可以随便改, 这句判据不该动。
+    assert ip[0] != cf[0]
+    assert ip[1] != cf[1]
+    # `ip_block` 的文案里出现 "chrome" 是**说它没用**, 这不是推荐。所以文案里必须
+    # 同时出现"没用"这件事, 否则用户会照错的那条试 —— 断言的是这一点, 不是"有没有 chrome"。
+    assert "换 TLS 指纹" in ip[3] and "没用" in ip[3], ip[3]
+
+
+def test_only_an_impersonation_fix_triggers_the_automatic_retry():
+    """自动换指纹是**白名单**: 只有"处置就是换指纹"的成因才重试。
+
+    这条与上面那条成对。以前的条件是 `kind != "ip_block"`(黑名单)—— 每加一种成因
+    都会**默认继承**"重试", 于是 429 限速与 5xx 也会白跑一次换指纹。现在按 `step`
+    白名单判, 新成因必须显式回答"换指纹有没有用"。
+    """
+    assert probe_site._RETRY_STEPS == ("impersonate", "escalate")
+    # 白名单里只有"换指纹有收益"的那两种; 其余成因的 step 都不在里面
+    not_retry = ["proxy", "login", "wait", "inspect", "referer"]
+    for step in not_retry:
+        assert step not in probe_site._RETRY_STEPS, step
 
 
 def test_accept_verdict_reads_the_three_way_control():

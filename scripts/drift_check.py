@@ -320,7 +320,9 @@ def main():
             continue
         checked += 1
         if not findings:
-            print("  ok  与基线一致(%s)" % (note or "无差异"))
+            # ⚠️ 注释就是注释, 别把"第一次见"印成"与基线一致" —— 那一次**没有基线可
+            # 比**, 说它"一致"是把"没比过"说成"比过了没问题"(同一条假绿的另一种写法)。
+            print("  ok  %s" % (note or "与基线一致"))
             continue
         for f in findings:
             mark = "!!" if f["level"] == HARD else " ·"
@@ -342,6 +344,16 @@ def main():
         print("\n新站点的基线已补记 -> %s%s" % (path, "" if ok else "  !! 写不进去"))
 
     print("\n" + "=" * 74)
+    if checked == 0:
+        # ⚠️ **空转不许算绿** —— 与 `add_site.py` 的 `Gate.checked` 是同一条规矩。
+        # "巡检跑了但一个站点都没查成"(探针连着失败 / 全被跳过)与"查过了没漂移"是
+        # 两件事。以前这种情况也印一句"无硬漂移"并 `exit 0`, 于是把它挂进定时任务的人
+        # 会一直收到"一切正常" —— 而实际上一次都没查。这是最坏的一种绿: 它把
+        # "巡检坏了"伪装成"站点没变"。
+        print("结论: **一个站点都没查成** —— 探针没跑出结果、全被跳过, 或者没有可用基线。")
+        print("      「没查到」与「查过没问题」是两件事, 所以这里**不算通过**。")
+        print("      先单独跑一次 `python scripts/probe_site.py <资源直链>` 看探针本身通不通。")
+        sys.exit(2)
     if hard_n:
         print("结论: %d 个站点查过, **硬漂移 %d 条** —— 站点可能改版了, 去看 collector"
               % (checked, hard_n))

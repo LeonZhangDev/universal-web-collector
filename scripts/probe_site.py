@@ -53,6 +53,27 @@ r"""新站点探针 —— 把「接入新站点」的第一步变成一份可�
 (本轮: 漫画柜连接超时; Lorem Picsum 的直链要 hmac 签名; Internet Archive 的页图
 是 `.php?file=...` 形态, 连"这是资源直链"都判不出来)。
 
+门禁: 从「五个手写的 if」到「一条规则」
+======================================
+上面那五处当时是逐个手写 `if` 堵的。堵完之后顺手把模式抽了出来 —— 因为**补丁只能
+挡住已经见过的那几种形态**, 而真正要防的是"第六种":
+
+    档 A  拼不出 URL   base / seq_format / suffix / gid_shape / id_patterns
+                       缺实测证据 -> **拒绝出草稿**(exit 2), 一个字都不给
+    档 B  采多采少     variants / quality_map / id_samples        -> 降级并标注
+    档 C  只影响体验   input_forms / album_url_template           -> 只标注
+
+分档的判据就一句: **猜错了, 是每条 URL 都错, 还是只是少采一点。**
+有了它, 第六种形态哪怕从没见过也会被拦下 —— 新写出来的那一行必然带缺口。
+
+另外两处也一并前移了:
+
+- **第 0 段 可达性**: 直链不通就早退(省掉后面四项、二十来个请求), 且 `403/429/503`
+  这类"被挡在门外"的状态会**自动**换一次浏览器 TLS 指纹重试 —— 不该让人先看见 403、
+  再手动加参数重跑一遍(2026-09-23 在 xchina 上就是这么手动重跑的)。
+- **草稿自检**: 拼完就地 exec 起来跑 `check_site()`。它是这份声明**唯一**的验收标准,
+  以前靠人肉(存盘 -> import -> 跑 selfcheck.py), 现在当场就能看见。
+
 用法
 ====
 至少给一条**资源直链**(用户右键复制到的那条)。它把基址与序号补零宽度直接写在了
@@ -85,7 +106,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings  # noqa: E402
-from collectors.gallery_base import _head_status_headers  # noqa: E402
+from collectors.gallery_base import (  # noqa: E402
+    GallerySite,
+    _head_status_headers,
+    check_site,
+)
 
 #: 视为"资源文件"的扩展名 —— 用来把输入的 URL 分成「资源直链」与「页面 URL」两类。
 IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "heic"}
@@ -158,6 +183,16 @@ def head(session, url, headers, timeout=None):
 
 def short(url, n=96):
     return url if len(url) <= n else url[: n - 1] + "…"
+
+
+def short_tail(url, n=48):
+    """截断时**保留尾部**。
+
+    URL 的末段才是要人判断的那一段: `/photo/id-x/10.html` 里的 `10.html` 说明它是
+    **页码**, 而 `/photo/id-x.html` 不是。用 `short()` 从头截恰好把这段砍掉, 于是
+    提示里给出的两个 URL 长得一模一样 —— 人有理由怀疑探针到底在说哪一个。
+    """
+    return url if len(url) <= n else "…" + url[-(n - 1):]
 
 
 def classify(urls):
@@ -371,8 +406,36 @@ def page_tail_evidence(page_urls, gid):
 
 
 # --------------------------------------------------------------------------
-# 五段探测
+# 第 0 段(可达性) + 五段探测
 # --------------------------------------------------------------------------
+
+
+#: 这些状态码说明"不是这条 URL 的问题, 而是我们被挡在门外了" —— 值得换指纹再试一次。
+_REACH_RETRY_STATUS = (401, 403, 406, 429, 503)
+
+
+def probe_reachability(session, info, timeout):
+    """**第 0 段**: 先确认"你给的那条直链"到底通不通, 不通就早退。
+
+    判据是 **200 + 媒体类型**, 不是"状态码是 200" —— 本站项目在这一点上吃过大亏:
+    站点对拿不到的图集照样答 `200`, 只是 Content-Type 变成 `text/html`。只看状态码
+    会把"完全拿不到"读成"一切正常"。
+
+    早退的回报是**省掉四次白跑**: 直链不通时 ②③④⑤ 加起来会发二十来个请求, 然后
+    给出一屏没有意义的数字 —— 而真正该做的第一件事(解决可达性)被埋在最下面。
+
+    返回 (ok, status, ctype)。
+    """
+    print("== 第 0 段 直链可达性 ==")
+    headers = {"User-Agent": settings.user_agent, "Accept": accept_for(info["ext"])}
+    status, hdrs = head(session, info["url"], headers, timeout)
+    ct = (hdrs.get("Content-Type") or "").lower() if hdrs else ""
+    ok = status == 200 and ct.startswith(ctype_for(info["ext"]))
+    print("  %s" % short(info["url"], 68))
+    print("      -> %s  %s" % (status, ct or "(无 Content-Type)"))
+    print("  => %s" % ("通过: 直链能拿到资源, 后面的探测才有意义"
+                      if ok else "不通 —— 后面的四项**都没跑**(它们全都要先能拿到资源)"))
+    return ok, status, ct
 
 
 def probe_existence(session, info, scan, over, timeout):
@@ -625,9 +688,14 @@ def probe_url_forms(all_urls, media, pages, info):
     gid = info["gid"]
     gid_re = gid_regex(gid)
     patterns = [("直链", link_pattern(info["base_path"], gid_re))]
+    seen_pat = {patterns[0][1]}
     for u in pages:
         pp = page_pattern(u, gid, gid_re)
-        if pp:
+        # 去重: 同一个站点的多种页面形态(相册页 `/photo/id-X.html` 与分页
+        # `/photo/id-X/10.html`)常常推出**同一条**正则。重复写进 `id_patterns` 无害,
+        # 但会让人以为漏了哪条, 也让 `check_site()` 白跑一遍。
+        if pp and pp not in seen_pat:
+            seen_pat.add(pp)
             patterns.append(("相册页", pp))
 
     for kind, pat in patterns:
@@ -638,7 +706,7 @@ def probe_url_forms(all_urls, media, pages, info):
     bad_tail = page_tail_evidence(pages, gid)
     if bad_tail:
         print("  !! 末段是纯数字(页码, 不是 ID): %s"
-              % [short(u, 46) for u in bad_tail])
+              % [short_tail(u, 46) for u in bad_tail])
         print("     => 必须声明 page_tail=r\"^\\d+$\"。否则解析失败时会退回"
               "“取路径末段”, 把页码当 ID -> 枚举不存在的图集 -> 成功但 0 资源。")
 
@@ -657,7 +725,7 @@ def probe_url_forms(all_urls, media, pages, info):
             fails.append((u, got))
     print("  自检: %d/%d 条输入解析出一致的 gid (%s)" % (ok, len(all_urls), gid))
     for u, got in fails:
-        print("      !! %s -> %r" % (short(u, 58), got))
+        print("      !! %s -> %r" % (short_tail(u, 58), got))
     if fails:
         print("     => 有形态没覆盖。补一条 pattern, 或把该形态加进 `id_samples` 后重跑。")
     if len(pages) < 2:
@@ -676,6 +744,54 @@ def probe_url_forms(all_urls, media, pages, info):
 # --------------------------------------------------------------------------
 # 草稿
 # --------------------------------------------------------------------------
+
+
+#: 草稿字段按"猜错的后果"分档 —— **门禁只认档 A**。
+#:
+#:     A  拼不出 URL    猜错 = 每一条 URL 都是错的, 整份声明作废
+#:     B  采多采少      猜错 = 少几个画质档 / 少两条样本, 不影响能不能采到
+#:     C  只影响体验    猜错 = 提示文案不好看
+#:
+#: 分档不是为了好看, 是为了把"哪些字段必须实测"从**人脑**搬进**程序**。
+#: 在那之前, 每遇到一个新形态就得手写一个 `if` 去堵 —— 2026-09-24 在 MangaDex
+#: 与 picsum 上一次性堵了五个, 而它们只是同一类错(探测结果没进结论)的五个化身。
+#: 搬进来之后, 第六种形态**哪怕从没见过**, 新写出来的那行也必然带缺口、必然被拦下。
+TIER_A, TIER_B, TIER_C = "A", "B", "C"
+
+
+class Gap:
+    """一条「这个字段其实没有实测证据」的缺口。"""
+
+    __slots__ = ("field", "tier", "why", "fix")
+
+    def __init__(self, field, tier, why, fix=""):
+        self.field = field
+        self.tier = tier
+        self.why = why
+        self.fix = fix
+
+
+class Draft(str):
+    """草稿正文 + 它的证据缺口。
+
+    继承 `str` 是为了让 `draft.split(...)` / `x in draft` 这类用法照旧可用 ——
+    绝大多数调用方只关心正文, 只有 `main()` 需要看 `gaps`。
+    """
+
+    def __new__(cls, text, gaps=()):
+        self = super().__new__(cls, text)
+        self.gaps = list(gaps)
+        return self
+
+    @property
+    def blocking(self):
+        """档 A 的缺口 —— 有它就不该出草稿。"""
+        return [g for g in self.gaps if g.tier == TIER_A]
+
+    @property
+    def advisory(self):
+        """档 B/C 的缺口 —— 照出草稿, 但要标注。"""
+        return [g for g in self.gaps if g.tier != TIER_A]
 
 
 def site_name(host):
@@ -705,16 +821,23 @@ def quality_key(suffix, i):
 
 def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases,
                 resolution=None, seq_hits=None):
-    """拼一份 `GallerySite` 草稿。带 `# TODO` 的地方是**必须人工确认**的。
+    """拼一份 `GallerySite` 草稿, 并把**证据缺口**一并带出来。
+
+    带 `# TODO` 的地方是**必须人工确认**的。
 
     `resolution` 是 ⑤ 逐条 URL 的解析结果。**只有自检通过的 URL 才写进
     `id_samples`** —— 期望值必须是"正则真的从这条 URL 里抽出来的那个", 不能一律
     填采信直链的 gid。填错了不会报错, 只会让 `check_site()` 拿着假证据空转
     (2026-09-24 用 MangaDex 实测到: 页面 URL 明明报 `-> None`, 草稿却给它配了 gid)。
+
+    返回 `Draft`(str 的子类, 正文照旧可以直接用) 外加 `gaps`。**gaps 才是重点**:
+    在这之前"哪些字段是实测的、哪些是猜的"只存在于人脑里, 于是每一处新形态都得手写
+    一个 `if` 去堵; 现在交给调用方判断 —— 档 A 有缺口就**一个字都不给**(见 `main()`)。
     """
     name = site_name(info["host"])
     base, digits = split_digit_base(info["base"])
     resolution = resolution or {}
+    gaps = []
     others = [h["suffix"] for h in hits if h["suffix"] != info["suffix"]]
     variants = ([info["suffix"]] if any(h["suffix"] == info["suffix"] for h in hits)
                 else []) + others
@@ -729,18 +852,30 @@ def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases
             _bb, d = split_digit_base(b)
             digits = max(digits, d)
 
+    # ---- 收集证据缺口(门禁的输入) ----
+    if seq_hits == 0:
+        # 命中 0 意味着"序号枚举型"这个**前提**本身没验出来 —— 草稿里每一条都是按
+        # URL 形态猜的。猜错的失败方式是"任务 success 但 0 个资源", 本项目最贵的一种错。
+        gaps.append(Gap(
+            "base / seq_format", TIER_A,
+            "--scan 范围内**一个存在的序号都没探到**",
+            "先让报告 ① 里那几条 HEAD 真的返回 200 + 媒体类型, 再回来重跑"))
+    if not any(h["suffix"] == info["suffix"] for h in hits):
+        # 采信的那条直链自己没探通 -> base / gid / suffix 至少有一个是错的。
+        gaps.append(Gap(
+            "base / gid / suffix", TIER_A,
+            "按你给的直链拼出来的那条 URL **自己都没探通**",
+            "直链可能已失效(签名过期 / 图集删了), 先换一条有效的"))
+    if seq_hits == 1:
+        # 单条命中是**歧义**而不是缺口: 有证据, 只是不足以定论。所以只降级、不阻断。
+        gaps.append(Gap(
+            "base / seq_format", TIER_B,
+            "只探到 **1 个**存在的序号(见报告 ① 的歧义提示)",
+            "再给一条**不同序号**的直链就能当场分辨"))
+
     L = ["# 由 scripts/probe_site.py 生成 —— 每条都对应报告里的一条实测证据。",
          "# 标 TODO 的地方必须人工确认, 不要直接提交。", ""]
-    if seq_hits == 0:
-        # 命中 0 时, 下面每一条都是"按样本形态猜的", 没有一条有实测支持 —— 而报告里
-        # ① 已经说了"判定规则还没验出来"。此时最危险的是用户只翻到草稿这一段。
-        L.extend([
-            "# !!!! 实测: --scan 范围内**一个存在的序号都没探到** —— 这份声明**没有**",
-            "#      任何证据支持, 下面每一条都是按 URL 形态猜的, **不要用**。",
-            "#      先让报告 ① 里那几条 HEAD 真的返回 200 + 媒体类型, 再回来重跑。",
-            "",
-        ])
-    elif seq_hits == 1:
+    if seq_hits == 1:
         L.extend([
             "# !! 实测: --scan 范围内只探到 **1 个**存在的序号 —— 这份声明可能根本",
             "#    不成立。先按报告 ① 的歧义提示补一条**不同序号**的直链复核, 再决定用不用。",
@@ -774,6 +909,16 @@ def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases
     # ⚠️ 期望值必须是"正则真的从这条 URL 里抽出来的", 不能一律填采信直链的 gid。
     good = [u for u in (media + pages) if resolution.get(u) == info["gid"]]
     missed = [u for u in (media + pages) if resolution.get(u) != info["gid"]]
+    if (media or pages) and not good:
+        gaps.append(Gap(
+            "id_patterns", TIER_A,
+            "**没有一条**输入能解析出 gid —— 现有正则一条 ID 都抽不出来",
+            "先修正则, 或换一条更有代表性的直链"))
+    elif missed:
+        gaps.append(Gap(
+            "id_patterns", TIER_B,
+            "%d 条输入没被任何正则覆盖(见下方注释)" % len(missed),
+            "补一条正则; 该形态也要进 `id_samples`, 否则回归时没有护栏"))
     L.append("    id_samples=[")
     L.append('        ("%s", "%s"),' % (info["gid"], info["gid"]))
     for u in good[:4]:
@@ -788,7 +933,7 @@ def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases
         L.append("    # !! 以下输入**没通过自检**, 因此**没有**写进 id_samples ——")
         L.append("    #    给它们编一个期望值, 只会让 check_site() 拿着假证据空转:")
         for u in missed[:3]:
-            L.append("    #      %s  -> %r" % (short(u, 56), resolution.get(u)))
+            L.append("    #      %s  -> %r" % (short_tail(u, 56), resolution.get(u)))
     L.append("    input_forms=[")
     for kind, _pat in patterns:
         L.append('        "%s",   # TODO 补成用户看得懂的说明' % kind)
@@ -805,7 +950,80 @@ def build_draft(info, media, pages, hits, patterns, gid_re, bad_tail, page_bases
     L.append("")
     L.append("    site = %s" % name.upper())
     L.append("")
-    return "\n".join(L)
+    return Draft("\n".join(L), gaps)
+
+
+def refuse(title, gaps=(), lines=()):
+    """一份「不生成草稿」的拒绝报告 —— 所有挡路的出口共用它。
+
+    统一出口的价值是口径一致: 用户永远看到「为什么拦」+「怎么补」两件事, 而不是
+    三个出口三种写法(其中一种忘了写"怎么补")。
+    """
+    print("\n" + "=" * 74)
+    print("!! 不生成草稿: %s" % title)
+    print("=" * 74)
+    for ln in lines:
+        print(ln)
+    if gaps:
+        print("档 A 字段(拼不出 URL —— 猜错就是整份声明作废)缺实测证据:")
+        for g in gaps:
+            print("  · %s" % g.field)
+            print("      为什么: %s" % g.why)
+            if g.fix:
+                print("      怎么补: %s" % g.fix)
+    print()
+    print("一份没有实测支撑的声明, 拼出来的是**每一页都不存在**的 URL, 而失败方式是")
+    print("「任务 success 但 0 个资源」—— 本项目最贵的一种错。所以这里一个字都不给。")
+    return 2
+
+
+def validate_draft(text):
+    """把草稿**跑起来**并调用 `check_site()` —— 那是这份声明唯一的验收标准。
+
+    草稿里写的是相对 import(`from .. import register`), 直接 exec 会失败; 换成绝对
+    import 即可(`backend` 已在 `sys.path` 上)。这不改变"草稿被放进 `collectors/`
+    之后"的语义 —— 那时相对 import 指向的正是同一个模块。
+
+    以前这步靠人肉: 存盘 -> import -> 跑 `selfcheck.py`。现在前移到探针里, 于是
+    "草稿自己的 `id_samples` 过不了自己的 `id_patterns`"当场就能看见, 而不是等提交
+    之后被 CI 拦下。
+
+    返回 (problems, note)。note 非空表示草稿连跑都跑不起来。
+    """
+    src = (text
+           .replace("from .. import register", "from collectors import register")
+           .replace("from ..gallery_base import",
+                    "from collectors.gallery_base import"))
+    ns = {}
+    try:
+        exec(compile(src, "<draft>", "exec"), ns)
+    except Exception as e:
+        return [], "%s: %s" % (type(e).__name__, e)
+    site = next((v for v in ns.values() if isinstance(v, GallerySite)), None)
+    if site is None:
+        return [], "草稿里没有 GallerySite 实例"
+    try:
+        return check_site(site), ""
+    except Exception as e:
+        return [], "check_site 抛出 %s: %s" % (type(e).__name__, e)
+
+
+def report_draft_selfcheck(text):
+    """跑一遍草稿自检并打印结论。"""
+    print("\n" + "=" * 74)
+    print("草稿自检 (check_site)")
+    print("=" * 74)
+    problems, note = validate_draft(text)
+    if note:
+        print("  !! 草稿跑不起来: %s" % note)
+        return
+    if not problems:
+        print("  => 通过: 每条 `id_samples` 都被解析出期望的 gid, 各 pattern 无冲突。")
+        return
+    print("  !! %d 条问题 —— 草稿是给人改的起点, 但下面这些**必须先改掉**:" % len(problems))
+    for p in problems:
+        print("     · %s" % p)
+    print("  => 改到这一节为空, 才算可以提交的声明。")
 
 
 # --------------------------------------------------------------------------
@@ -858,6 +1076,39 @@ def main():
           % (info["base"], info["gid"], info["seq_format"], info["suffix"]))
     print()
 
+    ok, status, _ct = probe_reachability(session, info, args.timeout)
+    if not ok and not args.impersonate and status in _REACH_RETRY_STATUS:
+        # "站点在 Cloudflare 后面"是最常见的一种"谁都没做错、就是进不去"。既然换指纹
+        # 这条现成的路就在手边, 就不该让用户先看见 403、再手动加参数重跑一遍 ——
+        # 中间那一步纯属浪费(2026-09-23 在 xchina 上就是这么手动重跑的)。
+        print("  => %s: 自动改用 chrome TLS 指纹重试一次(curl-cffi)" % status)
+        alt_session, alt_transport = make_session(args.proxy, "chrome")
+        ok2, status2, _ct2 = probe_reachability(alt_session, info, args.timeout)
+        if ok2 or status2 != status:
+            try:
+                session.close()
+            except Exception:
+                pass
+            session, transport = alt_session, alt_transport
+            ok, status = ok2, status2
+        else:
+            try:
+                alt_session.close()
+            except Exception:
+                pass
+    if not ok:
+        sys.exit(refuse(
+            "你给的那条直链**本身没探通**",
+            lines=[
+                "所以后面的四项(请求头 / 页面 / 变体 / URL 形态)**都没跑** —— 它们全都",
+                "要先能拿到资源, 跑了也只是给出一屏没有意义的数字。",
+                "",
+                "下一步按顺序试(上面标了「自动」的就不必再手工跑一遍):",
+                "  1. --proxy <你的代理>      站点可能只对特定地区放行",
+                "  2. --impersonate firefox   换一个指纹(curl-cffi 支持 chrome/firefox/safari/edge)",
+                "  3. 浏览器里打开这条直链, 确认它**本身**还有效(签名过期/图集删了都会这样)",
+            ]))
+
     _verdict, ex_rows = probe_existence(session, info, args.scan, args.over, args.timeout)
     seq_hits = sum(1 for r in ex_rows if r[4])
     probe_accept(session, info, args.timeout)
@@ -893,10 +1144,26 @@ def main():
     draft = build_draft(info, media, pages, hits, patterns, gid_re, bad_tail,
                         page_bases, resolution, seq_hits)
 
+    if draft.blocking:
+        # 档 A 缺证据 -> 拒绝出草稿。这一步是**把特例升成规则**: `opaque_suffix`
+        # 早就在这么干了, 但全文件只有它一处 —— 于是每遇到一个新形态都得再手写一个
+        # if。现在凡是"URL 拼不出来"的字段缺实测, 都走同一个出口。
+        sys.exit(refuse("档 A 字段缺实测证据", draft.blocking))
+    if draft.advisory:
+        print("\n" + "-" * 74)
+        print("注意(不阻断出草稿, 但也别当没看见):")
+        for g in draft.advisory:
+            print("  · %s —— %s" % (g.field, g.why))
+            if g.fix:
+                print("      怎么补: %s" % g.fix)
+        print("-" * 74)
+
     print("\n" + "=" * 74)
     print("GallerySite 草稿")
     print("=" * 74)
     print(draft)
+
+    report_draft_selfcheck(draft)
 
     print("=" * 74)
     print("接下来")

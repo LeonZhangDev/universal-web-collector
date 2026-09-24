@@ -57,6 +57,9 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
     total = 5                      # 存在的序号: 1..5
     hole = 0                       # 让某个序号"缺一张"(0 = 不制造空洞)
     always_403 = False             # 整站不可达(用来验"不要编结论"那条守卫)
+    #: 非空则"只有这几个序号存在" —— 用来造"直链通、但 --scan 范围内 0 命中"的场景。
+    #: 档 A 门禁要拦的正是它: 直链有效, 但"序号枚举型"这个前提一个样本都没验出来。
+    only_seqs = ()
     #: 非空则启用车名形态 `/hashes/<gid>/<seq>-<内容哈希>.png`(MangaDex 那种)——
     #: 只有 `1-<该哈希>` 存在。用来验"不透明后缀 -> 拒绝出草稿"。
     opaque_hash = ""
@@ -121,7 +124,8 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
             if mm:
                 n = int(mm.group(1))
                 ctype = self.suffix_ext.get(stem[len(mm.group(1)):])
-                if ctype and n <= self.total and n != self.hole:
+                listed = not self.only_seqs or n in self.only_seqs
+                if ctype and n <= self.total and n != self.hole and listed:
                     self._send(200, ctype, b"\xff\xd8\xff" + b"0" * 64, body)
                     return
         self._send(200, "text/html; charset=utf-8", b"<html>x</html>", body)
@@ -132,7 +136,7 @@ def fake_site():
     """起一个本地假站点; 用完关掉。端口由系统分配, 不占固定端口。"""
     servers = []
 
-    def start(always_403=False, hole=0, total=None, opaque_hash=""):
+    def start(always_403=False, hole=0, total=None, opaque_hash="", only_seqs=()):
         over = {}
         if always_403:
             over["always_403"] = True
@@ -142,6 +146,8 @@ def fake_site():
             over["total"] = total
         if opaque_hash:
             over["opaque_hash"] = opaque_hash
+        if only_seqs:
+            over["only_seqs"] = tuple(only_seqs)
         cls = type("_S", (_FakeSite,), over)
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -248,6 +254,74 @@ def test_page_tail_evidence_flags_a_page_number():
     assert bad == ["https://x.site/photo/id-%s/10.html" % GID]
 
 
+def test_draft_separates_blocking_gaps_from_advisory_ones():
+    """门禁只认档 A —— 而"哪些字段属于档 A"必须是代码里的一条事实, 不是作者的记忆。
+
+    在这之前, "哪个字段猜错了会致命"只存在于人脑, 于是每遇到一个新形态就得手写一个
+    `if` 去堵(2026-09-24 一次性堵了五个, 而它们只是同一类错的五个化身)。
+    """
+    g_a = probe_site.Gap("base", probe_site.TIER_A, "没有实测", "先让它通")
+    g_b = probe_site.Gap("variants", probe_site.TIER_B, "少个档位")
+    d = probe_site.Draft("body", [g_a, g_b])
+    assert d == "body"                                # str 子类: 正文照旧能直接用
+    assert d.blocking == [g_a]
+    assert d.advisory == [g_b]
+    assert probe_site.Draft("x").blocking == []        # 没缺口 -> 不拦
+
+
+def test_validate_draft_runs_the_real_check_site():
+    """草稿要**跑起来**过一遍 `check_site()` —— 那是这份声明唯一的验收标准。
+
+    以前这步靠人肉(存盘 -> import -> 跑 selfcheck.py)。前移到探针里之后, "草稿自己的
+    `id_samples` 过不了自己的 `id_patterns`"当场就能看见, 而不是等提交后被 CI 拦下。
+
+    这里刻意用 `gid_shape` 与样本不符来造问题: 它是 `check_site()` 里一条独立判据,
+    与"正则能不能匹配"无关, 所以断言不会因为正则细节漂移而失效。
+    """
+    def decl(shape, sample):
+        return (
+            "from .. import register\n"
+            "from ..gallery_base import GallerySite, SequenceGallerySpider\n"
+            "T = GallerySite(\n"
+            '    name="t",\n'
+            '    base="https://x/photos",\n'
+            '    seq_format="{seq:04d}",\n'
+            '    variants=[".jpg"],\n'
+            '    gid_shape=r"%s",\n'
+            '    id_patterns=[r"/photos/([0-9A-Za-z]+)/"],\n'
+            '    id_samples=[("https://x/photos/%s/0001.jpg", "%s")],\n'
+            ")\n" % (shape, sample, sample))
+
+    problems, note = probe_site.validate_draft(decl(r"[0-9a-f]{8,}", "ABCDEF123456"))
+    assert note == ""                                  # 草稿本身是能跑起来的
+    assert any("gid_shape" in p for p in problems), problems
+
+    problems, note = probe_site.validate_draft(decl(r"[0-9a-f]{8,}", "abcdef123456"))
+    assert (problems, note) == ([], "")
+
+
+def test_validate_draft_reports_a_draft_that_cannot_even_run():
+    """草稿连跑都跑不起来时要**说出来**, 而不是静默当成"通过"。"""
+    problems, note = probe_site.validate_draft("this is not python(")
+    assert problems == []
+    assert note.startswith("SyntaxError")
+
+
+def test_short_tail_keeps_the_part_that_carries_the_evidence():
+    """URL 截断要**保尾部** —— 末段才是要人判断的那一段。
+
+    踩过(目视输出时发现的): 提示"末段是页码"时用的是从头截断的 `short()`, 于是
+    `/photo/id-X.html` 与 `/photo/id-X/10.html` 显示出来长得一样, 人根本分不清
+    探针在说哪一条 —— 而这两个 URL 的处理规则**完全相反**。
+    """
+    a = "https://x.site/photo/id-%s.html" % GID
+    b = "https://x.site/photo/id-%s/10.html" % GID
+    assert probe_site.short_tail(a, 24).startswith("…")
+    assert probe_site.short_tail(a, 24).endswith(".html")
+    assert probe_site.short_tail(a, 24) != probe_site.short_tail(b, 24)
+    assert probe_site.short_tail(a, 200) == a           # 够短就别动它
+
+
 # ---------------------------------------------------------------- 端到端
 
 
@@ -287,6 +361,13 @@ def test_probe_reports_the_five_known_conclusions(fake_site, tmp_path):
     ast.parse(draft)                                  # 草稿至少是合法 Python
     # 从 IP 取不出有意义的站点名 -> 退回 site_gallery, 而不是 `0_gallery`
     assert 'name="site_gallery"' in draft
+    # 草稿自检: `check_site()` 是这份声明**唯一**的验收标准, 探针自己先跑一遍
+    # (以前这步靠人肉: 存盘 -> import -> 跑 selfcheck.py)
+    assert "草稿自检 (check_site)" in out
+    assert "=> 通过: 每条 `id_samples` 都被解析出期望的 gid" in out
+    # 相册页与它的分页会推出**同一条**正则 —— 不许写两遍(写两遍会让人以为漏了哪条,
+    # 也让 check_site 白跑一遍)。目视输出时发现的。
+    assert draft.count(r"/photo/id\-([0-9a-f]{8,})") == 1
 
 
 def test_probe_flags_a_hole_in_the_sequence(fake_site):
@@ -303,19 +384,24 @@ def test_probe_flags_a_hole_in_the_sequence(fake_site):
     assert "用线性扫描" in out
 
 
-def test_probe_refuses_to_conclude_when_nothing_resolved(fake_site):
-    """整站不可达时**不许**照抄一个结论 —— 那是本项目最忌讳的"看着有结论、其实没证据"。
+def test_probe_gives_up_early_when_the_link_is_unreachable(fake_site):
+    """直链不通 -> **第 0 段就早退**, 而不是跑完四项再给一屏没意义的数字。
 
     真实教训(2026-09-23): xchina 的媒体主机从这台机器整段 403, 而探针第一版会把
     "越界 403" 判成"状态码可用", 那会把一个**完全不可达**的站点写成"判定规则已确认"。
+
+    顺带: `403` 这种"被挡在门外"的状态要**自动**换一次浏览器 TLS 指纹, 不该让人先
+    看见 403、再手动加参数重跑一遍 —— 那天在 xchina 上就是这么手动重跑的。
     """
     srv = fake_site(always_403=True)
     out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID])
-    assert rc == 0, out
-    assert "还没验出来" in out
-    assert "状态码可用" not in out
-    assert "--impersonate chrome" in out              # 给出可行动的下一步
+    assert rc == 2, out
+    assert "自动改用 chrome TLS 指纹重试一次" in out      # 不用人叫, 自己试一次
     assert "你给的那条直链**本身没探通**" in out
+    assert "都没跑" in out                                # 后面四项省掉了
+    assert "状态码可用" not in out                        # 绝不编结论
+    assert "--proxy" in out                               # 还得给可行动的下一步
+    assert "--impersonate" in out
 
 
 def test_probe_requires_a_direct_link(fake_site):
@@ -445,15 +531,21 @@ def test_probe_calls_a_single_hit_an_ambiguity(fake_site):
     assert "只探到 **1 个**存在的序号" in out      # 草稿顶部横幅
 
 
-def test_probe_marks_a_draft_with_no_evidence(fake_site):
-    """一个存在的序号都没探到时, 草稿顶部必须有"没有任何证据支持"的醒目横幅。
+def test_probe_refuses_a_draft_with_no_sequence_evidence(fake_site):
+    """直链通、但 --scan 范围内一个存在的序号都没探到 -> **拒绝出草稿**。
 
-    报告 ① 已经说了"判定规则还没验出来", 但人很可能只翻到"GallerySite 草稿"那一段
-    —— 所以那一段得自己把话说清楚。(picsum 实测: gid 被推错, 于是 6 次全 400。)
+    这正是 picsum 实测暴露的那处: gid 被推错, 6 次一个都不中 —— 而草稿照样打印出来,
+    那份声明**没有一条有实测支持**。现在它走档 A 门禁, 一个字都不给。
+
+    场景要造得准: 直链**自己必须有效**, 否则会在第 0 段被可达性拦下, 测不到 ① 这一层。
     """
-    srv = fake_site(total=0)
-    out, rc = _run(srv.server_address[1], [])
-    assert rc == 0, out
-    assert "本次命中 0/6" in out
-    assert "任何证据支持" in out           # 横幅里这个词组跨了行, 只断言单行片段
-    assert "不要用" in out
+    srv = fake_site(only_seqs=(2,))
+    port = srv.server_address[1]
+    out, rc = _run(port, [],
+                   dlink="http://127.0.0.1:%d/photos/%s/0002.jpg" % (port, GID),
+                   extra=["--scan", "1"])
+    assert rc == 2, out
+    assert "本次命中 0/1" in out
+    assert "档 A 字段缺实测证据" in out
+    assert "一个存在的序号都没探到" in out
+    assert "GallerySite 草稿" not in out      # 一个字都不给, 免得被照抄

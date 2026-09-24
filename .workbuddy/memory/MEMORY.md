@@ -82,7 +82,7 @@
 
 ## 本机验证
 `~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；curl 对 127.0.0.1 加 `--noproxy '*'`。别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）；同一文件多处 Edit **不要并行发**。
-⚠️ **口径 = 收集总数**。本机 Windows **1290 收集 / 1284 passed + 6 skipped**，CI(Linux) **1291** —— 差额是 `POSIX_TERMINATION_SIGNALS` 非 Win 多一个 SIGHUP 参数；跳过项两边**互换**（本机 6 = POSIX×5 + 信号×1，CI 8 = 无 ffmpeg×7 + Win 锁×1）。**改文档前先跑数；差分不闭合先怀疑自己。**
+⚠️ **口径 = 收集总数**。本机 Windows **1290 收集**（1284 passed + 6 skipped = POSIX-only 用例×5 + 信号参数×1）；CI(Linux) **1291 收集 / 1289 passed + 2 skipped** —— **V40 起 CI 装了 ffmpeg，那 7 条"真解码"用例真的跑了**（第 21 条已修，实测确认），剩下 2 条是 Windows-only。**改文档前先跑数；差分不闭合先怀疑自己。**
 ⚠️ **`img.xchina.io` 从本机整段 403**（`text/plain`，不是 CF 挑战页）→ 这条**网络**的问题，不是站点改版、不是回归。别拿它当靶子。
 ⚠️ 别前置 `export PATH="/usr/bin:/bin:$PATH"`（会把裸 `python` 换成没 pytest 的 3.13.12）。coreutils 全无，但 `echo`/`git`/`python`/`date` 可用。
 ⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50）→ `verify_output.py` 的 `rmtree` / `vite build` 的 `emptyDir` / pytest 清 `tmp_path` 全无 `FAILED`、**连汇总行都没有**。判据：看进度行有没有 `F`；若输出**只有一行** `[safe-delete]…`，那是上一次留下的 `data/_verify_output` 触发的 —— **`mv` 走它**再跑即可。被 kill 时重定向的输出去丢 → 脚本要 `python -u`。

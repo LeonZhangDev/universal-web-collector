@@ -93,7 +93,7 @@
 ⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50）→ 被杀时**无 `FAILED`、连汇总行都没有**。判据：看进度行有没有 `F`；若输出**只有一行** `[safe-delete]…`，那是上次留下的 `data/_verify_output` 触发的 —— **`mv` 走它**再跑。被 kill 时重定向的输出去丢 → 脚本要 `python -u`。
 ⚠️ 想拿 pytest 汇总行：`--basetemp` 指系统临时目录下一个**不存在**的路径；**绝不指进项目目录**。宿主包装器偶发缺失 → 长命令 `MODULE_NOT_FOUND`（**压根没跑**），加 `run_in_background=true` 绕过。
 ⚠️ **行尾**：`Path.write_text()` 在 Windows 上把 `\n` 翻成 `\r\n`。`.gitattributes` 是唯一来源；`downloaders/video.py` 与 `scripts/verify_output.py` 的 HEAD 本是 CRLF，别去"统一"。
-⚠️ **npm 的"包目录存在"≠"包装好了"**：`@rollup/rollup-win32-x64-msvc` 可能是**空目录** → `vite build` 报 `Cannot find module`（`--no-save` 重装即可）。
+⚠️ **npm 的"包目录存在"≠"包装好了"**：`@rollup/rollup-win32-x64-msvc` 可能是**空目录** → `vite build` 报 `Cannot find module`。
 
 ## Git / 远端
 独立建仓（toplevel = 项目目录），分支 `main`。**上级 `C:\Users\admin` 那个仓库绝不能碰**。远端 <https://github.com/LeonZhangDev/universal-web-collector>；本机**无 `gh` CLI** → `printf "protocol=https\nhost=github.com\n\n" | git credential fill` 取 `gho_` token。

@@ -116,7 +116,6 @@ URL 里, 是手上最硬的一份证据; 再给相册页 URL, 就能顺带验"�
 
 import argparse
 import hashlib
-import json
 import re
 import sys
 import tempfile

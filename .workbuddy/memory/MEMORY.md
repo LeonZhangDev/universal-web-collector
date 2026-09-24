@@ -87,7 +87,7 @@
 
 ## 本机验证
 `~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；curl 对 127.0.0.1 加 `--noproxy '*'`。别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）。
-⚠️ **口径 = 收集总数**。本机 Windows **1306 收集**（1300 passed + 6 skipped）；CI(Linux) **1307** —— 差额恒为 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数×1。**V40 起 CI 装了 ffmpeg，那 7 条"真解码"用例真的跑了**（第 21 条已修，剩下 2 条是 Windows-only）。**改文档前先跑数；差分不闭合先怀疑自己。**
+⚠️ **口径 = 收集总数**。本机 Windows **1309 收集**（1303 passed + 6 skipped）；CI(Linux) **1310**（CI 实测 1308+2，与 README 逐位对账过）—— 差额恒为 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数×1。**V40 起 CI 装了 ffmpeg，那 7 条"真解码"用例真的跑了**（第 21 条已修，剩下 2 条是 Windows-only）。**改文档前先跑数；差分不闭合先怀疑自己。**
 ⚠️ **`img.xchina.io` 从本机整段 403**（`text/plain`，不是 CF 挑战页）→ 这条**网络**的问题，不是站点改版、不是回归。别拿它当靶子。
 ⚠️ 别前置 `export PATH="/usr/bin:/bin:$PATH"`（会把裸 `python` 换成没 pytest 的 3.13.12）。coreutils 全无，但 `echo`/`git`/`python`/`date` 可用。
 ⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50）→ 被杀时**无 `FAILED`、连汇总行都没有**。判据：看进度行有没有 `F`；若输出**只有一行** `[safe-delete]…`，那是上次留下的 `data/_verify_output` 触发的 —— **`mv` 走它**再跑。被 kill 时重定向的输出去丢 → 脚本要 `python -u`。
@@ -112,6 +112,6 @@
 
 - **V38 复核要点**：当初写的拒绝理由**站不住** —— **"暂时不做"不许写成"不该做"。**
 - **V39 / V39.5 / V40 一句话**：**加站的成本在探测不在写声明**；假绿＝判据挂在"没报错"（要 `checked`，`0` 算红）；假红＝判据挂在中文子串（要 `kind`/`step`/`level` 代号）。修法是**先把它变成结构**；结构也有方向 —— 见第 24 条。
-- **V41** 对标 Immich/PhotoPrism/Eagle 后吸收四项：**排除模式 glob**（命中要计数）/ **往年今日**（`basis="mtime"`，不用 EXIF）/ **重复标记**（复用 `core/phash`，无 ffmpeg 报 `no-decoder` 不报空列表）/ **扫描对账**（`None` ≠ `{"added":0}`）；抓出第 26/27 条（**1306**）
+- **V41** 对标 Immich/PhotoPrism/Eagle 后吸收四项：**排除模式 glob**（命中要计数）/ **往年今日**（`basis="mtime"`，不用 EXIF）/ **重复标记**（复用 `core/phash`，无 ffmpeg 报 `no-decoder` 不报空列表）/ **扫描对账**（`None` ≠ `{"added":0}`）；抓出第 26/27 条 + 同族 H/I（**1309**）
 - **V41 一句话**：**"没有结果"与"没算出结果"必须是两个值**（空列表会被读成"没有重复"）；**"规则生效了"要有计数当证据**（写了却一条没排除，长得和"没配规则"一模一样）。
 - **下一步候选**：更多站点插件（先跑 `probe_site.py`）/ HLS 直播（`EVENT` 或无 `ENDLIST`，缺真站样本）/ 直播断点续录（低）/ 人脸·语义搜索·地图（另一档投入）/ 评分·颜色搜索·智能文件夹（要"属性的属性"语义）—— 全是**"暂时不做"，不是"不该做"**。

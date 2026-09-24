@@ -1,5 +1,5 @@
 .PHONY: install start start-native start-dev backend frontend test build docker clean \
-	add-site selfcheck drift
+	add-site selfcheck drift guard
 
 install:
 	uv sync --group dev
@@ -15,6 +15,9 @@ selfcheck:
 
 drift:
 	uv run python scripts/drift_check.py
+
+guard:
+	uv run python scripts/gateguard.py
 
 start:
 	uv run python scripts/start.py
@@ -41,6 +44,7 @@ frontend:
 
 test:
 	uv run pytest -q
+	uv run python scripts/gateguard.py
 
 build:
 	cd frontend && npm run build

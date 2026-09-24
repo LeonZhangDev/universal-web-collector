@@ -44,7 +44,7 @@ import json
 import os
 import re
 import sys
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urljoin
 
 ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))

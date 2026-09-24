@@ -7,6 +7,7 @@ import TaskDetail from "./components/TaskDetail.vue";
 import EnvDiagnose from "./components/EnvDiagnose.vue";
 import StatsPanel from "./components/StatsPanel.vue";
 import LibraryPanel from "./components/LibraryPanel.vue";
+import LocalAlbumPanel from "./components/LocalAlbumPanel.vue";
 import NotificationCenter from "./components/NotificationCenter.vue";
 import ToastHost from "./components/ToastHost.vue";
 import {
@@ -48,12 +49,16 @@ const activeId = ref(0);
 
 const collectors = ref(["auto"]);
 const config = ref({});
-// 主视图切换: 任务列表 / 资源库。记忆选择, 高频用户不用每次点回来。
+// 主视图切换: 任务列表 / 资源库 / 本地相册集。记忆选择, 高频用户不用每次点回来。
+// 三个视图的分工: 任务列表 = "我正在采什么"; 资源库 = "我**下过**什么"(每一行都
+// 对得上一份本程序产出的文件, 所以能删); 本地相册集 = "我**本来就有**什么"
+// (用户自己的目录, **只读**)。
 const view = ref("tasks");
 const VIEW_KEY = "uwc.view.v1";
+const VIEWS = ["tasks", "library", "local"];
 try {
   const savedView = localStorage.getItem(VIEW_KEY);
-  if (savedView === "tasks" || savedView === "library") view.value = savedView;
+  if (VIEWS.includes(savedView)) view.value = savedView;
 } catch (e) {
   /* ignore */
 }
@@ -430,6 +435,11 @@ onUnmounted(() => {
       :class="{ on: view === 'library' }"
       @click="view = 'library'"
     >资源库</button>
+    <button
+      class="vtab"
+      :class="{ on: view === 'local' }"
+      @click="view = 'local'"
+    >本地相册集</button>
   </div>
 
   <div class="card" v-show="view === 'tasks'">
@@ -495,6 +505,8 @@ onUnmounted(() => {
   </div>
 
   <LibraryPanel v-if="view === 'library'" />
+
+  <LocalAlbumPanel v-if="view === 'local'" />
 
   <TaskDetail
     v-if="selectedId"

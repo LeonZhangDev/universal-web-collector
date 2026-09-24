@@ -46,7 +46,7 @@ def _has_curl_cffi():
 
 
 needs_curl_cffi = pytest.mark.skipif(not _has_curl_cffi(),
-                                    reason="curl-cffi 没装 —— 这条恰恰只在装了它才有效")
+                                    reason="[deps:curl-cffi] 没装 —— 这条恰恰只在装了它才有效")
 
 #: 一个"只回 CF 挑战页"的假站点。正文就是判据 —— `diagnose_block` 靠它分型。
 CF_PAGE = (b"<html><head><title>Just a moment...</title></head>"

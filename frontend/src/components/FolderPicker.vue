@@ -5,6 +5,11 @@ import { browseFs, mkdirFs } from "../api";
 const props = defineProps({
   show: { type: Boolean, default: false },
   initial: { type: String, default: "" },
+  // 标题与底部说明做成 props: 这个选择器现在有两个用途(选下载目录 / 选相册集目录),
+  // 而"文件保存到 …/<任务ID>/"这句话对后者是**错的** —— 相册集目录是只读的。
+  // 抄一份出来改字更省事, 但那就有两个目录选择器要各自维护了。
+  title: { type: String, default: "选择下载文件夹" },
+  hint: { type: String, default: "" },
 });
 const emit = defineEmits(["select", "close"]);
 
@@ -72,7 +77,7 @@ watch(
   <div v-if="show" class="modal-mask" @click.self="emit('close')">
     <div class="modal">
       <div class="modal-head">
-        <h3>选择下载文件夹</h3>
+        <h3>{{ title }}</h3>
         <button class="ghost" @click="emit('close')">✕</button>
       </div>
 
@@ -112,7 +117,10 @@ watch(
 
       <div class="modal-foot">
         <div class="hint">
-          文件保存到 <code>{{ selected || cwd || "-" }}</code> / &lt;任务ID&gt; /
+          <template v-if="hint">{{ hint }}</template>
+          <template v-else>
+            文件保存到 <code>{{ selected || cwd || "-" }}</code> / &lt;任务ID&gt; /
+          </template>
         </div>
         <span style="flex: 1"></span>
         <button class="ghost" @click="emit('close')">取消</button>

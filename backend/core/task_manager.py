@@ -12,7 +12,6 @@ from pathlib import Path
 from collectors import get_collector
 from core import events
 from core import layout
-from core import mediacheck
 from core import partials
 from core.cancel import TaskCancelled  # noqa: F401  (下载层要识别它, 在这里重导出)
 from core.config import settings

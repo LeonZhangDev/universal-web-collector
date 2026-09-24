@@ -23,6 +23,7 @@
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -34,6 +35,112 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))     # 让 isolation 可
 import isolation  # noqa: E402
 
 import core.task_manager as _tm  # noqa: E402
+
+
+# --------------------------------------------------------------------------
+# R-CI-3: 跳过项必须**说得清是哪一类**, 且 CI 里只允许平台门控
+# --------------------------------------------------------------------------
+#
+# 这条规矩治的是本项目最贵的一种假绿: **最该跑的那些用例整类只在跳, 而 job 是绿的**。
+#
+# 2026-09-24 逐位还原过 CI 的 8 条跳过: 其中 7 条是「没装 ffmpeg」(4 条 phash 真解码
+# + 3 条 DASH 端到端)。也就是说 —— **CI 从不验证"产物内容是不是好的"**, 而那 7 条
+# 恰好是最贵的判据。绿灯给了"它验过了"的错觉, 实际是"它根本没跑"。
+#
+# 判据不能挂在中文理由上(那是本项目记过的假红: 文案一改, 正确实现被判红), 所以:
+#   ① 每条跳过都必须带一个**机器标签**: `[platform:posix]` / `[deps:ffmpeg]` / `[env:make]`
+#      没有标签 -> 红。强迫写的人回答"这次跳过属于哪一类", 而不是写一句"环境不支持"。
+#   ② `[platform:X]` 里的 X 是**这条用例需要的平台**(不是"我现在在哪个平台"),
+#      所以判据是 `X != 当前平台` 才算合理跳过; `X == 当前平台` 却仍在跳 -> 红,
+#      那说明门控条件写反了(在自己需要的平台上把自己跳掉了)。
+#   ③ `[deps:*]` / `[env:*]` -> 在 CI(`UWC_CI=1`)里**一律不许出现**。
+#      CI 只有两个选择: 把依赖装上, 或者承认这个 job 是 partial 的 —— 而现在只允许前者。
+#
+# ⚠️ ② 的这一版是**改过一次**的, 前一次的判据是"必须当前平台确实是它"。那一条
+#    在本仓里**永远不可能两边都绿**: 仓库同时有"只在 POSIX 跑"和"只在 Windows 跑"
+#    的用例, 于是无论跑在哪个平台上, 总有一类跳过的标签等于当前平台 -> 必然红。
+#    更值得记的是它**当时没红**: 那轮只跑了 `test_skip_policy.py`, 而那几条双向
+#    用例是照**实现**写的(实现说"标签要等于当前平台", 用例就断言这一条), 于是
+#    "实现与意图一致地错"通过了自检。暴露它的是**端到端**的那次全量 —— 真实站点
+#    上真的跳了, 标签真的不等于当前平台, 钩子真的报了红。
+#    这就是 F 类("通过但理由已经不对")的现场, 也是 ⑦ 那条心法的用法: 判据要能被
+#    **整条链路**跑到, 光有双向单测不算 —— 单测可以忠实地编码一个错的意图。
+#    反过来说, `[platform:X]` 的语义必须**只有一个方向**, 否则同一条标签在两个
+#    平台上会各有一次被判红。那个证明被写成了用例:
+#    `tests/test_skip_policy.py::test_the_platform_tag_is_satisfiable_on_both_platforms`
+#
+# 与 `scripts/gateguard.py` 是一条链: 那边管 ci.yml 有没有装依赖, 这边管"装了之后
+# 是不是真的不跳了"。
+
+_SKIP_TAG = re.compile(r"\[(platform|deps|env):([a-z0-9_.+-]+)\]")
+
+_SKIPPED = []           # [(nodeid, reason)]
+_SKIP_PROBLEMS = []
+
+
+def _current_platform():
+    return "windows" if os.name == "nt" else "posix"
+
+
+def _skip_reason(report):
+    """跳过的理由。`skipif` 的 longrepr 是 `(file, lineno, reason)` 三元组。"""
+    lr = getattr(report, "longrepr", None)
+    if isinstance(lr, tuple) and len(lr) == 3:
+        return str(lr[2])
+    return str(lr)
+
+
+def pytest_runtest_logreport(report):
+    if report.skipped:
+        _SKIPPED.append((report.nodeid, _skip_reason(report)))
+
+
+def _skip_problems(skips=None, on_ci=None):
+    """把跳过清单判成"有没有问题"。纯函数, 所以可以被用例直接喂假数据。"""
+    skips = _SKIPPED if skips is None else skips
+    on_ci = bool(os.getenv("UWC_CI")) if on_ci is None else on_ci
+    problems = []
+    for nodeid, reason in skips:
+        where = nodeid.split("::", 1)[-1] if "::" in nodeid else nodeid
+        m = _SKIP_TAG.search(reason or "")
+        if not m:
+            problems.append(
+                "%s\n      跳过理由 %r 里没有机器标签。加一个 `[platform:…]` / "
+                "`[deps:…]` / `[env:…]` —— 「运气不好跳过了」与「这类用例本来就不该跑」"
+                "必须是两个结论, 而现在看不出来是哪一个。" % (where, (reason or "")[:80]))
+            continue
+        category, name = m.group(1), m.group(2)
+        if category == "platform":
+            # 标的是"这条用例**需要**哪个平台"。所以合理的跳过必然发生在**别的**
+            # 平台上; 如果当前平台正是它要的那个却仍然跳了, 门控条件就是反的。
+            if name == _current_platform():
+                problems.append(
+                    "%s\n      标了 `[platform:%s]`(这条用例需要 %s), 而这次就**跑在 %s 上**"
+                    "却仍然跳过了 —— 门控条件写反了?" % (where, name, name, name))
+        elif on_ci:
+            problems.append(
+                "%s\n      因为 `[%s:%s]` 跳过了, 而这跑在 CI 上。CI 里**只允许平台门控**"
+                "的跳过: 要么在 ci.yml 里把 %s 装上(见 README「CI 契约」), 要么这个"
+                "job 就得承认自己是 partial。" % (where, category, name, name))
+    return problems
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionfinish(session, exitstatus):
+    _SKIP_PROBLEMS[:] = _skip_problems()
+    if _SKIP_PROBLEMS and not session.exitstatus:
+        session.exitstatus = 1
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not _SKIP_PROBLEMS:
+        return
+    terminalreporter.write_sep("=", "跳过项策略 (R-CI-3) 不通过")
+    for p in _SKIP_PROBLEMS:
+        terminalreporter.write_line("  !! " + p)
+    terminalreporter.write_line(
+        "  规则见 README 的「CI 契约」: 跳过必须带 [platform:*] / [deps:*] / [env:*],"
+        "且 CI 里只允许平台门控的跳过。")
 
 
 @pytest.fixture(autouse=True)

@@ -21,7 +21,6 @@ ffmpeg 拉流, 而假分片不是合法 TS —— ffmpeg 直接报错, 验证失
 
 import hashlib
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -166,6 +165,11 @@ def engine(mode: str, hide_ffmpeg: bool = False):
 
 PASS = []
 FAIL = []
+
+#: 断言总数 —— 与 README 的「`verify_hls.py` … (18 项断言)」是同一个数。
+#: 少的那个方向最危险: 少核了几项, 脚本照样印「18 项通过」而没人看得出来。
+#: `scripts/gateguard.py` 会拿这个常量与 README 对账。
+EXPECTED_CHECKS = 18
 
 
 def check(label, cond, detail=""):
@@ -330,5 +334,11 @@ print("\n" + "=" * 66)
 print(f"结果: {len(PASS)} 项通过, {len(FAIL)} 项失败")
 for f in FAIL:
     print(f"  [x] {f}")
+if not FAIL and len(PASS) != EXPECTED_CHECKS:
+    # 一条都没失败, 却**比声明的少核了几项** —— 少了的那几项不会说话。
+    # 与 FAIL 同等对待: 不许静默少核。反方向(多核了)同样要改声明, 所以也报。
+    print(f"  [!] 只核了 {len(PASS)} 项, 声明的是 {EXPECTED_CHECKS} 项"
+          f"(差 {len(PASS) - EXPECTED_CHECKS:+d}) —— 同步 README 与 EXPECTED_CHECKS")
 print("=" * 66)
-sys.exit(1 if FAIL else 0)
+sys.exit(1 if (FAIL or len(PASS) != EXPECTED_CHECKS) else 0)
+

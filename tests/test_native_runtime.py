@@ -48,7 +48,7 @@ def _fake_runtime_uv(path):
 def _run_native_make(tmp_path, *, path_uv=False, home_uv=False, unset_home=False):
     make = shutil.which("make")
     if make is None:
-        pytest.skip("make is unavailable")
+        pytest.skip("[env:make] make is unavailable")
     home = tmp_path / "home"
     path_dir = tmp_path / "path"
     capture = tmp_path / "uv-call.txt"
@@ -77,7 +77,7 @@ def _run_native_make(tmp_path, *, path_uv=False, home_uv=False, unset_home=False
     return result, call
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+@pytest.mark.skipif(os.name == "nt", reason="[platform:posix] POSIX Makefile recipe")
 def test_start_native_falls_back_to_user_uv(tmp_path):
     result, call = _run_native_make(tmp_path, home_uv=True)
 
@@ -85,7 +85,7 @@ def test_start_native_falls_back_to_user_uv(tmp_path):
     assert call == "home:run python scripts/start.py --native --no-open --idle-minutes 30"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+@pytest.mark.skipif(os.name == "nt", reason="[platform:posix] POSIX Makefile recipe")
 def test_start_native_prefers_path_uv(tmp_path):
     result, call = _run_native_make(tmp_path, path_uv=True, home_uv=True)
 
@@ -93,7 +93,7 @@ def test_start_native_prefers_path_uv(tmp_path):
     assert call == "path:run python scripts/start.py --native --no-open --idle-minutes 30"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+@pytest.mark.skipif(os.name == "nt", reason="[platform:posix] POSIX Makefile recipe")
 def test_start_native_reports_missing_uv(tmp_path):
     result, call = _run_native_make(tmp_path)
 
@@ -102,7 +102,7 @@ def test_start_native_reports_missing_uv(tmp_path):
     assert "$HOME/.local/bin/uv" in result.stderr
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+@pytest.mark.skipif(os.name == "nt", reason="[platform:posix] POSIX Makefile recipe")
 def test_start_native_reports_missing_uv_with_unset_home(tmp_path):
     result, call = _run_native_make(tmp_path, unset_home=True)
 
@@ -112,11 +112,11 @@ def test_start_native_reports_missing_uv_with_unset_home(tmp_path):
     assert "parameter not set" not in result.stderr.lower()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX Makefile recipe")
+@pytest.mark.skipif(os.name == "nt", reason="[platform:posix] POSIX Makefile recipe")
 def test_native_fallback_passes_uv_to_internal_sync(tmp_path):
     make = shutil.which("make")
     if make is None:
-        pytest.skip("make is unavailable")
+        pytest.skip("[env:make] make is unavailable")
     home = tmp_path / "home"
     path_dir = tmp_path / "path"
     path_dir.mkdir()
@@ -391,7 +391,7 @@ def test_activity_read_error_restarts_full_idle_window():
     assert "database busy" in messages[0]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX signal semantics")
+@pytest.mark.skipif(os.name == "nt", reason="[platform:posix] POSIX signal semantics")
 @pytest.mark.parametrize("signum", POSIX_TERMINATION_SIGNALS)
 def test_posix_signal_cleans_owned_child_descriptor_and_lock(tmp_path, signum):
     runtime_file = tmp_path / "runtime.json"
@@ -448,7 +448,7 @@ def test_posix_signal_cleans_owned_child_descriptor_and_lock(tmp_path, signum):
     replacement.release()
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows byte-range lock regression")
+@pytest.mark.skipif(os.name != "nt", reason="[platform:windows] Windows byte-range lock regression")
 def test_second_windows_launcher_waits_for_locked_runtime(tmp_path):
     class CollectorHandler(BaseHTTPRequestHandler):
         def do_GET(self):

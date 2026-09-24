@@ -23,10 +23,7 @@
 (暂存区的正确性**就是**文件搬来搬去, 用假文件系统测等于什么都没测)。
 """
 
-import io
-import os
 import time
-from pathlib import Path
 
 import pytest
 from fastapi import FastAPI

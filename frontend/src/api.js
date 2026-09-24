@@ -247,6 +247,76 @@ export function toggleWatch(id) {
 export function deleteWatch(id) {
   return api.delete(`/watches/${id}`).then((r) => r.data);
 }
+// ---- 本地相册集 ----
+// 把**用户自己的目录**当相册集浏览(见 core/localalbums.py)。这一组对用户的目录
+// 是**只读**的: 这里没有任何一个函数会改/删相册目录里的东西 —— 连"忘记这个目录"
+// 也只删掉那条登记记录, 磁盘上的文件一个都不动。
+export function listLocalRoots() {
+  return api.get("/local/roots").then((r) => r.data);
+}
+export function addLocalRoot(path, name) {
+  return api.post("/local/roots", { path, name: name || null }).then((r) => r.data);
+}
+export function renameLocalRoot(id, name) {
+  return api.patch(`/local/roots/${id}`, { name }).then((r) => r.data);
+}
+export function removeLocalRoot(id) {
+  return api.delete(`/local/roots/${id}`).then((r) => r.data);
+}
+export function scanLocalRoot(id) {
+  return api.post(`/local/roots/${id}/scan`).then((r) => r.data);
+}
+export function listLocalAlbums(opts = {}) {
+  const params = {};
+  if (opts.root_id) params.root_id = opts.root_id;
+  if (opts.q) params.q = opts.q;
+  if (opts.sort) params.sort = opts.sort;
+  if (opts.order) params.order = opts.order;
+  if (opts.min_photos !== undefined) params.min_photos = opts.min_photos;
+  if (opts.refresh) params.refresh = true;
+  return api.get("/local/albums", { params }).then((r) => r.data);
+}
+export function listLocalPhotos(opts = {}) {
+  const params = { root_id: opts.root_id, rel: opts.rel || "" };
+  if (opts.q) params.q = opts.q;
+  if (opts.offset) params.offset = opts.offset;
+  if (opts.limit) params.limit = opts.limit;
+  return api.get("/local/photos", { params }).then((r) => r.data);
+}
+// 随机池。⚠️ `seed` + 递增的 `page` 是一副**可以一直往下翻的牌**: 同一个 seed 的各页
+// 不重叠。所以"换一批"换的是 seed, "更多"加的是 page —— 两者语义不同, 不要合并。
+export function getLocalRandom(opts = {}) {
+  const params = { count: opts.count || 60 };
+  if (opts.root_id) params.root_id = opts.root_id;
+  if (opts.album) params.album = opts.album;
+  if (opts.mode) params.mode = opts.mode;
+  if (opts.page) params.page = opts.page;
+  if (opts.seed) params.seed = opts.seed;
+  if (opts.min_bytes) params.min_bytes = opts.min_bytes;
+  if (opts.favorites_only) params.favorites_only = true;
+  return api.get("/local/random", { params }).then((r) => r.data);
+}
+export function listLocalFavorites() {
+  return api.get("/local/favorites").then((r) => r.data);
+}
+export function setLocalFavorite(rootId, rel, value = true) {
+  return api
+    .post("/local/favorite", { root_id: rootId, rel, value })
+    .then((r) => r.data);
+}
+// 删掉一条**失效**的收藏(源文件没了 / 那个目录不再登记)。
+// ⚠️ 这里传的是绝对路径, 与出图接口那条"绝不收绝对路径"的纪律不冲突: 出图要
+// 打开文件, 而这个动作只删我们库里的一行 —— 后端连 Path() 都不碰。
+export function forgetLocalFavorite(path) {
+  return api.post("/local/favorite/forget", { path }).then((r) => r.data);
+}
+export function getLocalStats() {
+  return api.get("/local/stats").then((r) => r.data);
+}
+export function pruneLocalThumbs() {
+  return api.post("/local/thumbs/prune").then((r) => r.data);
+}
+
 // ---- 登录态 ----
 export function listSessions() {
   return api.get("/sessions").then((r) => r.data);

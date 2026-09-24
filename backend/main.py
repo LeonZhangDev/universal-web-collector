@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from api.local import router as local_router
 from api.sessions import router as sessions_router
 from api.tasks import router
 from core.config import settings
@@ -100,6 +101,7 @@ app = install_exception_handlers(app)
 
 app.include_router(router)
 app.include_router(sessions_router)
+app.include_router(local_router)
 
 # 文件访问走 /files/{task_id}/... 路由(见 api/tasks.py serve_file),
 # 按任务下载目录做越权校验, 不再整体 mount downloads 目录

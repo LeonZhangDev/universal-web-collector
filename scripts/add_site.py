@@ -37,11 +37,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))     # 让 gate 可 import
 
 from collectors import COLLECTORS, resolve_collector  # noqa: E402
 from collectors.gallery_base import SequenceGallerySpider, check_site  # noqa: E402
 from core.filters import Filters  # noqa: E402
 from core.layout import claim, place  # noqa: E402
+from gate import NOTHING_CHECKED, Gate, problem as _p  # noqa: E402
 
 #: 预演用的相册名。闸 4 关心的是"相册名这一层有没有被保留", 用谁都一样, 但
 #: 这里刻意用一个**含中文与空格**的名字 —— 那正是 `clean_segment` 要处理的形态,
@@ -53,82 +55,16 @@ _ALBUM = "葡萄 一番街"
 # 闸的结论: **结构化**, 不是"一串给人看的文案"
 # --------------------------------------------------------------------------
 #
-# 两条规矩, 各治一种"绿/红是假的"的病:
+# `Gate` / `Problem` 的定义搬去了 `scripts/gate.py` —— 理由是它们**不是本脚本
+# 专用的**: `scripts/gateguard.py`(仓库级"声称 vs 实际")读的是同一份形状。
+# 与 `core/jsonstore.py` / `core/layout.py` 同一条道理: 判据形状只留一个定义。
+# 一旦有两份, 就会出现"这边认 `checked`、那边不认" —— 而这种不一致不会报错,
+# 只会让某一道闸悄悄变成永远绿。
 #
-# ① 每道闸必须报 `checked`(实际核了几项)。`checked == 0` **不许算绿**。
-#    治的是**假绿**里最常见的一种: 闸跑通了、印了一行 ok, 但它一项都没核 ——
-#    因为它要核的东西压根不存在(没有样本 / 拼不出 URL / 站点没注册)。
-#    "没验到" 与 "验过了没问题" 是两件事, 混在一行 ok 里就是撒谎。
-#
-# ② 问题带 `kind`(代号), 测试断言 `kind`, 不断言中文文案。
-#    治的是**假红**: 本项目真实踩过一条 —— 断言写 `"chrome" not in ip`, 而那句
-#    文案里提到 Chrome 是在说"**换指纹没用**"(IP 封禁只能换出口), 于是一条**正确**
-#    的文案把测试判红了。文案是给人看的: 会改措辞、会有反讽、会被翻译; 判据必须是代号。
-#    (同族: `core/errors.py` 用 `error_kind` 归类, 而不是 match 中文标签。)
-
-
-NOTHING_CHECKED = "nothing-checked"      # 闸跑了, 但一项都没核 -> 一律算红
-
-
-class Problem:
-    """一条问题: `kind` 给机器判, `message` 给人看。"""
-
-    __slots__ = ("kind", "message")
-
-    def __init__(self, kind, message):
-        self.kind = kind
-        self.message = message
-
-    def __str__(self):
-        return self.message
-
-    def __repr__(self):
-        return "Problem(%r, %r)" % (self.kind, self.message)
-
-
-class Gate:
-    """一道闸的结论。
-
-    `checked` 是**必填**且**必须是实际数目** —— 它是这整套门禁里唯一能防"空转绿"
-    的字段。写新闸时忘了填, 这闸就是永远绿的, 而没人看得出来。
-    """
-
-    __slots__ = ("title", "checked", "problems", "rows")
-
-    def __init__(self, title, checked=0, problems=(), rows=()):
-        self.title = title
-        self.checked = int(checked)
-        self.problems = list(problems)
-        self.rows = list(rows)
-
-    @property
-    def empty(self):
-        """空转: 一项都没核 —— 这不是"通过"。"""
-        return self.checked == 0
-
-    def effective_problems(self):
-        """对外的问题清单: **空转也算一条问题**。
-
-        放在这里(而不是散在各个 `section()` 分支里)的理由: 让"空转不许算绿"成为
-        `Gate` 自己的性质, 那么 `ok` / `verify()` / 测试三处读的是同一个判据 ——
-        不会出现"脚本记得拦、测试忘了拦"这种半拉子护栏。
-        """
-        if self.empty and not self.problems:
-            return [_p(NOTHING_CHECKED,
-                       "这道闸**一项都没核到**(要核的对象不存在)。"
-                       "「没验到」与「验过了没问题」是两件事 —— 前者不许算绿。")]
-        return list(self.problems)
-
-    @property
-    def ok(self):
-        return not self.effective_problems()
-
-    def kinds(self):
-        return {p.kind for p in self.effective_problems()}
-
-
-def _p(kind, message):
-    return Problem(kind, message)
+# 两条规矩(细节与来龙去脉见 `scripts/gate.py` 顶部):
+#   ① 每道闸必须报 `checked`(实际核了几项); `checked == 0` 不许算绿。
+#   ② 问题带 `kind`(代号), 测试断言 `kind`, 不断言中文文案。
+# `NOTHING_CHECKED` / `Gate` / `problem`(本文件里叫 `_p`)都从 `gate` 导入。
 
 
 # --------------------------------------------------------------------------
@@ -488,14 +424,18 @@ def verify(name, site, smoke=False, timeout=None, proxy=None):
     total = 0
 
     def section(gate):
-        """印一道闸。⚠️ 空转**不许印 ok** —— 判据在 `Gate.effective_problems()`。"""
+        """印一道闸。⚠️ 空转**不许印 ok** —— 判据在 `Gate.effective_problems()`。
+
+        行文案来自 `Gate.verdict()` **而不是这里拼字符串**: 这样"每道闸都必须报
+        核了几项"只在一处实现, 加减脚本都不会漏。
+        """
         nonlocal total
         print("-- %s" % gate.title)
         for row in gate.rows:
             print("     " + "  ".join(str(x) for x in row))
         problems = gate.effective_problems()
+        print("   " + gate.verdict())
         if not problems:
-            print("   核了 %d 项: ok" % gate.checked)
             return
         total += len(problems)
         for p in problems:

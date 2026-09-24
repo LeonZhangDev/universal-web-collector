@@ -16,7 +16,6 @@ from core.cancel import TaskCancelled
 from core.config import DEFAULT_ACCEPT, settings
 from core.errors import DiskFullError, GoneError
 from .ratelimit import (
-    describe,
     domain_slot,
     note_failure,
     note_rate_limited,

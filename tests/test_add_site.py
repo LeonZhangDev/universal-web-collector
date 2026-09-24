@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 import add_site  # noqa: E402
 from collectors.gallery_base import GallerySite  # noqa: E402
+from gate import NOTHING_CHECKED, Gate, Problem  # noqa: E402
 
 GID = "6aa5136f606fe"
 
@@ -77,15 +78,15 @@ def test_verdict_rides_on_kind_not_on_wording():
     ]
     verdicts = set()
     for w in wordings:
-        g = add_site.Gate("t", checked=1, problems=[add_site.Problem("ip-block", w)])
+        g = Gate("t", checked=1, problems=[Problem("ip-block", w)])
         verdicts.add((g.ok, tuple(sorted(g.kinds()))))
     assert len(verdicts) == 1, "文案一改判据就变 = 判据挂在文案上, 迟早假红: %r" % (verdicts,)
 
 
 def test_a_wording_only_change_does_not_flip_a_gate_to_green():
     """反方向也要管: 不能靠"文案里出现了'通过'两个字"把红变成绿。"""
-    g = add_site.Gate("t", checked=1,
-                      problems=[add_site.Problem("filtered-out", "已通过常规检查, 但…")])
+    g = Gate("t", checked=1,
+                      problems=[Problem("filtered-out", "已通过常规检查, 但…")])
     assert not g.ok
     assert g.kinds() == {"filtered-out"}
 
@@ -102,9 +103,9 @@ def test_checked_is_the_only_thing_that_stops_a_vacuous_green():
     空列表(它的每条检查都被 `if ... and samples:` 挡掉了), 于是闸 1 会印一行 ok,
     而它一项都没核 —— 一个还没写样本的新站点直接放行。
     """
-    g = add_site.Gate("闸 X", checked=0, problems=[])
+    g = Gate("闸 X", checked=0, problems=[])
     assert not g.ok, "空转被算成绿 —— 这就是那条假绿"
-    assert add_site.NOTHING_CHECKED in g.kinds()
+    assert NOTHING_CHECKED in g.kinds()
 
 
 def test_a_real_problem_is_not_masked_by_the_nothing_checked_marker():
@@ -113,8 +114,8 @@ def test_a_real_problem_is_not_masked_by_the_nothing_checked_marker():
     否则排查时看到的是"一项都没核到", 而真正的原因(比如 seq_format 渲染失败)被吞掉,
     等于用一个笼统的红替掉一条能直接照做的问题。
     """
-    g = add_site.Gate("闸 X", checked=0,
-                      problems=[add_site.Problem("seq-format-unrenderable", "渲染失败")])
+    g = Gate("闸 X", checked=0,
+                      problems=[Problem("seq-format-unrenderable", "渲染失败")])
     assert g.kinds() == {"seq-format-unrenderable"}
 
 
@@ -131,7 +132,11 @@ def test_every_gate_reports_how_many_things_it_actually_checked():
         add_site.gate_layout(_site()),
     ]
     for g in gates:
-        assert isinstance(g, add_site.Gate), g
+        assert isinstance(g, Gate), g
+        # ⚠️ 这一条是**防复发**的: `Gate` 一旦在 `add_site.py` 里被重新抄一份,
+        #    两边就会各自演化 —— 到时候"脚本认 `checked`、gateguard 不认"这种
+        #    不一致不会报错, 只会让某道闸悄悄变成永远绿。
+        assert add_site.Gate is Gate, "Gate 必须只有一份定义(scripts/gate.py)"
         assert isinstance(g.checked, int), g
         assert g.checked > 0, "有样本却报 0 项已核 = 这闸没在数"
 
@@ -163,7 +168,7 @@ def test_gate1_refuses_a_declaration_with_no_samples_at_all():
     """
     g = add_site.gate_declaration(_site(id_samples=[]))
     assert not g.ok
-    assert g.kinds() == {add_site.NOTHING_CHECKED}
+    assert g.kinds() == {NOTHING_CHECKED}
 
 
 # ==========================================================================
@@ -207,7 +212,7 @@ def test_gate2_says_so_when_there_is_nothing_to_verify():
     """没有 URL 样本时**不能说 ok** —— "没验到"与"验过了没问题"是两件事。"""
     g = add_site.gate_claim(_site(id_samples=[(GID, GID)]), "demo")   # 只有纯 ID 形态
     assert not g.ok
-    assert g.kinds() == {add_site.NOTHING_CHECKED}
+    assert g.kinds() == {NOTHING_CHECKED}
 
 
 # ==========================================================================
@@ -238,7 +243,7 @@ def test_gate3_says_so_when_no_url_can_be_built():
         _site(id_samples=[("https://cdn.example.com/photos/%s/00001.jpg" % GID, "")]))
     assert not g.ok
     assert g.rows == []
-    assert g.kinds() == {add_site.NOTHING_CHECKED}
+    assert g.kinds() == {NOTHING_CHECKED}
 
 
 # ==========================================================================

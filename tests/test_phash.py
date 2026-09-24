@@ -110,7 +110,7 @@ def test_dhash_of_missing_file_is_none():
 # ---- 解码层: 现场生成真图, 探测不到 ffmpeg 就跳过 ----
 
 pytestmark_ffmpeg = pytest.mark.skipif(
-    not FFMPEG, reason="未探测到 ffmpeg, 跳过真实解码用例"
+    not FFMPEG, reason="[deps:ffmpeg] 未探测到 ffmpeg, 跳过真实解码用例"
 )
 
 

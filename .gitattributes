@@ -1,0 +1,30 @@
+# 行尾的**唯一来源**。
+#
+# scripts/gateguard.py 直接读这份文件, 不另写一份规则 —— 否则会出现"git 认为是 LF、
+# 门禁认为是 CRLF"这种半通状态, 而那正是本项目反复踩的"同一个东西两个定义"。
+#
+# 为什么需要它: 本机是 Windows, `Path.write_text()` 默认把每个 `\n` 翻成 `\r\n`,
+# 一次"读-改-写"往返就把整份文件换掉 —— 70 行的改动会膨胀成 400 行(而且 `git add`
+# 之后会被静默归一, 于是**看不见了**, 而不是不存在)。以前靠"提交前记得自查",
+# 现在由 git 改写 + 门禁复查两道。
+#
+# ⚠️ 这里已经做过一次**一次性归一**: 之前有 5 个文件整份是 CRLF
+#    (backend/downloaders/{file,text,video}.py、scripts/verify_output.py、
+#    tests/test_robustness.py)。归一后规则统一, 所以下面的清单里**没有**行尾豁免项 ——
+#    一条一开始就需要豁免的门禁, 迟早会被加到失效。
+* text=auto eol=lf
+
+# 二进制 / 不该被 git 改写行尾的
+*.key      -text
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.webp     binary
+*.ico      binary
+*.mp4      binary
+*.m4s      binary
+*.mp3      binary
+*.zip      binary
+*.db       binary
+*.sqlite3  binary

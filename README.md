@@ -1048,10 +1048,103 @@ HLS/DASH 的分片缓存原来只躺在**目标路径旁边**(`.<stem>.parts/`)�
 用户唯一的感知是"这几秒怎么跳过去了" —— 所以最后一行日志会写清"成功 N 片 / 其中 M 片
 没取到"。初始化段只下一份(排在它所属时段的分片前面), 中途换 init 会记一行日志。
 
+## 本地相册集: 把自己电脑上的目录当相册集(V40)
+
+采集侧解决的是"网上有什么、怎么搬下来"; 但用户手上早就有一堆**已经在本地**的照片
+(手机导出、旧收藏、别的工具存下来的)。它们散在若干目录里, 想看只能开文件管理器一张张翻。
+
+「本地相册集」把**用户显式登记过的目录**当成相册集: 登记之后就有相册网格、相册内的照片
+列表、以及一个**跨相册的随机池** —— 最后这项是图集站给不了的, 随机抽的是自己忘了的照片。
+
+```bash
+GET    /local/roots                  # 已登记的目录 + 统计
+POST   /local/roots   {path,name}     # 登记(只登记, **不扫描**)
+PATCH  /local/roots/{id} {name}       # 只改显示名
+POST   /local/roots/{id}/scan         # 强制重扫(绕开索引缓存)
+DELETE /local/roots/{id}              # 取消登记(**磁盘上的文件一个都不动**)
+GET    /local/albums                  # 相册列表(带封面/张数/体积/索引时刻)
+GET    /local/photos?root_id=&rel=     # 一个相册里的照片(**实时**列目录, 分页)
+GET    /local/random?count=&seed=&page=&mode=&min_bytes=&favorites_only=
+GET    /local/photo?root_id=&rel=      # 原图
+GET    /local/thumb?root_id=&rel=&size= # 缩略图(生成不了就**回退原图**)
+GET    /local/favorites                # 收藏(失效的单独列出来, 带原因代号)
+POST   /local/favorite                 # 收藏 / 取消
+POST   /local/favorite/forget          # 删掉一条**失效**的收藏
+GET    /local/stats                    # 合计 + 缩略图缓存占用
+POST   /local/thumbs/prune             # 清掉"现在看不见的照片"的缩略图
+```
+
+### 口径
+
+| 问题 | 答案 |
+| --- | --- |
+| 相册是什么 | **直接装着照片的目录**。`2024/旅行/` 里直接放的照片属于相册 `2024/旅行`, 不会被算进 `2024` |
+| 根目录下直接放的照片 | 也算一个相册(`rel=""`), 名字用**登记名** |
+| 看几层 | `UWC_LOCAL_ALBUM_DEPTH`(默认 3) |
+| 跳过什么 | 隐藏目录、`_meta/`(我们自己的清单与缩略图)、`node_modules` / `@eaDir` / `$RECYCLE.BIN` 等、`Thumbs.db` / `Desktop.ini` |
+| 认哪些扩展名 | **浏览器能直接渲染的**: jpg/jpeg/jfif/png/gif/webp/avif/bmp。刻意**不收** heic/cr2/nef —— 收进来就是一片打不开的破图, 而"格式不支持"和"文件坏了"在网格里长得一样 |
+| 顺序 | 自然序: `2.jpg` 排在 `10.jpg` 前面(纯字符串排序会让图集看起来是乱的) |
+| 重复的照片 | **都留着**。本地相册不去重 —— 那是下载侧 sha256/dHash 的事, 在这里删用户的东西不可逆 |
+| 随机池 | 读**索引快照**, 返回里带 `at`(几点核的)与 `pool`(池里多少张)。界面必须显示, 否则"怎么没抽到我刚放的那张"无从解释 |
+| 打开相册 | **实时列目录**。所以看得见的一定打得开; 而且这一步会**就地修正**索引里那一条, 于是"刚删掉的照片还出现在随机池里"不会发生 |
+| 种子 / 翻页 | 同一 `seed` + 递增 `page` = **一副可以一直往下翻的牌**: 各页之间不重叠、也不缺项。「换一批」换 seed(重洗), 「更多」加 page(翻下一页) |
+| 取向 | `mode=album`(默认)**按轮发牌**: 每轮从每个相册各取一张, 3 张的小相册不会被 3000 张的大相册淹掉; `mode=photo` 是整池洗牌, 按张数占优 |
+| 张数上限 | 单个根 `UWC_LOCAL_ALBUM_MAX_PHOTOS`(默认 5 万)。超了**会说**"只登记了前一部分" —— 静默截断会让用户以为照片丢了 |
+| 收藏记在哪 | 按**绝对路径**(不是 `根+相对路径`)。代价说清楚: 用户把文件改名/移走之后收藏就断了 —— 反过来在目录整体挪位置时断得更彻底 |
+| 索引保质期 | `UWC_LOCAL_ALBUM_TTL`(默认 30s)。它只影响随机池, 不影响"打开相册" |
+
+### 只读边界
+
+用户登记的是**他自己的目录**。所以这个模块:
+
+1. **绝不写、改、删根内的任何文件。** 唯一落盘的是缩略图缓存, 而它在**本程序自己的
+   数据目录**里(`<库文件同级>/local_albums/_meta/thumb/`)。
+   判据有两层: 运行时比对跑完一圈之后根的**逐文件 size+mtime_ns 指纹**; 以及一条
+   **结构化**判据 —— `tests/test_local_albums.py::test_the_module_contains_no_write_calls`
+   直接扫源码里有没有任何"写磁盘"的调用(`write_text` / `unlink` / `mkdir` / `open(…,"w")` …)。
+   只读是**不可逆**的那类风险, 不该等到某次运行时断言才发现。
+2. **取消登记 ≠ 删目录。** `DELETE /local/roots/{id}` 只删那条登记记录, 界面上也这么写
+   (按钮的二次确认里明说"文件一个都不会动")。收藏记录也保留 —— 重新登记那个目录它们就回来。
+3. **收藏也只写我们自己的库。** 不往用户的相册目录里塞 `.favorite` 之类的标记文件:
+   那会污染目录, 而且用户一旦把它当垃圾清掉, 数据就没了。
+
+### 越界与状态码
+
+出图接口只收 `(root_id, rel)` —— **没有任何接口接受一个裸的绝对路径**。收绝对路径的接口
+就是给"任意文件读取"开门, 而剩下的挡板只有一句"请传合法路径", 那句话不在代码里。
+(这条也有结构化判据: 直接扫 `api/local.py` 的函数签名里有没有 `path` / `file` 之类的参数。)
+
+| 情况 | 状态码 | `kind` |
+| --- | --- | --- |
+| `../` 出根 / 绝对路径指向根外 / 指向根外的软链接 | 403 | `escapes-root` |
+| 文件不存在 | 404 | `not-found` |
+| 不是图片(`notes.txt`) | 415 | `not-image` |
+| 想登记的目录不存在 | 404 | `not-found` |
+| 那不是目录(是个文件) | 400 | `not-a-dir` |
+| 与本程序的缩略图缓存重叠 | 400 | `inside-cache` |
+| 已经登记过同一个目录 | 409 | `duplicate` |
+| 没有这个 id | 404 | `unknown-root` |
+
+判据是"`resolve()` 之后在不在根内", 不是"字符串里有没有 `..`" —— 后者会拒掉
+`旅行/../旅行/a.jpg` 这种完全合法的路径, 而那种"为了安全把人挡在门外"的错误最难被发现
+(用户只会觉得"有时打不开")。`not-image` 回 415 而不是 404: 让"调用方传错了"和"文件真的
+没了"在日志里长得不一样。
+
+⚠️ 上限/降级必须**有痕**: 读不到的子树(`unreadable`)、被截断的张数(`truncated`)、
+扫不到的根(`error`)、索引快照时刻(`last_scan`)都随接口返回并显示在界面上。
+"没验到"与"验过了没问题"是两件事 —— `last_scan` 为 NULL 时界面显示"未扫描", 而不是 0 张。
+
+### 这一版**还没做**的
+
+* 视频: 只登记图片, 相册网格里不出现 `.mp4`(要先想清楚"这一页要不要真的 play")。
+* 本地照片的重复检测: `core/phash.py` 是现成的, 但本地相册的指纹要另一张表, 且
+  "只标记不删"的语义在这里(用户的既有文件)更需要先说清楚。
+* 按拍摄时间分类 / "往年今日"记忆视图: 需要 EXIF, 而 EXIF 读取器是新的依赖。
+
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (1146 用例, 本机 Windows 收集数; CI/Linux 收集 1147 —— POSIX 上 test_posix_signal_cleans_owned_child_descriptor_and_lock 多一个 SIGHUP 参数, 跳过项也随之互换。含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针与它的产出守卫 / 加站门禁 / 漂移分档 / 双传输与它的源码门禁)
+make test           # pytest (1290 用例, 本机 Windows 收集数; CI/Linux 收集 1291 —— POSIX 上 test_posix_signal_cleans_owned_child_descriptor_and_lock 多一个 SIGHUP 参数, 跳过项也随之互换。含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针与它的产出守卫 / 加站门禁 / 漂移分档 / 双传输与它的源码门禁 / 跳过项策略 / 仓库门禁与假绿 / 本地相册集)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
@@ -1064,16 +1157,67 @@ python scripts/add_site.py --all                     # 全部站点一次跑
 python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照(纯离线)
 python scripts/drift_check.py     # 站点特征漂移巡检(需联网, 不进 CI)
 python scripts/probe_feed.py <列表页URL>   # 第二类站点(API/分页)探针, 只出报告
+python scripts/gateguard.py       # 仓库门禁: 文档数字/CI 契约/结构规则/行尾(纯离线)
 ```
 
 配置: `config.yaml`, 环境变量 `UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` /
 `UWC_BROWSER_STATE_DIR` / `UWC_PROXY` / `UWC_CDN_PROFILE` / `UWC_FFMPEG` /
 `UWC_LIVE_MAX_SECONDS`(DASH 直播录制上限) /
+`UWC_LOCAL_ALBUM_DEPTH` / `UWC_LOCAL_ALBUM_TTL` / `UWC_LOCAL_ALBUM_MAX_PHOTOS`(本地相册集的
+扫描层数 / 索引保质期 / 单个目录的张数上限) /
 `PEXELS_API_KEY`(仅 Pexels 关键词/集合采集需要) 优先。
 站点解析探针: `uv run python scripts/probe.py <url>`(**浏览器**探针, 跑四种解析器看
 通用采集器能发现什么); 接入新站点用 `scripts/probe_site.py`(纯 HTTP, 见上)。
 感知去重依赖 ffmpeg(与视频 remux 共用同一套探测, 见 `core/ffmpeg.py`) ——
 探测不到时自动降级为"不算指纹", 不影响任何下载。
+
+### CI 契约: 什么在 CI 跑, 什么只在本地跑
+
+**R-CI-1 没有第三态**: 仓库里每个脚本, 要么在 `.github/workflows/ci.yml` 的调用链里,
+要么在下面这张表里写明"只在本地跑 **+ 为什么**"。两者的一致性由 `scripts/gateguard.py`
+逐条核对(它同时读 ci.yml 的 `run:` 步骤与这张表), 所以"加了个守卫却忘了接 CI"会当场红,
+而不是等到某天有人问"这个脚本到底跑没跑过"。
+
+| 命令 | 在 CI 跑 | 不在 CI 的理由 |
+| --- | --- | --- |
+| `uv run pytest -q` | ✅ | — |
+| `python scripts/gateguard.py` | ✅ | — |
+| `python scripts/selfcheck.py` | ✅ | — |
+| `python scripts/add_site.py --all` | ✅ | — |
+| `python scripts/verify_output.py` | ✅ | — |
+| `npm run build` / `npm run test:task-query`(`frontend/scripts/test-task-query.mjs`) | ✅ | — |
+| `python scripts/verify_hls.py` | ❌ | 要起本地 HLS 服务并真解码, 单次好几分钟 —— 归到"发布前手动跑"。**这是"暂时不做", 不是"不该做"**: 它验的是真解码, 正是 CI 里最缺的那类判据 |
+| `python scripts/drift_check.py` | ❌ | 必须联网打**真实站点**。放进 CI 等于让别人的站点决定我们的红绿, 而且它会随站点改版天天红 |
+| `python scripts/probe_site.py` | ❌ | 人肉探针: 要真实站点 + 由人来判断结论, 不是判据 |
+| `python scripts/probe_feed.py` | ❌ | 同上(第二类站点探针, 只出报告) |
+| `python scripts/probe.py` | ❌ | 浏览器探针, 要 Playwright 真跑 + 真实站点 |
+| `python scripts/preview_probe.py` | ❌ | 同上, 真实站点创建前预告 |
+| `python scripts/start.py` | ❌ | 启动器, 不是判据 |
+| `python scripts/gate.py` | ❌ | 共享模块(`Gate` / `Problem` 的唯一定义), 不是可执行脚本; 由上面两个门禁引用 |
+
+**R-CI-2 数字必须可核对**: README 是**唯一**的"当前口径"落点(历史版本数字留在
+`docs/AGENT_DEVELOPMENT_GUIDE.md` 的版本史里, 那些**不参与核对** —— 它们本来就是"当时是多少",
+拿今天的实测去比是另一种假红)。`make test` 那一行的用例数必须等于本机
+`pytest --collect-only -q` 的收集总数; 每个声明了 `EXPECTED_CHECKS` 的脚本, 它的数必须与
+上面命令清单里那一行一致(所以 `verify_output.py` 少跑一项断言会当场红, 而不是印一行
+"全部 39 项通过")。
+
+**R-CI-3 平台门控之外不许跳过**: 每条跳过都必须带机器标签(`[platform:…]` / `[deps:…]` /
+`[env:…]`), 且 `[deps:*]` / `[env:*]` 在 CI 里**一律不许出现** —— 要么在 ci.yml 里把依赖
+装上, 要么这个 job 就得承认自己是 partial。判据在 `tests/conftest.py` 的 `_skip_problems`,
+以及 `tests/test_skip_policy.py` 里那条**静态扫**(运行时钩子看不见"在别的平台上才会跳"
+的用例, 静态扫才管得住新加的那条)。
+
+⚠️ `[platform:X]` 里的 X 是**这条用例需要哪个平台**, 不是"我现在在哪个平台"。所以判据是
+`X != 当前平台` 才算合理跳过; `X == 当前平台` 却仍在跳 = 门控条件写反了。
+**这个方向只能有一个** —— 仓库里同时有"只在 POSIX 跑"和"只在 Windows 跑"的用例, 反过来
+判("标签必须等于当前平台")的写法在两边的任何一边都必然有一批被判红, 也就是说那条规则
+**永远不可能两边都绿**。这不是配置问题, 是判据方向错了; 证明写成了用例:
+`test_skip_policy.py::test_the_platform_tag_is_satisfiable_on_both_platforms`。
+
+> 三条规则治的是同一类错误: **绿灯覆盖的范围比你以为的小**。
+> 最贵的那 7 条判据曾经整类只在跳(CI 没装 ffmpeg)而 job 是绿的; 三个离线守卫曾经谁也没跑;
+> README 的用例数曾经和实测差一个。它们一个都不报错, 只是结论是错的。
 
 ### 任务通知(可选)
 

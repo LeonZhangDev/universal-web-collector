@@ -1086,5 +1086,186 @@ if checked == 0:
   绿/红不了"。
 
 
+## V39 六（2026-09-24）：CI 绿 ≠ 本地绿 —— 三处"没人跑"的假绿
+
+**前言**：把"假绿/假红"按判据修完、CI 也全绿之后，顺手核了一次 CI 的汇总行 ——
+`1139 passed, 8 skipped`，本机是 `1140 / 6`。差额查清了（平台参数化 +1、跳过项互换），
+但**对账过程中发现的东西比差额本身重要**：CI 的"绿"所覆盖的用例集合**比本地少一截**，
+而少掉的那一截恰好是最贵、最像"真验证"的那些。
+
+### 第 21 条 ⚠️ CI 里那 7 条"真解码"用例从来只跳不跑
+
+从 CI 日志的进度字符**逐位还原**（`-q` 的进度是逐位的，`s` 的下标即用例序号），
+CI 跳过的 8 条是：
+
+| 条数 | 用例 | 门控 |
+| --- | --- | --- |
+| 3 | `test_features_v36.py` 的 DASH 字节区间 / 多时段 / 多时段拒收 e2e | `@_needs_ffmpeg` |
+| 4 | `test_phash.py` 的重压缩判定 / 动图首帧 / 重复标记 / 不误标 | 模块级 `FFMPEG = find_ffmpeg()` |
+| 1 | `test_native_runtime.py::test_second_windows_launcher_waits_for_locked_runtime` | Windows-only |
+
+`core/ffmpeg.py::find_ffmpeg()` 在 `ubuntu-latest` 上探不到（PATH 与四个已知目录都没有），
+于是 **CI 从不验证"产物内容是不是好的"** —— dHash 去重、DASH 字节区间的真解码全只在本地跑。
+"CI 全绿" 的真实含义是："本地那套里，**去掉 7 条最贵的之后**全绿"。
+
+⚠️ 这条值得记的不是结论，而是**发现方式**：它不报错、不变慢、不影响任何数字，
+**只有对账才能看出来**（把两边的收集数/跳过项一一列出，"哪类判据只在一边存在"一眼可见）。
+
+### 第 22 条 ⚠️ 存在、但不在任何调用链里的测试 = 不存在
+
+`frontend/package.json` 里有 `test:task-query`（`node scripts/test-task-query.mjs`），
+而 CI 的 `frontend` job 只有 `npm install` + `npm run build` —— **这条测试从落地起
+从未在 CI 执行过**。同族：仓库没有 `.gitattributes` ⇒ 行尾只能靠人每轮自查
+（`Path.write_text` 在 Windows 上把整份文件翻成 CRLF，本项目已栽过好几次）。
+
+判据：**"一个测试/守卫若不在 CI 的调用链里，它等价于不存在。"**
+
+### 第 23 条 ⚠️ 三个"仓库级不变量"脚本只在本地跑
+
+| 脚本 | 守的是什么 | 能否进 CI |
+| --- | --- | --- |
+| `scripts/selfcheck.py` | 站点声明自洽（`check_site`）+ CDN 画像 | 离线，可 |
+| `scripts/add_site.py --all` | 认领 / 过滤 / 落盘预演（四闸） | 离线，可 |
+| `scripts/verify_output.py` | 端到端产物 / 清单 / 打包（40 项） | 离线，可（需 ffmpeg 则同上装） |
+| `scripts/verify_hls.py` | 真 HLS 双引擎（18 项） | 要 ffmpeg + 网络，不进 |
+
+前三个都**离线**，符合进 CI 的条件；它们守的恰恰是"整条流水线接起来还对不对"这类
+只能靠"跑一遍"才能发现的错。
+
+### 修法清单（文件级）
+
+1. `.github/workflows/ci.yml`：backend 装 ffmpeg（`apt-get install -y ffmpeg`）并跑
+   `selfcheck.py` / `add_site.py --all` / `verify_output.py`；frontend 改 `npm ci`
+   （走锁文件）+ node 22（本地是 22，且 node20 已被 GitHub 标 deprecated）+
+   跑 `npm run test:task-query`。
+2. `.gitattributes`（新增）：`* text=auto eol=lf`，并对两个**已知 CRLF** 文件
+   （`backend/downloaders/video.py`、`scripts/verify_output.py`）写 `-text`
+   —— 把行尾从"每轮人工检查"变成"Git 保证"。
+3. `scripts/gateguard.py`（新增）**文档声称门禁**：README / docs 里的用例数、
+   "N 项断言"必须与实测一致（本轮刚发生过"文档写 1146、CI 报 1147"）；顺带查
+   未用 import / 死声明 / 代码围栏配平，并把 `with session.get(...)` 的 AST 门禁
+   从单测扩到全仓。
+   ⚠️ 别用 ruff 顶这一条：项目没有 lint 配置，**一条一开始就需要大量豁免的门禁
+   迟早会被加到失效**（第 18 条）。
+4. `docs/AGENT_DEVELOPMENT_GUIDE.md` 增 §21「CI 契约：哪些东西必须由机器守」；
+   `README.md` 的"测试/部署"节补一张"在 CI 跑 / 只在本地跑（为什么）"对照表。
+
+**总判据**：CI 绿的含义只能是"**这套判据都在 CI 里跑过一遍**"。
+只要存在"某类判据只在一边跑"，绿就是一种**口径**，不是结论。
+
+
+## V40（2026-09-24）：门禁真的落地了 + 本地相册集；抓出第 24/25 条
+
+**前情**：V39 六 列的是"修法清单"（**打算**这么改）。这一轮把它**改完了**
+（`scripts/gate.py` / `scripts/gateguard.py` / `.gitattributes` / ci.yml / README 的
+「CI 契约」表），并新增了「本地相册集」：**把任意本地目录登记成相册集**，像 xchina 那样
+浏览，但首页看的是**随机池**里的照片。
+
+门禁一上线就抓出两条**新的**静默错 —— 都属于"看起来已经修好了"的那一类。
+
+### 第 24 条 ⚠️ 标签的语义只能有**一个方向**，写反了单测抓不到（F 类现场）
+
+`[platform:X]` 的判据原来写成"**标签必须等于当前平台**，否则算问题"。
+**单测照着这个实现写，全绿** —— 因为用例里的"当前平台"和"标签"是同一份常量，怎么翻都自洽。
+
+**它红在端到端全量**：本机是 Windows，仓库里有 6 条 `[platform:posix]` 的用例合法跳过，
+在错的判据下**全部被判红**。
+
+方向只有一个：`X` 是**这条用例需要哪个平台**，所以合法的跳过是 `X != 当前平台`；
+`X == 当前平台` 却仍在跳，才是"门控条件写反了"。反过来的写法**永远不可能两边都绿** ——
+仓库里同时有 POSIX-only 与 Windows-only 的用例，任何一边都会有一批判红。证明写成了用例：
+`test_skip_policy.py::test_the_platform_tag_is_satisfiable_on_both_platforms`。
+
+⚠️ 这是 **F 类**（"通过但理由已经不对"）的典型现场：**实现与测试一起错**，
+单测越忠实越看不见。抓住它的是**另一条完全不同的路径**（全量真跑一遍）。
+推论：**判据方向类**的错，必须至少有一个**不是照实现写的**观测面（端到端 / 真实平台 / 对账）。
+
+### 第 25 条 ⚠️ 别拿**墙钟**当判据
+
+`test_features_v32.py::test_proxy_breaker_cooldown_expires` 原来用
+`cooldown=0.01` + `time.sleep(0.05)` 再断言"已到期"。`note_failure()` 还会落一次 JSON
+（`core/jsonstore.py` 的四条并发纪律之一），负载高时这一步就超过 10ms → 断言看到的是
+**还没到期**的状态 → 报 `assert 'http://a:1' == 'http://b:2'`：一条**正确**的实现被判红。
+
+修法：把时刻**显式推**给实现（`cooldown=60` + `pool._is_blocked(url, now=time.time() + 61)`），
+不再 sleep。判据：**断言里出现 `sleep`，先问它能不能换成"显式传时刻"**。
+
+### 只读边界必须是**结构性**的，不能是"我小心了"
+
+本地相册集的核心承诺是"**只读**：扫描 / 浏览**一个字节都不动**用户的文件"。
+这类承诺最容易在后续维护里悄悄破掉，所以做了两层机器判据：
+
+* **静态**：AST 扫 `core/localalbums.py` / `api/local.py` 有没有写调用（`_FORBIDDEN_WRITES`）。
+  ⚠️ `Path.replace` **刻意不在黑名单**：它是路径归一操作，而且 AST 分不出接收者是不是
+  `Path` —— 放进去会把**正常代码**判红（假红）。
+* **运行时**：扫描前后对整棵树逐文件比 **`size` + `mtime_ns`** 指纹（而不是"我扫完没报错"）。
+* 缩略图落在**库同级**的 `local_albums/_meta/thumb/`，并用 `resolve()` **词法归一**拦
+  "把缓存目录本身登记成根"（不能靠"缓存目录已存在"来判断）。
+
+同族的一条：**出图接口只收 `(root_id, rel)`，从不收裸绝对路径**；越界的判据是
+"`resolve()` 之后在不在根内"，**不是**"字符串里有没有 `..`"。用例里加了 AST 扫
+`FunctionDef` 签名、禁止出现 `path` / `file` 参数 —— 把"以后别加回来"变成机器规则。
+（`not-image` 回 **415** 而不是 404：让"调用方传错了"与"文件真的没了"在日志里长得不一样。）
+
+### 本地相册集的三条口径
+
+1. **两套口径**：打开相册**实时列目录**（刚丢进去的照片立刻可见），随机池用**索引快照**
+   （带回 `at` / `pool`）。不同步的地方靠 `_patch_album` 就地修正 —— 于是"刚删掉的照片"
+   不会还留在随机池里。
+2. **`seed` + 递增 `page` = 一副能一直往下翻的牌**：换一批 = 换 `seed`（重洗），
+   更多 = 加 `page`（翻页）。各页**不重叠、不缺项**（有判据钉住）。
+3. **按轮发牌**：`mode="album"` 每轮从每个相册各取一张（小相册不会被大相册淹掉）；
+   `mode="photo"` 整池洗牌。
+
+### ⚠️ 就地改缓存里的 dict = 把一次查询的状态**永久**写进缓存
+
+`photos()` 返回的就是 `index["order"]` 里的**同一批对象**。早先的 `_with_favorite`
+直接给它们加 `favorite=True` → **取消收藏之后界面还是老样子**（缓存里那个 key 还在）。
+不报错，只是结果错。
+
+修法：`_with_favorite` **返回副本**；并加一条用例专门钉住"标记不污染索引缓存"。
+同族：`_list_album` 忘了把 `root_id` 写进每一条 → 星标**永远不亮**（也是不报错）。
+
+### 环境类：npm 把 Windows 原生二进制装成**空目录**
+
+`npm install` 之后 `npm run build` 报
+`Cannot find module '@rollup/rollup-win32-x64-msvc'`，而
+`node_modules/@rollup/rollup-win32-x64-msvc/` **存在但是空的** —— 它装的是
+`rollup-win32-x64-gnu`（另一个候选），给 msvc 留了个空壳。
+
+修法（**只动本机，不碰仓库**）：
+
+```bash
+rm -rf node_modules/@rollup/rollup-win32-x64-msvc
+npm install @rollup/rollup-win32-x64-msvc@<与 rollup 同版本> \
+    --no-save --package-lock=false --registry=https://registry.npmmirror.com
+```
+
+判据：**"包目录存在"不等于"包装好了"** —— 目录要非空、`package.json` 要能读出来。
+同族的坑：`@esbuild/win32-x64` 也要一起看一眼（它没坏，只是同一类）。
+
+### 环境类：`verify_output.py` 在"有上次残留"时会**在第 1 行就被拦**
+
+症状与第 613 行那条**不一样**，所以单看"有没有汇总行"会误判：
+
+| 症状 | 原因 |
+| --- | --- |
+| 进度行里有 `F`、**没有汇总行** | 守卫在**清理阶段**（结尾清 `tmp_path`）动手 |
+| 输出**只有一行** `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]…`、`exit 1` | 守卫在**第 1 行**（`verify_output.py:162` 的 `shutil.rmtree(data/_verify_output)`）就动手，**40 项断言一项都没跑** |
+
+第二种最容易被读成"验证失败了"。它其实**什么都不等于** —— 脚本压根没开始。
+修法（只动本机）：
+
+```bash
+mv data/_verify_output /tmp/uwc_stale_vo      # 移动不是批量删除, 不触发守卫
+python scripts/verify_output.py               # 这次会 40/40
+```
+
+⚠️ 别把这条当成"脚本有 bug"去改产品：守卫是**宿主/环境**的行为，仓库里的
+`rmtree(ignore_errors=True)` 本身是对的（CI 每次都是干净工作区，遇不到）。
+
+
+
+
 
 

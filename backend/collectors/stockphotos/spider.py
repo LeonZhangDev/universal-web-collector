@@ -39,7 +39,7 @@ import re
 from urllib.parse import parse_qs, unquote, urlparse
 
 from core.config import IMAGE_ACCEPT
-from collectors.scores import SCORE_AGGREGATE_PAGE, SCORE_ALBUM_PAGE, SCORE_BARE_ID
+from collectors.scores import SCORE_AGGREGATE_PAGE, SCORE_ALBUM_PAGE
 
 from .. import register
 from ..gallery_base import _match_score, probe, _session

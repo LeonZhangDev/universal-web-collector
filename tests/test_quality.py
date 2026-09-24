@@ -1,7 +1,6 @@
 from collectors.parsers import (
     base_identity,
     classify,
-    image_score,
     is_thumbnail,
     merge_by_priority,
     select_quality,

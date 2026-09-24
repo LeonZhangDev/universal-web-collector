@@ -16,7 +16,7 @@ from downloaders.base import ProxyPool
 from collectors.gallery_base import check_site, parse_gid, selfcheck_all
 from collectors.stockphotos.pexels import PEXELS
 from collectors.stockphotos.spider import PexelsSpider
-from collectors import COLLECTORS, match_collectors, resolve_collector
+from collectors import COLLECTORS, resolve_collector
 
 
 @pytest.fixture()
@@ -78,12 +78,22 @@ def test_proxy_breaker_success_resets_counter():
 
 
 def test_proxy_breaker_cooldown_expires():
-    """冷却到点后应自动半开放出, 不需要任何后台线程。"""
-    pool = ProxyPool("http://a:1,http://b:2", fail_threshold=1, cooldown=0.01)
+    """冷却到点后应自动半开放出, 不需要任何后台线程。
+
+    ⚠️ 这条原来写的是 `cooldown=0.01` + `sleep(0.05)`, 看着很保险, 实际是拿
+    **墙钟的抖动**当判据: `note_failure()` 在写完内存状态之后还会落一次代理健康
+    JSON(见 core/proxy_health.py), 而它一旦超过 10ms, 后面的"熔断中"断言看到的
+    就是已经到期的状态。本机全量跑时正是这样红了一次 —— 判据挂在"此刻几点"上,
+    负载一高就翻, 而且报出来的是 `'http://a:1' == 'http://b:2'`, 完全看不出是竞态。
+    所以改成**显式注入时刻**: 冷却给足, 到期由 `_is_blocked(now=…)` 推进。
+    """
+    import time
+
+    pool = ProxyPool("http://a:1,http://b:2", fail_threshold=1, cooldown=60)
     pool.note_failure("http://a:1")
     assert pool.pick(0) == "http://b:2"      # 熔断中
-    import time as _t
-    _t.sleep(0.05)
+    # 把"现在"推到冷却到期之后(而不是真的等): 半开放出走的是同一条分支。
+    assert pool._is_blocked("http://a:1", now=time.time() + 61) is False
     assert pool.pick(0) == "http://a:1"      # 冷却结束, 放出来再试
 
 

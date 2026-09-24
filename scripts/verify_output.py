@@ -76,6 +76,14 @@ MP4 = base64.b64decode(
 )
 PAGES = 3
 
+#: 断言总数 —— 与 README 的「`verify_output.py` … (40 项断言)」是同一个数,
+#: `scripts/gateguard.py` 会拿两边对账。
+#:
+#: 为什么要有这个常量: 这个脚本的失败方式是"**少核了几项**"。有人删掉一段用例,
+#: 脚本照样印「✓ 全部 39 项断言通过」—— 少了的那一项**不会说话**。声明一个数,
+#: 少一项就当场红。这是本项目记过的那类假绿("空转"的近亲: 不是没核, 是少核)。
+EXPECTED_CHECKS = 40
+
 FAILURES = []
 CHECKS = [0]
 
@@ -367,6 +375,13 @@ def main():
         print(f"✗ {len(FAILURES)}/{total} 项未通过:")
         for f in FAILURES:
             print(f"   - {f}")
+        return 1
+    if total != EXPECTED_CHECKS:
+        # 比失败更坏的一种绿: 它一项没少地"通过"了, 只是**比声明的少核了几项**。
+        print(f"✗ 只跑了 {total} 项断言, 声明的是 {EXPECTED_CHECKS} 项"
+              f"(差 {total - EXPECTED_CHECKS:+d})。"
+              f"\n   要么有判据被删了, 要么新加了一项 —— 两种都得同步 README 与"
+              f"\n   `EXPECTED_CHECKS`(它是「40 项断言」那句话的唯一来源)。")
         return 1
     print(f"✓ 全部 {total} 项断言通过")
     print(f"  媒体目录: {out_root}")

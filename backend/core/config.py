@@ -135,6 +135,17 @@ class Config:
     name_template: str = "{name}"
     # 每个任务跑完是否在输出目录写 manifest.json(溯源清单)
     write_manifest: bool = True
+    # ---- 本地相册集(core/localalbums.py)----
+    # 把**用户自己的目录**当相册集浏览。这三项都是"扫描有多深/多勤"的旋钮:
+    #   depth  根目录往下最多看几层(0 = 只看根目录本身)。相册 = "直接装着照片的
+    #          目录", 所以层数决定了"我的 2024/旅行/ 算不算一个相册"。
+    #   ttl    随机池索引快照的保质期(秒)。⚠️ 只影响随机池; 打开某个相册时
+    #          永远是**实时列目录**, 所以不存在"看到已经不存在的照片"。
+    #   max_photos 单个根最多登记多少张, 超了就截断并在界面**明说截断**
+    #          (静默截断会让用户以为丢照片了, 这里宁可报出来)。
+    local_album_depth: int = 3
+    local_album_ttl: float = 30.0
+    local_album_max_photos: int = 50000
     # 订阅巡检: 调度线程检查到期订阅源的间隔(秒)
     watch_interval: int = 60
     extra: dict = field(default_factory=dict)
@@ -248,6 +259,20 @@ def load(path: Path = None) -> Config:
     if os.environ.get("UWC_PARTIAL_STAGING") is not None:
         cfg.partial_staging = os.environ["UWC_PARTIAL_STAGING"].strip().lower() \
             not in ("", "0", "off", "no", "false", "none", "disable", "disabled")
+    # 本地相册集的扫描范围。与上面几条同一个原则: **写错就沿用默认值**,
+    # 一条可选优化项不该有能力让服务起不来。
+    for env_name, field_name, cast in (
+        ("UWC_LOCAL_ALBUM_DEPTH", "local_album_depth", int),
+        ("UWC_LOCAL_ALBUM_TTL", "local_album_ttl", float),
+        ("UWC_LOCAL_ALBUM_MAX_PHOTOS", "local_album_max_photos", int),
+    ):
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        try:
+            setattr(cfg, field_name, max(0, cast(raw)))
+        except ValueError:
+            pass
     return cfg
 
 

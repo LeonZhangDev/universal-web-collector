@@ -1,9 +1,26 @@
 name: CI
 
+# 这张 workflow 是「**可信口径**」的落点: 凡是"跑起来才知道"的结论, 要么在这里跑,
+# 要么在 README 的「CI 契约」表里写明"只在本地跑 + 为什么"。**没有第三态。**
+#
+# 两者的一致性由 `python scripts/gateguard.py` 逐条核对 —— 它同时读这张文件的
+# `run:` 步骤与 README 那张表。所以"新加了一个守卫但忘了接 CI"会当场红, 而不是
+# 等到某天有人问"这个脚本到底跑没跑过"。
+
 on:
   push:
     branches: [main, master]
   pull_request:
+
+env:
+  # R-CI-3 靠它落地: 跳过项被分成「平台门控」与「依赖缺失」两类, 只有前者允许出现在
+  # CI 里。判据在 `tests/conftest.py` 的 `_skip_problems`。
+  #
+  # 为什么必须区分: 2026-09-24 逐位还原过 CI 当时的 8 条跳过, 其中 7 条是"没装
+  # ffmpeg"(4 条 phash 真解码 + 3 条 DASH 端到端) —— 也就是说 **CI 从不验证
+  # "产物内容是不是好的"**, 而那几条恰好是最贵的判据。绿灯给了"它验过了"的错觉,
+  # 实际是"它根本没跑"。
+  UWC_CI: "1"
 
 jobs:
   backend:
@@ -13,8 +30,26 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
+
+      # ⚠️ ffmpeg **不是可选依赖**: 有 7 条最贵的判据门控在"探测不到 ffmpeg 就跳过"。
+      # 不装它, 这个 job 就从不检查产物内容, 而它依然是绿的。
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - run: uv sync --group dev
+
+      # 1) 用例(含那 7 条真解码)
       - run: uv run pytest -q
+
+      # 2) 仓库门禁: 文档数字 vs 实测 / CI 契约 / 未用 import / 结构规则 / 行尾
+      - run: uv run python scripts/gateguard.py
+
+      # 3) 三个**离线**守卫。它们以前不在任何地方跑 —— 所以"绿"从来没有覆盖过它们。
+      - run: uv run python scripts/selfcheck.py
+      - run: uv run python scripts/add_site.py --all
+      - run: uv run python scripts/verify_output.py
 
   frontend:
     runs-on: ubuntu-latest
@@ -22,10 +57,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-      - run: npm install
+          node-version: "22"          # 与开发机一致(20 已被 GitHub 标 deprecated)
+      # `npm ci` 而不是 `npm install`: 按 package-lock.json 装, 锁文件与 package.json
+      # 不一致时**直接红**; 而 `npm install` 会顺手改锁文件, 把不一致吞掉。
+      - run: npm ci
         working-directory: frontend
       - run: npm run build
+        working-directory: frontend
+      - run: npm run test:task-query
         working-directory: frontend
 
   docker:

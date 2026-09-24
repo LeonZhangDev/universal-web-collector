@@ -495,3 +495,35 @@ class BatchTaskOut(BaseModel):
     rejected_count: int
     # 超过单次上限被整行丢弃的数量(见 api.tasks.BATCH_MAX_URLS)
     truncated_count: int
+
+
+# ---- 本地相册集(见 core/localalbums.py)--------------------------------------
+# ⚠️ 这几个请求模型都**显式声明**每个字段(而不是靠 pydantic 兜底): 见本文件
+# `FilterIn` 上面那段 —— 没声明的键会被静默丢掉, 而表现是"前端传了, 后端当没看见"。
+
+class LocalRootIn(BaseModel):
+    """登记一个本地目录为相册集。"""
+
+    path: str
+    name: Optional[str] = None      # 留空就用目录名
+
+
+class LocalRootRenameIn(BaseModel):
+    name: Optional[str] = None      # 只改显示名, 不动 path
+
+
+class LocalFavoriteIn(BaseModel):
+    root_id: int
+    rel: str                        # 相对根的路径(用 `/`)
+    value: bool = True              # False = 取消收藏
+
+
+class LocalFavoriteForgetIn(BaseModel):
+    """删掉一条**失效**的收藏。
+
+    ⚠️ 这里收的是绝对路径 —— 与出图接口那条"绝不收绝对路径"的纪律**不冲突**:
+    出图要打开文件(所以必须锚在登记过的根上), 而这个动作只删我们库里的一行,
+    连 `Path()` 都不碰。唯一的输入风险是"删错了一行收藏", 代价是用户重新点一次星号。
+    """
+
+    path: str

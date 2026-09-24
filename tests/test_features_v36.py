@@ -965,7 +965,7 @@ def _have_ffmpeg():
     return bool(V.find_ffmpeg())
 
 
-_needs_ffmpeg = pytest.mark.skipif(not _have_ffmpeg(), reason="需要 ffmpeg")
+_needs_ffmpeg = pytest.mark.skipif(not _have_ffmpeg(), reason="[deps:ffmpeg] 需要 ffmpeg")
 
 
 def _run(cmd, cwd):

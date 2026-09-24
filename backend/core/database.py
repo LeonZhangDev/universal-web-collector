@@ -5,7 +5,6 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from core.config import settings
 
@@ -159,6 +158,48 @@ CREATE TABLE IF NOT EXISTS notifications(
     body TEXT,
     read INTEGER NOT NULL DEFAULT 0,
     created_time TEXT NOT NULL
+);
+
+-- 本地相册集的**登记表**(见 core/localalbums.py)。只有"用户显式注册过哪个目录"
+-- 需要落库 —— 目录里有什么照片是本机文件系统的事, 每次现扫即可, 不建索引表。
+--
+-- ⚠️ 这两张新表的时刻列是 **`created_at` / `last_scan` + REAL(epoch 秒)**, 不是
+-- 老表那种 `created_time` + `'%Y-%m-%d %H:%M:%S'` 字符串。理由: 读它们的每一处
+-- 都要拿来做算术(和 now 比、排序、算 TTL), 而格式化字符串只能先解析回来; 更要紧的
+-- 是名字里带 `time` 的列会被下一个人当成老约定, **类型才是不会说谎的那一半**。
+--
+-- ⚠️ 为什么不复用 tasks/resources 那张表: 本地相册是**只读的既有文件**, 而
+-- resources 的每一行都代表"本程序生产的一个产物" —— 它被 bulk-delete 的
+-- `_purge_files` 当作"可以删的文件"处理。把用户的照片登记进 resources, 就等于
+-- 把"删我下过的东西"和"删用户自己的东西"合成同一个语义。分开是唯一安全的做法。
+CREATE TABLE IF NOT EXISTS local_roots(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- 绝对路径。⚠️ **不加 UNIQUE**: Windows 路径大小写不敏感、Linux 敏感, 而
+    -- SQLite 既没有"平台相关的 NOCASE"也无法表达这个区别。去重放在 Python 里
+    -- 用 os.path.normcase 判(见 localalbums.add_root) —— 那样两边都对,
+    -- 而一个写死的 UNIQUE 只会在其中一边形成假判据。
+    path TEXT NOT NULL,
+    name TEXT,
+    created_at REAL NOT NULL,
+    -- 最近一次扫描完成时刻(epoch 秒)与那次扫出来的规模。存下来是为了让界面
+    -- 能说"这个数字是几点几分核出来的" —— 不含时间戳的统计数字过一会儿就是谎言。
+    -- NULL = **从来没扫过**(与"扫过、结果是 0 张"是两件必须分得开的事)。
+    last_scan REAL,
+    album_count INTEGER NOT NULL DEFAULT 0,
+    photo_count INTEGER NOT NULL DEFAULT 0,
+    -- 扫描时的异常(目录被拔了/权限不足)。**留着不吞**: 一个读不到的根如果
+    -- 只表现为"0 张照片", 用户会以为是自己目录是空的。
+    error TEXT
+);
+
+-- 本地照片的收藏。⚠️ 按**绝对路径**记账, 不按 (root_id, rel):
+-- 同一个目录可以既是根 A 的内容、又是根 B 的子目录, 按 (root_id, rel) 会变成
+-- 同一张照片两条收藏; 而路径是这张照片在磁盘上的唯一身份。
+-- 代价要说清楚: 用户**把文件改名/移走**之后收藏就断了 —— 这是已知且可接受的,
+-- 因为反过来(按 root+rel)在目录整体挪位置时断得更彻底。
+CREATE TABLE IF NOT EXISTS local_favorites(
+    path TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
 );
 """
 

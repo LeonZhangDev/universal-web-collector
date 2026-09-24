@@ -30,6 +30,7 @@
 
 import ast
 import http.server
+import json
 import re
 import subprocess
 import sys
@@ -57,6 +58,15 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
     total = 5                      # 存在的序号: 1..5
     hole = 0                       # 让某个序号"缺一张"(0 = 不制造空洞)
     always_403 = False             # 整站不可达(用来验"不要编结论"那条守卫)
+    #: 拦截**形态** —— 决定"被挡在门外"时正文长什么样, 而正文决定探针给出什么建议:
+    #:   ""      不拦
+    #:   "plain" 403 + `text/plain`  -> IP 段/地域封禁 -> 换指纹**没用**, 要代理
+    #:   "cf"    403 + CF 挑战页正文 -> TLS 指纹被拦     -> 换指纹**有用**, 该自动重试
+    #: 两种都返回 403 却要给**相反**的建议, 所以必须成对测 —— 只测一种会漏掉另一半。
+    block_mode = ""
+    #: 非空则 HEAD 说"存在"、GET 直接 500 —— 用来验"HEAD 通 != 能落地"这一条。
+    #: 它不是编出来的场景: 有的 CDN 只对 HEAD 放行, 真正取正文时才挡。
+    get_fails = False
     #: 非空则"只有这几个序号存在" —— 用来造"直链通、但 --scan 范围内 0 命中"的场景。
     #: 档 A 门禁要拦的正是它: 直链有效, 但"序号枚举型"这个前提一个样本都没验出来。
     only_seqs = ()
@@ -88,8 +98,19 @@ class _FakeSite(http.server.BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
     def _serve(self, body):
-        if self.always_403:
+        if body and self.get_fails:
+            self._send(500, "text/plain; charset=UTF-8", b"boom", body)
+            return
+        mode = self.block_mode or ("plain" if self.always_403 else "")
+        if mode == "plain":
+            # 403 且正文是 text/plain —— 2026-09-23 复测 img.xchina.io 就是这个样子
             self._send(403, "text/plain; charset=UTF-8", b"blocked", body)
+            return
+        if mode == "cf":
+            self._send(403, "text/html; charset=UTF-8",
+                       b"<html><head><title>Just a moment...</title></head>"
+                       b"<body><div id=\"challenge-platform\"></div></body></html>",
+                       body)
             return
         path = self.path.split("?")[0]
         if self.opaque_hash and re.match(r"^/hashes/[0-9a-f]+/(.+)\.png$", path):
@@ -136,10 +157,15 @@ def fake_site():
     """起一个本地假站点; 用完关掉。端口由系统分配, 不占固定端口。"""
     servers = []
 
-    def start(always_403=False, hole=0, total=None, opaque_hash="", only_seqs=()):
+    def start(always_403=False, hole=0, total=None, opaque_hash="", only_seqs=(),
+              block_mode="", get_fails=False):
         over = {}
         if always_403:
             over["always_403"] = True
+        if block_mode:
+            over["block_mode"] = block_mode
+        if get_fails:
+            over["get_fails"] = True
         if hole:
             over["hole"] = hole
         if total is not None:
@@ -390,18 +416,37 @@ def test_probe_gives_up_early_when_the_link_is_unreachable(fake_site):
     真实教训(2026-09-23): xchina 的媒体主机从这台机器整段 403, 而探针第一版会把
     "越界 403" 判成"状态码可用", 那会把一个**完全不可达**的站点写成"判定规则已确认"。
 
-    顺带: `403` 这种"被挡在门外"的状态要**自动**换一次浏览器 TLS 指纹, 不该让人先
-    看见 403、再手动加参数重跑一遍 —— 那天在 xchina 上就是这么手动重跑的。
+    这里用的是 `text/plain` 的 403 —— 即 **IP 段/地域封禁**。这一种**不该**自动换指纹:
+    2026-09-23 在 xchina 上实测过, 换指纹与浏览器 UA 全是同一个 `text/plain` 403。
+    自动重试的前提是"这条路有收益", 对 IP 封禁不成立 —— 多一次请求换回同一个结果,
+    还额外给了用户"指纹这条路已经试过了"的错觉。
     """
-    srv = fake_site(always_403=True)
+    srv = fake_site(block_mode="plain")
     out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID])
     assert rc == 2, out
-    assert "自动改用 chrome TLS 指纹重试一次" in out      # 不用人叫, 自己试一次
     assert "你给的那条直链**本身没探通**" in out
     assert "都没跑" in out                                # 后面四项省掉了
     assert "状态码可用" not in out                        # 绝不编结论
+    # 分型 + 该给的那条建议
+    assert "[ip_block]" in out
+    assert "换指纹对它**没用**" in out
     assert "--proxy" in out                               # 还得给可行动的下一步
-    assert "--impersonate" in out
+    assert "自动改用 chrome TLS 指纹重试一次" not in out   # 对 IP 封禁**不**重试
+
+
+def test_probe_retries_with_a_tls_fingerprint_on_a_cf_challenge(fake_site):
+    """另一种 403: **Cloudflare 挑战页** —— 这一个才该自动换指纹。
+
+    与上一个用例成对: 两者都返回 403, 正文决定给**相反**的建议。只测一种会漏掉一半 ——
+    而"只测一半"正是本项目记录过的老坑(同族 F: 通过但理由已经不对)。
+    """
+    srv = fake_site(block_mode="cf")
+    out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID])
+    assert rc == 2, out
+    assert "[cf_challenge]" in out
+    assert "自动改用 chrome TLS 指纹重试一次" in out        # 自己试, 别让人手动重跑
+    assert "换指纹对它**没用**" not in out
+    assert "probe.py" in out                              # 需要真浏览器的那条路也说了
 
 
 def test_probe_requires_a_direct_link(fake_site):
@@ -549,3 +594,159 @@ def test_probe_refuses_a_draft_with_no_sequence_evidence(fake_site):
     assert "档 A 字段缺实测证据" in out
     assert "一个存在的序号都没探到" in out
     assert "GallerySite 草稿" not in out      # 一个字都不给, 免得被照抄
+
+
+# ------------------------------------------------- 可达性分型(单元)
+
+
+def test_diagnose_block_separates_causes_with_opposite_fixes():
+    """六种成因给**互不通用**的建议 —— 混成一条"都试试"等于没说。
+
+    重点是前两种: `ip_block` 与 `cf_challenge` 都是 403, 但一个**换指纹没用**、另一个
+    **只有换指纹有用**。把它们混起来, 用户就会照着错的那条一直试下去。
+    """
+    cf_body = b"<html><title>Just a moment...</title>challenge-platform</html>"
+    cases = [
+        ((403, "text/plain; charset=utf-8", {}, b"blocked"), "ip_block"),
+        ((403, "text/html; charset=utf-8", {}, cf_body), "cf_challenge"),
+        ((403, "text/html; charset=utf-8", {"cf-mitigated": "challenge"}, b""),
+         "cf_challenge"),
+        ((401, "text/html", {}, b""), "auth"),
+        ((403, "text/html", {"www-authenticate": "Basic"}, b""), "auth"),
+        ((429, "text/plain", {}, b""), "rate"),
+        ((503, "text/html", {}, b""), "down"),
+        ((403, "text/html", {}, b"<html>nope</html>"), "blocked"),
+        ((0, "", {}, b""), "unknown"),
+    ]
+    for (status, ctype, hdrs, body), want in cases:
+        kind, why, fix = probe_site.diagnose_block(status, ctype, hdrs, body)
+        assert kind == want, (kind, want)
+        assert why and fix                       # 两件事都必须说清: 为什么 + 怎么办
+
+    ip = probe_site.diagnose_block(403, "text/plain", {}, b"blocked")[2]
+    cf = probe_site.diagnose_block(403, "text/html", {}, cf_body)[2]
+    # 判的是**第一条建议是什么**, 不是"文本里出现没出现过 chrome"。
+    # 差别很实在: `ip_block` 的正文里**必须**提到"换指纹没用"并给出实测证据,
+    # 那就必然会写到一个指纹名 —— 拿子串去查会把它当成"推荐了换指纹", 于是要么
+    # 误报, 要么逼着把证据从给用户看的文案里删掉。两种都是在改产品迁就断言。
+    assert ip.startswith("`--proxy`"), ip            # IP 封禁: 第一条就是换出口
+    assert "换 TLS 指纹" in ip and "没用" in ip      # 并且明说另一条没用
+    assert cf.startswith("换浏览器 TLS 指纹"), cf     # CF 挑战: 第一条就是换指纹
+    assert "chrome" in cf
+    assert ip != cf
+
+
+def test_accept_verdict_reads_the_three_way_control():
+    """② 的三档对照要读成机器可比的结论(快照靠它发现"站点开始校验 Accept")。"""
+    mk = lambda a, c: [("不带 Accept", a), ("Accept: */*", a), ("Accept: image/*", c)]
+    assert probe_site.accept_verdict(mk(403, 200)) == "required"
+    assert probe_site.accept_verdict(mk(200, 200)) == "not-required"
+    assert probe_site.accept_verdict(mk(403, 403)) == "unknown"
+    assert probe_site.accept_verdict([]) == "unknown"
+
+
+# ------------------------------------------------- 快照(建议 1 的产出侧)
+
+
+def test_probe_writes_a_machine_readable_snapshot(fake_site, tmp_path):
+    """`--json` 要把实测结论落成机器可读的快照 —— 那是 drift_check 的输入。
+
+    它必须包含"能不能进"以外的**判定规则本身**(`over_*` / `accept` / `exists_shape`),
+    因为站点改版时先变的正是这些, 而它们的变化会让所有 URL 一起失效。
+    """
+    srv = fake_site()
+    snap_file = tmp_path / "site_probe.json"
+    out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID],
+                   extra=["--json", str(snap_file)])
+    assert rc == 0, out
+    assert snap_file.is_file(), out
+
+    data = json.loads(snap_file.read_text(encoding="utf-8"))
+    assert len(data) == 1, data
+    snap = next(iter(data.values()))
+    assert snap["reachable"] is True
+    assert snap["reach_status"] == 200
+    assert snap["exists_hits"] == 5
+    assert snap["exists_shape"] == "TTTTTF"        # 5 个序号存在, 第 6 个不存在
+    assert snap["over_status"] == 200              # 越界也返回 200
+    assert snap["over_ctype"].startswith("text/html")   # -> 只能按 Content-Type 判定
+    assert snap["accept"] == "required"            # 不给 Accept 会被 403
+    assert ".jpg" in snap["variants"]
+    assert snap["opaque_suffix"] is False
+
+
+def test_probe_records_unreachable_in_the_snapshot(fake_site, tmp_path):
+    """**不通也要落快照** —— 它恰恰是最该被记下来的那一格。
+
+    否则 drift_check 只能看到"上次好好的、这次没数据", 分不清"站点挂了"和"我没跑"。
+    """
+    srv = fake_site(block_mode="plain")
+    snap_file = tmp_path / "site_probe.json"
+    out, rc = _run(srv.server_address[1], ["/photo/id-%s.html" % GID],
+                   extra=["--json", str(snap_file)])
+    assert rc == 2, out
+    assert snap_file.is_file(), out
+    snap = next(iter(json.loads(snap_file.read_text(encoding="utf-8")).values()))
+    assert snap["reachable"] is False
+    assert snap["reach_status"] == 403
+    assert snap["exists_hits"] == 0                # 后面四项没跑, 一个都没探
+    assert snap["accept"] == "unknown"
+
+
+def test_probe_merges_the_snapshot_by_site(tmp_path, fake_site):
+    """同一个快照文件里按**站点**合并, 不能互相覆盖 —— 巡检要一次看全所有站点。"""
+    snap_file = tmp_path / "site_probe.json"
+    snap_file.write_text(json.dumps({"someone_else": {"base": "x"}}),
+                         encoding="utf-8", newline="")
+    srv = fake_site()
+    out, rc = _run(srv.server_address[1], [], extra=["--json", str(snap_file)])
+    assert rc == 0, out
+    data = json.loads(snap_file.read_text(encoding="utf-8"))
+    assert "someone_else" in data                  # 别人的基线还在
+    assert len(data) == 2, sorted(data)
+
+
+# ------------------------------------------------- 冒烟(建议 2)
+
+
+def test_smoke_downloads_one_file_for_real(fake_site, tmp_path):
+    """`--smoke` 要**真的**下一张到磁盘 —— "HEAD 通"与"能落地"之间隔着四道关卡。
+
+    这里验的是最小那条链路: 下载 -> 写盘 -> 魔术字节/尺寸 -> `match_resource`。
+    """
+    srv = fake_site()
+    dest = tmp_path / "smoke"
+    snap_file = tmp_path / "site_probe.json"
+    out, rc = _run(srv.server_address[1], [],
+                   extra=["--smoke", "--smoke-dir", str(dest),
+                          "--json", str(snap_file)])
+    assert rc == 0, out
+    assert "冒烟" in out
+    assert "落盘" in out
+    files = sorted(p for p in dest.glob("smoke_*") if p.is_file())
+    assert files, out                              # 真的落盘了
+    assert all(p.stat().st_size > 0 for p in files)
+    snap = next(iter(json.loads(snap_file.read_text(encoding="utf-8")).values()))
+    assert snap["smoke_ok"] >= 1
+    assert snap["smoke_total"] == len(files)
+
+
+def test_smoke_says_so_when_nothing_could_be_downloaded(fake_site, tmp_path):
+    """HEAD 通、GET 全 500 -> 冒烟要**明说一张都没下来**, 而不是安静地跳过。
+
+    这正是"能探测"与"能落地"之间那道缝: 五段探测全部通过、草稿也生成得出来, 可真正
+    取正文时被 500 挡回来。探针此前对这一层**完全无感知** —— 它会交出一份看着完美的
+    报告, 而用户下单后才发现 0 个资源。
+    """
+    srv = fake_site(get_fails=True)
+    dest = tmp_path / "smoke"
+    snap_file = tmp_path / "site_probe.json"
+    out, rc = _run(srv.server_address[1], [],
+                   extra=["--smoke", "--smoke-dir", str(dest),
+                          "--json", str(snap_file)])
+    assert rc == 0, out                              # 探测本身没问题, 所以不拦草稿
+    assert "冒烟 0/" in out
+    assert "一张都没下来" in out
+    assert not list(dest.glob("smoke_*")) if dest.exists() else True
+    snap = next(iter(json.loads(snap_file.read_text(encoding="utf-8")).values()))
+    assert snap["smoke_ok"] == 0

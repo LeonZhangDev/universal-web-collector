@@ -433,6 +433,85 @@ python scripts/probe_site.py \
 写在路径里"、"资源直链是 `.php?file=...`"三种探针没见过的形态; 顺手还记下了哪些站
 根本不可达(漫画柜连接超时 / Lorem Picsum 直链要 hmac 签名)。
 
+#### 加站链路: 前三段有护栏, 后三段全裸
+
+把整条链路摊开看, 护栏的分布是不均匀的:
+
+```
+① 探测      scripts/probe_site.py   三档证据门禁 + 可达性分型 + 草稿自检
+② 声明自洽  check_site()            样本 -> gid 必须唯一且正确
+③ 草稿自检  validate_draft()        草稿必须过它自己的 check_site()
+------------------------------------------------------ 以上有护栏
+④ 认领      resolve_collector()     没人认领 -> 静默落到通用采集器, 行为完全不同
+⑤ 过滤      match_resource()        命中"广告位/装饰图" -> 静默全过滤 -> 0 资源
+⑥ 落盘/命名 layout.place()/claim()  相对路径写歪 -> 用户按预期去找找不到
+```
+
+④⑤⑥ 的共同点是**错了不报错**: 任务照样跑完、照样 `success`, 用户拿到 0 个资源或
+一堆散落在下载根目录的文件。所以补了一个主动入口:
+
+```bash
+make add-site SITE=xchina_gallery    # 等价于 uv run python scripts/add_site.py --verify xchina_gallery
+python scripts/add_site.py --list    # 有哪些站点可校验
+python scripts/add_site.py --all     # 一次校验全部
+python scripts/add_site.py --verify xchina_gallery --smoke   # 追加一次网络冒烟
+```
+
+四道闸**纯离线**(不发请求), 可以放心接进 CI; `--smoke` 才碰网络, 它补的是
+"HEAD 通、正文却不是图"这一类只看声明看不出来的坑。全绿退出 0, 任何一闸报问题退出 1。
+
+⚠️ 站点选择器的判据是 **`SequenceGallerySpider` 子类**, 不是"有没有 `site` 属性"。
+`PexelsSpider` 有 `site = PEXELS` 却**刻意没有**继承它(一个 id 下只有一张图, 序号
+枚举模型不成立)。按"有 site 就算"去筛, 它会被套上序号模型跑完四道闸而且**全绿** ——
+那份绿是假的, 它连 `url_for` 拼出来的 URL 都不存在。这正是本项目反复踩的"通过但
+理由已经不对", 所以宁可**拒绝验**, 也不给假绿(它会指向 `probe_feed.py`)。
+
+#### 站点漂移巡检
+
+站点改版是本项目的**头号静默故障**: 改完之后任务照样 `success`, 只是资源变成 0 个。
+改版之前没有任何信号 ——
+
+| 手段 | 覆盖到哪 |
+| --- | --- |
+| `selfcheck.py` | 只做**离线**自洽(正则 vs 样本), 不知道线上变了没 |
+| `cdn_profile` | 要**已经采不到东西之后**才看得出来(且只有跑过任务才有记录) |
+| 用户报障 | 最晚的那一道, 也是在此之前唯一的那一道 |
+
+`probe_site.py --json` 把五项实测落成机器可读快照(`data/site_probe.json`),
+`scripts/drift_check.py` 过一段时间再跑一次并**逐项比对**:
+
+```bash
+python scripts/drift_check.py               # 巡检所有已注册的声明式站点
+python scripts/drift_check.py --site xchina_gallery
+python scripts/drift_check.py --update      # 确认是站点正常改版, 刷新基线
+python scripts/drift_check.py --list
+```
+
+漂移分两档, 判据与三档门禁**同一条**(猜错了是每条 URL 都错, 还是只少采一点):
+
+- **硬漂移**(必须报警): 进不去 / 序号枚举型前提塌了 / 存在性判定规则变了 /
+  `Accept` 开始被校验 / 序号宽度变了 / 基址搬家 / 主档位消失 / 原来能解析的 URL 解析不出来了
+- **软漂移**(记一笔): 多一个画质档 / 多一条页面基址 / 多一种 URL 形态
+
+分档的理由很实际: 告警一旦变成噪音就没人看了, 而"永远在闪的灯"和"没有灯"是一回事。
+⚠️ 它**必须联网**, 所以不进 CI; 第一次跑只会**记基线**并明确说出来 —— "没有基线"和
+"没有漂移"是两件事。
+
+#### 第二类站点: API / 分页型
+
+序号枚举模型只覆盖一类站点。`pexels` 那种"一个 id 一张图、资源清单由页面或 API
+下发"的属于另一类, 走 `scripts/probe_feed.py`:
+
+```bash
+python scripts/probe_feed.py <列表页URL>              # 探分页协议/端点形态
+python scripts/probe_feed.py --api <API端点> --header Authorization --key-env PEXELS_KEY
+```
+
+它探四件事: 分页协议(cursor / offset / page)、端点形态、密钥依赖、以及**认领正则
+会不会误伤别的站点**。关键判据是 `offset-like` 与 `page-like` 的差别 —— 猜错的后果
+就是"少了些图但不报错"。它**只出报告不生成声明**: 单一实例不足以抽象, 硬写一份
+声明等于把一个样本的猜测当规律(见坑 #16)。
+
 **CDN 画像** (`backend/core/cdn_profile.py` → `data/cdn_profile.json`): 记住每条
 基址的命中次数与序号格式, 用来给候选探测排序。实测价值:
 
@@ -914,13 +993,19 @@ HLS/DASH 的分片缓存原来只躺在**目标路径旁边**(`.<stem>.parts/`)�
 ## 测试 / 部署
 
 ```bash
-make test           # pytest (1086 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针与它的产出守卫)
+make test           # pytest (1105 用例: 含 hls 校验 / 视频采集器 / 自动识别 / CDN 探测 / 有效资源 / 聚合页 / 感知去重 / 声明自检 / 令牌桶与 AIMD / 枚举快路径 / 健壮性与取消门禁 / 测试隔离守卫 / 产物-终态次序 / 批量操作与通知 / 代理池与熔断 / 统计增强 / 跨任务资源库 / 字节速率 / 失败分类与内容终检 / 画像并发 / 资源遥测 / 缩略图 / 条件请求 / 字节限速 / 资源库批量 / 完整性巡检 / 断点续传暂存区 / DASH 解析 / 标签与收藏 / 标签层级与颜色 / 分片缓存跨任务复用 / DASH 字节区间与多时段 / 媒体元数据 / 下载顺序 / 死信重放 / 嵌套 sidx / 直播录制 / 新站点探针与它的产出守卫 / 加站门禁)
 make docker         # docker compose 构建并启动
 python scripts/verify_output.py   # 端到端: 命名/manifest/打包/增量/订阅/停止 (40 项断言)
 python scripts/verify_hls.py      # 真实 HLS 双引擎验证 (18 项断言)
 python scripts/preview_probe.py <相册页URL或图集ID>   # 真实站点创建前预告
 python scripts/probe_site.py <资源直链> [相册页URL]  # 新站点五项探测 + 声明草稿
-python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照
+python scripts/probe_site.py <直链> --smoke          # 追加"真下一张"验能落地
+python scripts/probe_site.py <直链> --json           # 落机器可读快照(drift_check 的输入)
+python scripts/add_site.py --verify <站点名>          # 加站门禁: 认领/过滤/落盘(离线)
+python scripts/add_site.py --all                     # 全部站点一次跑
+python scripts/selfcheck.py       # 站点声明自检 + CDN 画像快照(纯离线)
+python scripts/drift_check.py     # 站点特征漂移巡检(需联网, 不进 CI)
+python scripts/probe_feed.py <列表页URL>   # 第二类站点(API/分页)探针, 只出报告
 ```
 
 配置: `config.yaml`, 环境变量 `UWC_DB_PATH` / `UWC_DOWNLOAD_DIR` /

@@ -1,9 +1,20 @@
-.PHONY: install start start-native start-dev backend frontend test build docker clean
+.PHONY: install start start-native start-dev backend frontend test build docker clean \
+	add-site selfcheck drift
 
 install:
 	uv sync --group dev
 	uv run playwright install chromium
 	cd frontend && npm install && npm install --package-lock-only
+
+add-site:
+	@test -n "$(SITE)" || { echo 'usage: make add-site SITE=<站点名>   (或 make add-site SITE=--all)'; exit 2; }
+	uv run python scripts/add_site.py --verify $(SITE)
+
+selfcheck:
+	uv run python scripts/selfcheck.py
+
+drift:
+	uv run python scripts/drift_check.py
 
 start:
 	uv run python scripts/start.py

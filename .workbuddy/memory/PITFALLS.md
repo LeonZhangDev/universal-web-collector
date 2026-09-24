@@ -869,3 +869,56 @@ F 是"断言的理由失效了"，这条是"**该断言的地方没断言**"。
 **判据**：凡是**产出给人看的东西**（报告、草稿、提示），改完都要目视一遍完整输出 ——
 测试保证"我想到的都算对了"，目视保证"我没想的那些没坏"。
 
+---
+
+### 第 19 条 ⚠️ 模块级单例在 **import 期**就起了后台线程
+
+**形状**：`backend/core/task_manager.py` 末尾一句 `task_manager = TaskManager()`
+（生产需要：api 层直接用它提交任务，`main.py` 的 lifespan 靠它）。但 `TaskManager.__init__`
+顺手 `start()` 了看门狗与调度两个线程 —— 于是**只要有人 import 这个模块，线程就活了**，
+而它们干活时读的是**当前的** `database.DB_PATH`。测试的库是**每条用例现换的**。
+
+**表现**（全是"单跑绿、全跑红、重跑又绿"）：
+
+* 调度线程扫当前用例的库，把刚启用的订阅源"顺手跑掉"并回写 `next_run`
+  → `due_watches()` 刚从 0 变 1、一转眼又变回 0（`test_disable_watch_stops_it_being_due`）。
+* 用例里的活动任务被它当成**自己的**，在单例的 `_active` 里留下条目；之后别条用例的看门狗
+  问 `_owned_by_any_manager(tid)` 得到 True，就不敢收那个 tid —— 而 tid 在小库上**从 1 重新数**，
+  **跨用例撞号**（`test_watchdog_reaps_task_with_dead_heartbeat` / `..._no_heartbeat_at_all`）。
+
+**为什么既有隔离管不到**：`tests/isolation.py` 登记的是**路径**，不是**线程**；
+`tests/conftest.py` 顶部记的两轮污染源都是**磁盘状态文件**，这轮的污染源是
+**一条进程内线程** + **一个跨用例复用的 dict**。所以隔离清单再全也拦不住它。
+
+**定位手法（可复用，比"猜哪个用例"快得多）**：写一个 in-process pytest 插件，
+在 `pytest_runtest_setup` 里打印活着的线程 / `mgr._active` 大小，用 `-p <插件名> -s` 跑一轮。
+先看**连跑 vs 单跑**的差异确认是污染，再让插件把"谁还活着"打出来 —— ⑤心法：卡死类/隔离类
+问题第一动作是**打出实际状态**，不是重跑撞运气。
+
+**修法**（`tests/conftest.py::_muzzle_import_time_singleton`，autouse）：
+
+* 只停**后台循环**（`_watchdog_stop.set()` / `_scheduler_stop.set()`），
+  **不动方法本身** —— 有用例直接同步调 `task_manager._final_status` / `.submit_resource`。
+* 用例结束后把它 `_active` 的增删**抹平**（存 before、clear、update before），免得下个用例再撞号。
+
+**修完的副作用是个好信号**：全量**反而快了**（274s → 193s）—— 杂散线程本来在做无用功。
+
+**推广判据**：写完一个模块，问一句「**只 import 它，会起线程吗？**」。
+会 → 要么改成显式 `start()`（lifespan 调），要么在测试里把它摁住。**生产需要 ≠ 测试需要。**
+
+---
+
+### 同族：门禁的**选择器**错 → 四道闸一起**假绿**
+
+`scripts/add_site.py` 的四道闸（可达性 / 声明自洽 / 命名落盘预演 / 过滤命中）都成立，
+但第一版用 `getattr(cls, "site", None)` 挑站点 —— **凡有 `site` 声明就收**。于是
+`pexels` 也被纳入了：它根本不是 `SequenceGallerySpider`（走 API 分页，不是序号枚举型），
+四道闸于是全绿在**一个永不可能出现的 URL 形态**上。**闸是真的、跑是真的、结论是假的。**
+
+判据：**"什么东西该被这道闸管"本身要有判据，且这个判据要写进代码**（这里 =
+带 `site` 声明的 `SequenceGallerySpider`），不能靠"我拿两个例子试了没问题"。
+同族 F 的变体：不是断言的理由失效，而是**被测集合的挑选理由错了** ——
+更隐蔽，因为闸的输出全都是"绿"。
+
+
+

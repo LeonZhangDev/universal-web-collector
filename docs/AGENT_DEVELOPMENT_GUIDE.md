@@ -3304,3 +3304,156 @@ Lorem Picsum 的图片直链要 `hmac` 签名（裸 URL 一律 400）；Internet
 | 目视全输出 | 起本地假站点跑一遍：第 0 段 / 档位汇总 / 草稿自检三节都按预期出现；**两处新缺陷就是这么发现的** |
 | 全量 pytest | **1086 用例全绿**（1080 passed / 6 skipped） |
 
+---
+
+## 19. 加站链路的后三段：把"全裸"补成门禁（2026-09-24 四）
+
+前一轮（§18）把加站链路的**前三段**装上了护栏。这一轮把链路摊开看，发现护栏分布
+**不均匀**：
+
+```
+① 探测      scripts/probe_site.py   三档证据门禁 + 可达性分型 + 草稿自检
+② 声明自洽  check_site()            样本 -> gid 必须唯一且正确
+③ 草稿自检  validate_draft()        草稿必须过它自己的 check_site()
+------------------------------------------------------ 以上有护栏
+④ 认领      resolve_collector()     没人认领 -> 静默落到通用采集器
+⑤ 过滤      match_resource()        命中"广告位/装饰图" -> 静默全过滤 -> 0 资源
+⑥ 落盘/命名 layout.place()/claim()  相对路径写歪 -> 用户按预期去找找不到
+```
+
+④⑤⑥ 的共同点是**错了不报错**：任务照样跑完、照样 `success`。所以补了
+`scripts/add_site.py`（`make add-site SITE=<名字>`），把这三段变成四条可执行的闸。
+
+### 19.1 四条闸分别防什么
+
+| 闸 | 判据 | 猜错/改坏的症状 |
+| --- | --- | --- |
+| 1 声明自洽 | 复用 `check_site()`，不另写一份 | 样本与正则矛盾 —— 站点换 ID 形态的第一现场 |
+| 2 认领 | 每条 `id_samples` URL 必须被**本站**接走，且不并列 | URL 落到通用采集器去"试着抓"，用户看到的是"采到的东西不对" |
+| 3 过滤 | 用 `site.url_for()` 拼出的真实 URL 必须过默认 `Filters()` | 资源被**全部**静默过滤，任务 `success` + 0 资源 |
+| 4 落盘/命名 | `place()` 保留相册层 / 视频平铺；`claim()` 撞名必须换名 | 文件散在下载根目录；或撞名被下载层当"半成品续传"拼成坏文件 |
+
+闸 3 有个容易忽略的细节：**必须走 `site.url_for()` 而不是自己拼字符串**。自己拼
+等于换了一套 URL 构造口径，验的就不是"这份声明拼出来的东西能不能过过滤"了。
+
+四条闸**纯离线**（不发任何请求），所以可以放心接进 CI。`--smoke` 才碰网络，它补的是
+"HEAD 通、正文却不是图"这一类只看声明看不出来的坑（取响应头 64KB 判魔术字节，
+比 `probe_site.py --smoke` 的完整下载便宜）。
+
+### 19.2 ⚠️ 一条**假绿**：按"有没有 `site` 属性"筛站点
+
+第一版 `registered_sites()` 筛的是 `getattr(cls, "site", None) is not None`。
+跑 `--all` 时输出里出现了 `pexels` 并且**四道闸全绿** —— 但 `PexelsSpider` 明明
+**刻意没有**继承 `SequenceGallerySpider`（见 `stockphotos/pexels.py:126`：一个 id 下
+只有一张图，序号枚举模型不成立）。它那份绿是假的：闸 3/闸 4 在 `url_for` 拼出的一个
+**根本不存在**的 URL 图案上照样"通过"。
+
+这正是本项目反复踩的**家族 F（通过但理由已经不对）**。判据改成 `issubclass(cls,
+SequenceGallerySpider)` 后，`pexels` 被明确归到"不走本门禁"，并指向
+`scripts/probe_feed.py`。**宁可不验，也不给假绿** —— 假绿比失败更贵，因为它给的是
+"我验过了"的信心。
+
+### 19.3 顺带修掉的一个真 bug：`cf-mitigated` 判反了
+
+`diagnose_block()` 原本这么判 CF 拦截：
+
+```python
+cf_hdr = (h.get("cf-mitigated") or "").lower()
+if any(m in low for m in _CF_MARKERS) or "mitigated" in cf_hdr:
+```
+
+真响应头是 `cf-mitigated: challenge` —— **值里根本没有 "mitigated" 这个词**，
+所以第二条恒为假。CF 挑战被错判成 `blocked`，而这两种成因的处置**正好相反**：
+`cf_challenge` 该换 TLS 指纹，`blocked` 说"按成本从低到高都试试"。用户会照着错的那条
+一直试下去。
+
+修法是**判响应头在不在**，不是拿值去搜：
+
+```python
+cf_mitigated = "cf-mitigated" in h
+```
+
+它是被 `tests/test_probe_site.py::test_diagnose_block_separates_causes_with_opposite_fixes`
+抓出来的 —— 那条用例的第三个 case（只有响应头、正文为空）正好命中这个组合。
+**成对测"两种 403 给相反建议"是刻意的**：只测一种会漏掉另一半。
+
+### 19.4 同一条用例里还改掉了一个**太字面**的断言
+
+同一条用例原来断言 `"--proxy" in ip and "chrome" not in ip`。而 `ip_block` 的建议正文
+里**必须**提到"换指纹没用"并给出实测证据（"裸 curl、浏览器 UA、`impersonate=chrome`
+全是同一个 `text/plain` 403"）—— 那就必然会写到一个指纹名。拿子串去查，等于把
+"提到了某选项"读成"推荐某选项"，结果是**要么误报，要么逼着把证据从给用户看的文案里
+删掉**。
+
+两种都是在改产品迁就断言（心法④）。改成判**第一条建议是什么**：
+
+```python
+assert ip.startswith("`--proxy`")            # IP 封禁: 第一条就是换出口
+assert "换 TLS 指纹" in ip and "没用" in ip  # 并且明说另一条没用
+assert cf.startswith("换浏览器 TLS 指纹")     # CF 挑战: 第一条就是换指纹
+```
+
+### 19.5 ⚠️ 顺带抓出第 19 条静默坑：导入期的 TaskManager 单例在测试里按**当前** DB 干活
+
+修完上面几处跑全量，出现 3 条与本次改动**毫无关系**的失败：
+
+```
+tests/test_incremental.py::test_disable_watch_stops_it_being_due
+tests/test_pause_resume.py::test_watchdog_reaps_task_with_dead_heartbeat
+tests/test_pause_resume.py::test_watchdog_reaps_task_with_no_heartbeat_at_all
+```
+
+三条**单跑全绿**，全跑才红。根因在 `backend/core/task_manager.py` 末尾：
+
+```python
+task_manager = TaskManager()      # 导入即创建, 并起看门狗 + 调度两条线程
+```
+
+生产环境需要它（api 层直接用，`main.py` 的 lifespan 靠它）。但任何人 import 这个模块，
+它的**两个后台线程就活了**，而且干活时读的是**当前的 `database.DB_PATH`** —— 而测试的库
+是每条用例现换的。于是：
+
+- 调度线程扫当前的库，把用例刚启用的订阅源"顺手跑掉"并回写 `next_run`
+  → `due_watches()` 刚从 0 变 1，一转眼又变回 0（第 1 条失败）
+- 用例里的活动任务被它当成自己的，在**单例**的 `_active` 里留下条目；之后别条用例的
+  看门狗问 `_owned_by_any_manager(tid)` 得到 True 就不敢收那个 tid 的任务 ——
+  而 `tid` 在小库上从 1 重新数，**跨用例撞号**（第 2、3 条失败）
+
+为什么以前没炸：线程每 30 秒才醒一次，落在哪条用例上是**随机的**。这是**时间相关的
+间歇失败**（加文件改变了时序才现形），不是本次改动引入的回归。
+
+**处置**（`tests/conftest.py` 里一个 autouse 夹具）：只停它的两条**后台循环**，不动
+方法本身（有用例直接调 `tm.task_manager._final_status` / `.submit_resource`，那是同步
+调用）；并把它 `_active` 的增删在用例结束后抹平，免得下一个用例又撞号。
+
+教训与 conftest 顶部记的那两轮同型，**但污染源换了种类**：那两轮是磁盘上的状态文件，
+这一轮是**一条进程内线程 + 一个会跨用例复用的 dict**。`isolation.py` 的清单登记的是
+**路径**，管不到线程 —— 所以"隔离清单 + 真库守卫"这套机制必须在**新增一类共享资源**
+（这里是"导入期就活着的后台线程"）时同步扩展，而不是等问题再出现一次。
+
+### 19.6 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 新增 `tests/test_add_site.py` | **11 项**，每一条闸都有一个**故意造坏**的输入（否则分不清"查了没问题"和"根本没查"），另有一条专门钉住 19.2 的假绿 |
+| `tests/test_probe_site.py` | **23 → 31 项**，全绿。修掉 `cf-mitigated` 判反 + 一条太字面的断言 |
+| 目视完整输出 | `add_site.py --list / --verify / --verify pexels` 三种形态都跑过；**假绿就是这么发现的** |
+| 全量 pytest | **1105 用例全绿**（1099 passed / 6 skipped，183s）；1105 = 上个提交的 1086 + `test_add_site` 11 + 探针新增 8 |
+| 新脚本 | `scripts/drift_check.py`（漂移巡检，硬/软分档）、`scripts/probe_feed.py`（第二类站点探针）、`scripts/add_site.py`（加站门禁） |
+| Makefile | 新增 `add-site`（`SITE=` 参数）/ `selfcheck` / `drift` 三个目标 |
+
+### 19.7 验证记录：那 3 个红是怎么被判成"污染"而不是"回归"的
+
+| 步 | 动作 | 观察到 |
+| --- | --- | --- |
+| 1 | 全量 `pytest` | 3 个红，全在**无关**文件（`test_incremental` / `test_pause_resume`） |
+| 2 | 把 3 条**单独**跑 | 全绿 → **单跑绿 / 连跑红**，判为跨用例污染 |
+| 3 | 读 `tests/conftest.py` + `isolation.py` | 隔离清单登记的是**路径**，管不到**线程** |
+| 4 | 写 in-process pytest 插件打印活线程 / `_active` 大小 | 锁定时序：单例的调度线程跑掉了用例刚启用的订阅源 |
+| 5 | 加 autouse 夹具摁住单例的两条后台循环 + 抹平 `_active` | 全绿，且**更快**（污染那轮 ≈274s → 183s） |
+
+**顺序别颠倒**：先看到"单跑绿/连跑红"再去找原因，不要一上来就重跑撞运气。
+⑤心法：卡死类 / 隔离类问题第一动作是**打出实际状态**。
+
+
+

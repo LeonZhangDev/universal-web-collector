@@ -66,13 +66,27 @@ r"""新站点探针 —— 把「接入新站点」的第一步变成一份可�
 分档的判据就一句: **猜错了, 是每条 URL 都错, 还是只是少采一点。**
 有了它, 第六种形态哪怕从没见过也会被拦下 —— 新写出来的那一行必然带缺口。
 
-另外两处也一并前移了:
+另外几处也一并前移了:
 
 - **第 0 段 可达性**: 直链不通就早退(省掉后面四项、二十来个请求), 且 `403/429/503`
   这类"被挡在门外"的状态会**自动**换一次浏览器 TLS 指纹重试 —— 不该让人先看见 403、
   再手动加参数重跑一遍(2026-09-23 在 xchina 上就是这么手动重跑的)。
+  **不通时还会分型**(见 `diagnose_block`): IP 段封禁 / CF 挑战页 / 防盗链 / 要登录,
+  这四种的处置完全不同 —— 笼统说一句"换个指纹试试"等于没说。
 - **草稿自检**: 拼完就地 exec 起来跑 `check_site()`。它是这份声明**唯一**的验收标准,
   以前靠人肉(存盘 -> import -> 跑 selfcheck.py), 现在当场就能看见。
+
+报告之后: 快照与冒烟
+====================
+前面五段测的都是**站点特征**。可是"特征没变"不等于"声明能用", 所以还补了两件事:
+
+- `--json PATH` **快照**: 把这次的实测结论落成机器可读的 JSON。它不是给人看的, 而是
+  让 `scripts/drift_check.py` 能**过一段时间再跑一次**并逐项比对。站点改版是本项目
+  的头号静默故障源, 而在它之前没有任何信号: `selfcheck.py` 只做离线自洽(正则 vs 样本,
+  不知道线上变了没), `cdn_profile` 只在**已经采不到东西之后**才看得出来。
+- `--smoke` **冒烟**: 拿已经探通的直链**真下一张**到临时目录, 校验魔术字节 / 尺寸 /
+  `filters.match_resource`。HEAD 通 != 采集器真能跑 —— 中间还隔着认领、过滤、命名、
+  原子落盘, 任何一处不匹配的结果都还是"0 个资源", 而此前这些探针一处都不覆盖。
 
 用法
 ====
@@ -91,14 +105,21 @@ URL 里, 是手上最硬的一份证据; 再给相册页 URL, 就能顺带验"�
     --impersonate X 换成浏览器 TLS 指纹(curl-cffi), 如 chrome; 全 403 时再试
     --proxy URL     走代理
     --out draft.py  把声明草稿写成文件(同时仍打印报告)
+    --json PATH     把实测结论写成快照(默认 data/site_probe.json, 按站点名合并),
+                    供 scripts/drift_check.py 之后比对"站点特征有没有漂"
+    --smoke         拿已探通的直链**真下一张**到临时目录验"能落地"(默认不做)
+    --smoke-dir D   冒烟下载的落脚目录(默认系统临时目录)
 
-⚠️ 本脚本**只探测、不落盘任何资源**。它发的是 HEAD(必要时一次流式 GET 只读响应头),
-不会把图片正文读下来。
+⚠️ 默认情况下本脚本**只探测、不落盘任何资源**: 发的是 HEAD(必要时一次流式 GET 只读
+响应头), 不读图片正文。只有显式加了 `--smoke` 才会真的下载(一张)。
 """
 
 import argparse
+import hashlib
+import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -106,11 +127,19 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 
 from core.config import IMAGE_ACCEPT, VIDEO_ACCEPT, settings  # noqa: E402
+from core import imageinfo  # noqa: E402
+from core.filters import Filters  # noqa: E402
+from core.jsonstore import JsonStore  # noqa: E402
+from collectors import resolve_collector  # noqa: E402
 from collectors.gallery_base import (  # noqa: E402
     GallerySite,
     _head_status_headers,
     check_site,
 )
+
+#: 快照默认落在 `data/` 下, 与 `cdn_profile.json` 同一层 —— 两者都是"运行期攒出来的
+#: 站点事实", 放在一起便于一起备份/一起删。
+SNAPSHOT_DEFAULT = ROOT / "data" / "site_probe.json"
 
 #: 视为"资源文件"的扩展名 —— 用来把输入的 URL 分成「资源直链」与「页面 URL」两类。
 IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "heic"}
@@ -413,18 +442,110 @@ def page_tail_evidence(page_urls, gid):
 #: 这些状态码说明"不是这条 URL 的问题, 而是我们被挡在门外了" —— 值得换指纹再试一次。
 _REACH_RETRY_STATUS = (401, 403, 406, 429, 503)
 
+#: Cloudflare 挑战页的指纹。命中任何一个就说明"我们被当成爬虫挡在 JS 挑战前面" ——
+#: 这不是请求头写得不像, 而是 TLS/JS 指纹层面的拦截。
+_CF_MARKERS = (
+    "just a moment", "cf-mitigated", "challenge-platform", "__cf_chl",
+    "cf-chl-", "attention required",
+)
+
+
+def sniff(session, url, headers, timeout=None, limit=1024):
+    """GET 前 `limit` 个字节就断开 —— 只为看清"被挡在门外时长什么样"。
+
+    与 `head()` 一样, 失败返回 `(None, None, b"")`, **绝不当成"不存在"**。
+    只读前 1KB: 判定 403 的成因够用了, 没必要为一次诊断把整张图拖下来。
+    """
+    try:
+        with session.get(url, headers=headers, allow_redirects=True,
+                         timeout=timeout or settings.request_timeout,
+                         stream=True) as resp:
+            body = b""
+            for chunk in resp.iter_content(512):
+                if chunk:
+                    body += chunk
+                if len(body) >= limit:
+                    break
+            return resp.status_code, resp.headers, body[:limit]
+    except Exception:
+        return None, None, b""
+
+
+def diagnose_block(status, ctype, hdrs, body):
+    """把"被挡在门外"分成**处置完全不同**的几种; 返回 `(kind, why, fix)`。
+
+    这一步的价值全在"下一步该做什么"上 —— 下面几种成因的处置互不通用, 笼统说一句
+    "换个指纹试试"等于没说, 而 403 恰好是最常见也最容易误判的一种:
+
+        cf_challenge  CF 挑战页 / `cf-mitigated` -> TLS 或 JS 指纹被拦 -> **换指纹/走浏览器**
+        auth          401 / `WWW-Authenticate`   -> 要登录 -> **本就不适用**
+        rate          429                        -> 限速 -> **等一会儿或换出口**
+        ip_block      `text/plain` 的 403        -> IP 段/地域封禁 -> **代理**
+        down          5xx 且无 CF 特征            -> 站点自己挂了 -> **过会儿再看**
+        blocked       403/406 但看不出成因        -> 按成本从低到高试
+        unknown       其它
+
+    ⚠️ `ip_block` 与 `cf_challenge` 长得像但处置相反: 2026-09-23 复测 `img.xchina.io`,
+    从这台机器整段 403 且正文是 `text/plain`, **换 TLS 指纹与浏览器 UA 都没有用** ——
+    那是出口 IP 被挡, 换指纹只是白跑一次。把它们混成一条建议, 用户就会照着错的那条
+    一直试下去。
+    """
+    h = {k.lower(): v for k, v in (hdrs or {}).items()}
+    low = (body or b"")[:1024].decode("utf-8", "ignore").lower()
+    ctype = (ctype or "").lower()
+    # ⚠️ 判的是**响应头在不在**, 不是拿值去搜 "mitigated" —— 真头是
+    # `cf-mitigated: challenge`, 值里根本没有 "mitigated" 这个词, 按值搜会**恒为假**,
+    # 于是 CF 挑战被错判成 "blocked"(给的建议正好相反: 该换指纹却说"都试试")。
+    cf_mitigated = "cf-mitigated" in h
+
+    if any(m in low for m in _CF_MARKERS) or cf_mitigated:
+        return ("cf_challenge",
+                "Cloudflare 挑战页(正文/响应头里有 `just a moment`、`cf-mitigated` 之类标记)",
+                "换浏览器 TLS 指纹(`--impersonate chrome`); 还不行就走 `scripts/probe.py` "
+                "让真浏览器打开 —— 需要跑 JS 的挑战, 裸 HTTP 永远过不去")
+
+    if status == 401 or "www-authenticate" in h:
+        return ("auth",
+                "要登录(401 / WWW-Authenticate)",
+                "这条路本就不适用: 本项目不做登录态采集。换一个公开的下载点, 或换站点")
+
+    if status == 429:
+        return ("rate",
+                "被限速(429)",
+                "等几分钟再跑; 或 `--proxy` 换一个出口 IP")
+
+    if status == 403 and ctype.startswith("text/plain"):
+        return ("ip_block",
+                "403 且正文是 `text/plain` —— 典型的 **IP 段/地域封禁**(不是 WAF 挑战页)",
+                "`--proxy` 换出口。**换 TLS 指纹对这种没用**(2026-09-23 在 xchina 上实测: "
+                "裸 curl、浏览器 UA、`impersonate=chrome` 全是同一个 `text/plain` 403)")
+
+    if status and 500 <= status < 600:
+        return ("down",
+                "站点自己返回 %s" % status,
+                "过几分钟再跑; 持续这样就先去浏览器确认站点是否正常")
+
+    if status in (403, 406):
+        return ("blocked",
+                "%s, 但看不出具体成因(既不是 CF 挑战页, 也不是 text/plain 封禁)" % status,
+                "按成本从低到高试: ① `--impersonate chrome` ② `--proxy` "
+                "③ 浏览器里打开这条直链确认它还有效")
+
+    return ("unknown", "状态码 %s, 无法归类" % (status,),
+            "先在浏览器里打开这条直链, 确认它本身还有效(签名过期 / 图集被删都会这样)")
+
 
 def probe_reachability(session, info, timeout):
-    """**第 0 段**: 先确认"你给的那条直链"到底通不通, 不通就早退。
+    """**第 0 段**: 先确认"你给的那条直链"到底通不通; 不通就**分型**并早退。
 
-    判据是 **200 + 媒体类型**, 不是"状态码是 200" —— 本站项目在这一点上吃过大亏:
-    站点对拿不到的图集照样答 `200`, 只是 Content-Type 变成 `text/html`。只看状态码
-    会把"完全拿不到"读成"一切正常"。
+    判据是 **200 + 媒体类型**, 不是"状态码是 200" —— 本项目的头号教训: 站点对拿不到
+    的图集照样答 `200`, 只是 Content-Type 变成 `text/html`。只看状态码会把"完全拿不到"
+    读成"一切正常"。
 
-    早退的回报是**省掉四次白跑**: 直链不通时 ②③④⑤ 加起来会发二十来个请求, 然后
-    给出一屏没有意义的数字 —— 而真正该做的第一件事(解决可达性)被埋在最下面。
+    早退的回报是**省掉四次白跑**: 直链不通时 ②③④⑤ 加起来会发二十来个请求, 然后给出一
+    屏没有意义的数字 —— 而真正该做的第一件事(解决可达性)被埋在最下面。
 
-    返回 (ok, status, ctype)。
+    返回 `(ok, status, ctype, diag)`; `diag` 通过时为 None。
     """
     print("== 第 0 段 直链可达性 ==")
     headers = {"User-Agent": settings.user_agent, "Accept": accept_for(info["ext"])}
@@ -433,9 +554,34 @@ def probe_reachability(session, info, timeout):
     ok = status == 200 and ct.startswith(ctype_for(info["ext"]))
     print("  %s" % short(info["url"], 68))
     print("      -> %s  %s" % (status, ct or "(无 Content-Type)"))
-    print("  => %s" % ("通过: 直链能拿到资源, 后面的探测才有意义"
-                      if ok else "不通 —— 后面的四项**都没跑**(它们全都要先能拿到资源)"))
-    return ok, status, ct
+    if ok:
+        print("  => 通过: 直链能拿到资源, 后面的探测才有意义")
+        return True, status, ct, None
+
+    # 不通 -> 花一次 GET 把"长什么样"看清楚。不看清就只能给笼统建议, 而 403 的几种
+    # 成因处置完全相反(换指纹 / 换 IP / 加 Referer / 根本不该做)。
+    g_status, g_hdrs, body = sniff(session, info["url"], headers, timeout)
+    diag = diagnose_block(g_status or status, ct, g_hdrs or hdrs, body)
+
+    if status in (403, 406):
+        # 「带上 Referer 就通」是**更强的证据** —— 它直接给出了能让它通过的请求头, 比
+        # "看起来像 IP 封禁"这种推断硬。所以真测一次, 测到就覆盖上面的分类。
+        u = urlparse(info["url"])
+        ref = "%s://%s/" % (u.scheme, u.netloc)
+        r_status, r_hdrs = head(session, info["url"], dict(headers, Referer=ref), timeout)
+        r_ct = (r_hdrs.get("Content-Type") or "").lower() if r_hdrs else ""
+        if r_status == 200 and r_ct.startswith(ctype_for(info["ext"])):
+            diag = ("referer",
+                    "带上 `Referer: %s` 就通了 —— 这是**防盗链**(裸请求没有来源页)" % ref,
+                    "⚠️ 基类目前**不带 Referer**(`gallery_base` 里没有这个字段): 要么给 "
+                    "`GallerySite` 加一个 referer 声明, 要么单独记一笔待办 —— "
+                    "别以为换个指纹能解决")
+            print("      (带 Referer 重试: %s %s)" % (r_status, r_ct or "-"))
+
+    print("  => 不通 —— 后面的四项**都没跑**(它们全都要先能拿到资源)")
+    print("  => 成因: [%s] %s" % (diag[0], diag[1]))
+    print("  => 下一步: %s" % diag[2])
+    return False, status, ct, diag
 
 
 def probe_existence(session, info, scan, over, timeout):
@@ -521,7 +667,9 @@ def probe_existence(session, info, scan, over, timeout):
               "①图集本来就只有 1 张; ②每页文件名各不相同(改序号拼不出下一页, 例如 "
               "`/data/<图集hash>/1-<该页内容哈希>.png`); ③序号不从 1 开始。"
               "再给一条**不同序号**的直链就能当场分辨, 别急着照抄草稿。")
-    return verdict, rows
+    # 越界对照的原始状态也带出去: 快照里要有"判定规则"(靠状态码还是靠 Content-Type),
+    # `drift_check.py` 正是靠它的变化来发现站点改版的。
+    return verdict, rows, (o_status, o_ct)
 
 
 def probe_accept(session, info, timeout):
@@ -1027,6 +1175,176 @@ def report_draft_selfcheck(text):
 
 
 # --------------------------------------------------------------------------
+# 快照(给 drift_check.py 比对) 与冒烟(验"能落地")
+# --------------------------------------------------------------------------
+
+
+def accept_verdict(got):
+    """从 ② 的三档对照里读出结论: `required` / `not-required` / `unknown`。
+
+    单独抽成函数是因为**快照要它**: `Accept` 从"无所谓"变成"必须显式带 `image/*`"会让
+    所有请求一起 403 —— 那是站点侧的一次静默改版, 而它的现象与"整站挂了"无法区分。
+    """
+    if not got or len(got) < 3:
+        return "unknown"
+    no_accept, with_accept = got[0][1], got[2][1]
+    if no_accept != 200 and with_accept == 200:
+        return "required"
+    if no_accept == 200 and with_accept == 200:
+        return "not-required"
+    return "unknown"
+
+
+def build_snapshot(info, ok, status, ctype, ex_rows, over, accept, hits,
+                   patterns, resolution, page_bases, seq_hits):
+    """把本次实测压成一份**机器可读**快照。
+
+    只放"变了会不会导致静默少采 / 采空"的字段, 不放报告正文 —— 它是给程序比对的。
+    字段选择本身就是判据: `reach_*` / `exists_*` / `over_*` / `accept` 这四组一旦变,
+    就足以让"任务 success 但 0 个资源"重新出现, 所以 `drift_check` 对它们报**硬漂移**;
+    其余(variants / page_bases / id_patterns)只报**软漂移**。
+    """
+    ov = over or (None, None)
+    return {
+        "host": info["host"],
+        "base": info["base"],
+        "base_path": info.get("base_path", ""),
+        "gid": info["gid"],
+        "seq_format": info.get("seq_format"),
+        "suffix": info.get("suffix"),
+        "opaque_suffix": bool(info.get("opaque_suffix")),
+        # 「进得去吗」—— 最硬的一格
+        "reachable": bool(ok),
+        "reach_status": status,
+        "reach_ctype": ctype or "",
+        # 序号连不连续, 压成 "TTTTTF" 这样的形状串
+        "exists_shape": "".join("T" if r[4] else "F" for r in (ex_rows or [])),
+        "exists_hits": seq_hits,
+        # 「靠状态码还是靠 Content-Type 判定存在」—— 它变了就是站点改版
+        "over_status": ov[0],
+        "over_ctype": ov[1] or "",
+        # Accept 是否被校验
+        "accept": accept_verdict(accept),
+        # 下面是线索类
+        "variants": [h["suffix"] for h in (hits or [])],
+        "id_patterns": [list(p) for p in (patterns or [])],
+        "id_resolution": {u: v for u, v in (resolution or {}).items()},
+        "page_bases": list(page_bases or []),
+    }
+
+
+def write_snapshot(path, site_key, snap):
+    """把快照按站点名合并进 `path`; 返回是否真的落盘。
+
+    ⚠️ 走 `core.jsonstore.JsonStore`, 不自己 `write_text` —— 那个模块存在的全部理由就是
+    这类小 JSON 状态文件的四条并发纪律(原子替换 / 可重入锁 / 退避重试 / 失败留痕), 而
+    本项目已经因为"手写第二遍"静默丢过一半数据。这里虽然是个 CLI, 但用户完全可能一边
+    跑巡检、一边跑探测。
+    """
+    store = JsonStore(lambda: str(path))
+
+    def _mut(d):
+        d[site_key] = snap
+        return d
+
+    _data, wrote = store.update(_mut)
+    return wrote
+
+
+def _read_capped(resp, cap):
+    """读响应正文; 声明的长度就超过 `cap` 时直接放弃。返回 `(bytes, 是否截断)` 或 None。"""
+    declared = resp.headers.get("Content-Length")
+    try:
+        if declared and int(declared) > cap:
+            return None
+    except (TypeError, ValueError):
+        pass
+    buf = b""
+    for chunk in resp.iter_content(65536):
+        if chunk:
+            buf += chunk
+        if len(buf) > cap:
+            return buf, True
+    return buf, False
+
+
+def probe_smoke(session, info, urls, timeout, out_dir=None):
+    """`--smoke`: 拿已探通的直链**真下一张**, 验「能落地」。
+
+    HEAD 通只说明"这个 URL 有东西"。从"有东西"到"任务落盘一张图"之间还隔着四道关卡,
+    每一道都能把结果变成 0 个资源, 而它们此前**都不在探针的视野里**:
+
+        ① `resolve_collector` 认领 —— 没人认领就落到通用采集器, 行为完全不同
+        ② `filters.match_resource` —— "什么是有效资源"的**唯一定义**
+        ③ 落盘(命名 / 重名消解 / `.part` 原子替换) —— 由 verify_output.py 那 40 项覆盖
+        ④ 内容是不是**真的**图片(魔术字节) —— Content-Type 撒过谎的站点是有的
+
+    这里覆盖 ①②④。返回 `(rows, ok_n)`, rows 每项为 `(url, ok, 细节)`。
+
+    ⚠️ 会真的下载, 所以只在用户显式 `--smoke` 时才调用。单张上限 64MB, 超了只记一笔 ——
+    探针没有理由为一次冒烟拖一个几百 MB 的文件下来。
+    """
+    print("\n== 冒烟: 真下一张, 验「能落地」 ==")
+    if not urls:
+        print("  (没有已探通的直链可试 —— 先让 ① 有命中)")
+        return [], 0
+    dest = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="uwc-smoke-"))
+    dest.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i, u in enumerate(urls[:3]):
+        ext = (u.split("?")[0].rsplit(".", 1)[-1] or "").lower()
+        rtype = "video" if ext in VIDEO_EXT else "image"
+        try:
+            claim = resolve_collector(u)
+            who, auto = claim.get("collector"), claim.get("auto")
+        except Exception as e:
+            who, auto = "?", False
+            print("      (认领解析失败: %s: %s)" % (type(e).__name__, e))
+        http_headers = {"User-Agent": settings.user_agent, "Accept": accept_for(ext)}
+        detail, ok = "", False
+        try:
+            with session.get(u, headers=http_headers, allow_redirects=True,
+                             timeout=timeout or settings.request_timeout,
+                             stream=True) as resp:
+                if resp.status_code != 200:
+                    detail = "HTTP %s" % resp.status_code
+                else:
+                    got = _read_capped(resp, 64 * 1024 * 1024)
+                    if got is None or got[1]:
+                        detail = "超过 64MB 上限, 跳过下载"
+                    else:
+                        data = got[0]
+                        fp = dest / ("smoke_%02d.%s" % (i + 1, ext or "bin"))
+                        fp.write_bytes(data)
+                        sha = hashlib.sha256(data).hexdigest()
+                        dims = imageinfo.dimensions_from_bytes(data)
+                        ok = True
+                        detail = ("%d bytes  sha %s  %s  落盘 %s"
+                                  % (len(data), sha[:12],
+                                     imageinfo.fmt_dimensions(dims) if dims
+                                     else "尺寸解析不出",
+                                     fp.name))
+                        reason = Filters().match_resource(rtype, u, len(data))
+                        if reason:
+                            ok = False
+                            detail += "  !! 被 match_resource 拦下: %s" % reason
+        except Exception as e:
+            detail = "%s: %s" % (type(e).__name__, e)
+        rows.append((u, ok, detail))
+        print("  %s %s" % ("ok " if ok else "!! ", short(u, 62)))
+        print("      认领: %s%s" % (who, "" if auto else "  (**没有专用采集器认领**)"))
+        print("      %s" % detail)
+    ok_n = sum(1 for _u, o, _d in rows if o)
+    print("  => 冒烟 %d/%d 通过" % (ok_n, len(rows)))
+    if ok_n == 0:
+        print("  => !! 一张都没下来 —— 探针说「能拿到」的东西拿不到, 先别急着写声明。")
+    elif ok_n < len(rows):
+        print("  => 部分失败: 上面 `!!` 那几条要单独看清 —— 序号空间里可能只有一部分")
+        print("     序号真的有图(见 ① 的「空洞」提示)。")
+    return rows, ok_n
+
+
+# --------------------------------------------------------------------------
 
 
 def main():
@@ -1039,7 +1357,25 @@ def main():
     ap.add_argument("--proxy", default=None)
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--out", default="", help="把草稿写成文件")
+    ap.add_argument("--json", nargs="?", const=str(SNAPSHOT_DEFAULT), default="",
+                    help="把实测结论写成快照 JSON(默认 data/site_probe.json)")
+    ap.add_argument("--smoke", action="store_true",
+                    help="拿已探通的直链真下一张, 验「能落地」(会真的下载)")
+    ap.add_argument("--smoke-dir", default="", help="冒烟下载的落脚目录")
     args = ap.parse_args()
+
+    # 快照按"出口"落盘 —— 拒绝出草稿、直链不通**都是**要记下来的实测结论。尤其"不通"
+    # 那一格, 它正是 drift_check 最想知道的漂移。所以每个出口都走 finish()。
+    snap = {}
+    snap_path = args.json
+    site_key = ""
+
+    def finish(code):
+        if snap_path and snap:
+            wrote = write_snapshot(snap_path, site_key, snap)
+            print("\n快照已写入 %s%s"
+                  % (snap_path, "" if wrote else "  !! 落盘失败(见 core/jsonstore)"))
+        sys.exit(code)
 
     if not args.urls:
         print(__doc__)
@@ -1062,7 +1398,13 @@ def main():
         print("!! 给的直链里文件名**不以数字序号开头** —— 这个站不是「序号枚举型」,")
         print("   本脚本(以及 SequenceGallerySpider)不适用。例如 pexels 一个 ID 只有")
         print("   一张图(pexels-photo-12345.jpeg), 它的资源来自页面/API 解析。")
+        print("   那一类走 `scripts/probe_feed.py`(探分页/端点/密钥, 不是序号)。")
         sys.exit(2)
+
+    site_key = site_name(info["host"])
+    # 先把"只看直链就能填的那几格"放进快照。直链不通时会从这里 exit, 而那一格
+    # (`reachable: False`) 恰是 drift_check 最想看到的漂移。
+    snap.update(build_snapshot(info, False, None, "", (), None, (), (), (), {}, (), 0))
 
     session, transport = make_session(args.proxy, args.impersonate or None)
 
@@ -1076,45 +1418,77 @@ def main():
           % (info["base"], info["gid"], info["seq_format"], info["suffix"]))
     print()
 
-    ok, status, _ct = probe_reachability(session, info, args.timeout)
+    ok, status, ct_seen, diag = probe_reachability(session, info, args.timeout)
     if not ok and not args.impersonate and status in _REACH_RETRY_STATUS:
-        # "站点在 Cloudflare 后面"是最常见的一种"谁都没做错、就是进不去"。既然换指纹
-        # 这条现成的路就在手边, 就不该让用户先看见 403、再手动加参数重跑一遍 ——
-        # 中间那一步纯属浪费(2026-09-23 在 xchina 上就是这么手动重跑的)。
-        print("  => %s: 自动改用 chrome TLS 指纹重试一次(curl-cffi)" % status)
-        alt_session, alt_transport = make_session(args.proxy, "chrome")
-        ok2, status2, _ct2 = probe_reachability(alt_session, info, args.timeout)
-        if ok2 or status2 != status:
-            try:
-                session.close()
-            except Exception:
-                pass
-            session, transport = alt_session, alt_transport
-            ok, status = ok2, status2
+        if diag and diag[0] == "ip_block":
+            # 换指纹只对**一部分**成因有用: CF 挑战页有用, 而 IP 段封禁(-- 上面判出来的
+            # `text/plain` 403)是白跑一次。自动重试的前提是"这条路的收益 > 成本", 对
+            # IP 封禁不成立 —— 那就该把它换成一条**正确的**建议, 而不是多一次请求。
+            print("  => 成因是 IP 段封禁 —— 换指纹对它**没用**, 所以不自动重试; "
+                  "要的是 `--proxy`(见上面的下一步)")
         else:
-            try:
-                alt_session.close()
-            except Exception:
-                pass
+            # "站点在 Cloudflare 后面"是最常见的一种"谁都没做错、就是进不去"。既然换
+            # 指纹这条现成的路就在手边, 就不该让用户先看见 403、再手动加参数重跑一遍 ——
+            # 中间那一步纯属浪费(2026-09-23 在 xchina 上就是这么手动重跑的)。
+            print("  => %s: 自动改用 chrome TLS 指纹重试一次(curl-cffi)" % status)
+            alt_session, alt_transport = make_session(args.proxy, "chrome")
+            ok2, status2, ct2, diag2 = probe_reachability(alt_session, info, args.timeout)
+            if ok2 or status2 != status:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session, transport = alt_session, alt_transport
+                ok, status, ct_seen, diag = ok2, status2, ct2, diag2
+            else:
+                try:
+                    alt_session.close()
+                except Exception:
+                    pass
+    snap.update(build_snapshot(info, ok, status, ct_seen, (), None, (), (), (), {}, (), 0))
     if not ok:
-        sys.exit(refuse(
+        # 拒绝出口里**必须**带成因分型 —— 那是这一步唯一有价值的信息。四种成因的处置
+        # 互不通用(换指纹 / 换 IP / 加 Referer / 根本不该做), 给一份通用的"都试试"清单
+        # 等于让用户照着错的那条一直试下去。
+        kind = diag[0] if diag else ""
+        if kind == "auth":
+            nxt = ["  !! 这条直链**要登录** —— 本项目不做登录态采集: 换一个公开的下载点,",
+                   "     或换站点。换指纹、换 IP 都解决不了。"]
+        elif kind == "down":
+            nxt = ["  !! 站点自己返回 5xx —— 过几分钟直接重跑, **不用改任何参数**。"]
+        elif kind == "referer":
+            nxt = ["  !! 这是**防盗链**: 带上 Referer 就通。基类目前不带 Referer,",
+                   "     要么给 `GallerySite` 加一个 referer 字段, 要么先记一笔待办。"]
+        elif kind == "ip_block":
+            nxt = ["  !! 出口 IP 被挡 —— 换 TLS 指纹对这条**没用**, 只有下面第 1 条有用。"]
+        else:
+            nxt = []
+        finish(refuse(
             "你给的那条直链**本身没探通**",
             lines=[
-                "所以后面的四项(请求头 / 页面 / 变体 / URL 形态)**都没跑** —— 它们全都",
+                "成因见上面第 0 段的 `[分型]` 那一行 —— 那是这一步唯一有价值的信息。",
+                "",
+                "所以后面的四项(请求头 / 页面 / 变体 / URL 形态)**都没跑**: 它们全都",
                 "要先能拿到资源, 跑了也只是给出一屏没有意义的数字。",
                 "",
-                "下一步按顺序试(上面标了「自动」的就不必再手工跑一遍):",
-                "  1. --proxy <你的代理>      站点可能只对特定地区放行",
-                "  2. --impersonate firefox   换一个指纹(curl-cffi 支持 chrome/firefox/safari/edge)",
+                "下一步(上面标了「自动」的就不必再手工跑一遍):",
+                "  1. --proxy <你的代理>      站点可能只对特定地区/IP 放行(IP 段封禁只有这条有用)",
+                "  2. --impersonate firefox   换一个指纹(只对 CF 挑战页有用)",
                 "  3. 浏览器里打开这条直链, 确认它**本身**还有效(签名过期/图集删了都会这样)",
-            ]))
+            ] + nxt))
 
-    _verdict, ex_rows = probe_existence(session, info, args.scan, args.over, args.timeout)
+    _verdict, ex_rows, over = probe_existence(session, info, args.scan, args.over,
+                                              args.timeout)
     seq_hits = sum(1 for r in ex_rows if r[4])
-    probe_accept(session, info, args.timeout)
+    accept_got = probe_accept(session, info, args.timeout)
     page_bases, page_suffixes = probe_page(session, pages, args.timeout)
     hits = probe_variants(session, info, args.timeout, page_suffixes)
     patterns, gid_re, bad_tail, resolution = probe_url_forms(args.urls, media, pages, info)
+
+    # 五段都跑完 -> 快照可以填满了。放在草稿门禁**之前**: 拒绝出草稿同样是要记下来的
+    # 实测结论(站点特征就是那个样子), 而快照的读者是 drift_check, 不是人。
+    snap.update(build_snapshot(info, ok, status, ct_seen, ex_rows, over, accept_got,
+                               hits, patterns, resolution, page_bases, seq_hits))
 
     if info["opaque_suffix"]:
         # 文件名以数字开头、但序号之后是内容哈希 —— 与 pexels 同类, 只是更隐蔽。
@@ -1135,11 +1509,7 @@ def main():
         print("⚠️ 判据是启发式的(长度 ≥%d 或含 ≥16 位连续 hex)。若你确认这真的是"
               % _OPAQUE_MIN_LEN)
         print("   画质后缀, 把直链与站点说明发出来改判据 —— 但**不要**先照抄草稿。")
-        try:
-            session.close()
-        except Exception:
-            pass
-        sys.exit(2)
+        finish(2)
 
     draft = build_draft(info, media, pages, hits, patterns, gid_re, bad_tail,
                         page_bases, resolution, seq_hits)
@@ -1148,7 +1518,7 @@ def main():
         # 档 A 缺证据 -> 拒绝出草稿。这一步是**把特例升成规则**: `opaque_suffix`
         # 早就在这么干了, 但全文件只有它一处 —— 于是每遇到一个新形态都得再手写一个
         # if。现在凡是"URL 拼不出来"的字段缺实测, 都走同一个出口。
-        sys.exit(refuse("档 A 字段缺实测证据", draft.blocking))
+        finish(refuse("档 A 字段缺实测证据", draft.blocking))
     if draft.advisory:
         print("\n" + "-" * 74)
         print("注意(不阻断出草稿, 但也别当没看见):")
@@ -1165,14 +1535,36 @@ def main():
 
     report_draft_selfcheck(draft)
 
+    if args.smoke:
+        seq = info["seq"] or 1
+        fmt = info["seq_format"] or "{seq:05d}"
+        smoke_urls = ["%s/%s/%s%s" % (info["base"], info["gid"], fmt.format(seq=seq),
+                                      h["suffix"]) for h in hits]
+        smoke_urls = smoke_urls or list(media)
+        rows, ok_n = probe_smoke(session, info, smoke_urls, args.timeout,
+                                 args.smoke_dir or None)
+        snap["smoke_ok"] = ok_n
+        snap["smoke_total"] = len(rows)
+
     print("=" * 74)
     print("接下来")
     print("=" * 74)
+    print("先看清一件事: 探针能给的结论**只到「拿得到」为止** —— 上面五段全是站点特征。")
+    print()
+    print("手动三步:")
     print("1. 存成 backend/collectors/%s/gallery.py" % name_for_path(info["host"]))
     print("2. 在 backend/collectors/__init__.py 末尾 import 它(否则 @register 不执行)")
-    print("3. python scripts/selfcheck.py    # 声明自检: 样本 -> gid 无冲突")
-    print("4. 加一条测试: check_site(site) 必须返回空列表")
-    print("5. 用真实相册跑一次, 核对落盘文件的魔术字节(图片 \\xff\\xd8\\xff)")
+    print("3. 加一条测试: check_site(site) 必须返回空列表")
+    print()
+    print("门禁三步:")
+    print("   python scripts/selfcheck.py                    # 声明自洽(纯离线)")
+    print("   python scripts/add_site.py --verify %s  # 认领 + 冒烟 + 落盘"
+          % name_for_path(info["host"]))
+    print("   python scripts/probe_site.py --smoke <直链>    # 只验「能落地」那一格")
+    print()
+    print("之后: python scripts/drift_check.py 会拿这次写的快照跟线上**逐项比对** ——")
+    print("      站点改版是本项目的头号静默故障源, 而它是唯一能在用户报障**之前**")
+    print("      发现的手段(`selfcheck.py` 纯离线, `cdn_profile` 要等到已经采不到)。")
     print()
     print("!! 的行都是「证据与预期不符」的地方, 别跳过。")
     print("!! 探针跑不出 xchina 那五项已知结论 = 探针自身有 bug(见本文件顶部)。")
@@ -1181,10 +1573,7 @@ def main():
         Path(args.out).write_text(draft + "\n", encoding="utf-8", newline="")
         print("\n草稿已写入 %s" % args.out)
 
-    try:
-        session.close()
-    except Exception:
-        pass
+    finish(0)
 
 
 def name_for_path(host):

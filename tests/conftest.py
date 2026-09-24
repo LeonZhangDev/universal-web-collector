@@ -33,6 +33,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))     # 让 isolation 可
 
 import isolation  # noqa: E402
 
+import core.task_manager as _tm  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _muzzle_import_time_singleton():
+    """导入期就存在的那只 TaskManager 单例, 在测试里必须**闭嘴**。
+
+    `backend/core/task_manager.py` 末尾有一句 `task_manager = TaskManager()` ——
+    生产环境需要它(api 层直接用它提交任务, main.py 的 lifespan 靠它)。但只要有人
+    import 了这个模块, 它的**两个后台线程就活了**, 而且它们干活时读的是
+    **当前的 `database.DB_PATH`** —— 测试的库是每条用例现换的。于是:
+
+      · 调度线程扫当前的库, 把用例刚启用的订阅源"顺手跑掉"并回写 `next_run`
+        (症状: `due_watches()` 刚从 0 变 1, 一转眼又变回 0)
+      · 用例里的活动任务被它当成自己的, 在**单例**的 `_active` 里留下条目; 之后
+        别条用例的看门狗问 `_owned_by_any_manager(tid)` 得到 True, 就不敢收那个
+        tid 的任务 —— 而 `tid` 在小库上从 1 重新数, **跨用例撞号**
+        (症状: 心跳 99999 秒没跳了, 却判不出死活)
+
+    症状全是"**单跑绿、全跑红、重跑又绿**", 与 conftest 顶部记的那两轮同型 ——
+    只是这次的污染源不是磁盘上的状态文件, 而是**一条进程内线程**加**一个跨用例
+    复用的 dict**。所以隔离清单管不到它: `isolation.py` 登记的是路径, 不是线程。
+
+    ⚠️ 只停**后台循环**, 不动方法本身 —— 有用例直接调
+    `tm.task_manager._final_status` / `.submit_resource`, 那些是同步调用, 与循环无关。
+    另外把它 `_active` 的增删在用例结束后抹平, 免得下一个用例又撞号。
+    """
+    mgr = _tm.task_manager
+    mgr._watchdog_stop.set()
+    mgr._scheduler_stop.set()
+    with mgr._active_lock:
+        before = dict(mgr._active)
+    yield
+    with mgr._active_lock:
+        mgr._active.clear()
+        mgr._active.update(before)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_shared_state(tmp_path, monkeypatch):

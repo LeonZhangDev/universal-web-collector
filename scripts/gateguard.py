@@ -58,6 +58,10 @@ from gate import Gate, problem  # noqa: E402
 SKIP_DIRS = {
     ".git", ".workbuddy", "node_modules", "__pycache__", ".venv", "dist",
     ".pytest_cache", "downloads", "data", "browser_state",
+    # git worktree 的检出目录: 它**自己就是一个仓库**(有自己的 index), 让本仓库的
+    # 门禁去判另一个分支的旧代码, 既没有意义又会在本机刷出上百条噪音(CI 上没有
+    # 这个目录, 所以它从来不影响 CI 的红绿 —— 加进来只会让本机看得清)。
+    ".worktrees",
 }
 
 #: `with <某个东西>.get(...)` 这种写法: `requests` 下能用, `curl_cffi` 下抛
@@ -108,12 +112,42 @@ def tracked_files(root):
                 return [Path(root) / n for n in names if n]
         except (OSError, subprocess.SubprocessError):
             pass
+    return _walk_all(root)
+
+
+def _walk_all(root):
+    """磁盘上除 `SKIP_DIRS` 外的所有文件(不管 git 跟不跟踪)。"""
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for f in filenames:
             out.append(Path(dirpath) / f)
     return out
+
+
+def untracked_sources(root):
+    """磁盘上有、但 **git 没跟踪** 的 `.py` 文件(相对路径, 升序)。
+
+    ⚠️ 门禁按 `git ls-files` 扫, 所以**一个新文件只要没 `git add`, 这次就根本没被
+    验到** —— 表现为"本机六闸全绿、推上去 CI 红", 而红的正是这个新文件本身。
+    (V44 就栽在这上面: 新增的测试文件里有 2 个没用的 import, 本机门禁看不见它。)
+
+    它**不算红**: 临时脚本也会落在这里, 红了就是假红 —— 而假红的下场通常是被
+    加进豁免清单。但它必须**看得见**: "没验到"和"验过了没问题"不能是同一个输出。
+    """
+    tracked = set()
+    for p in tracked_files(root):
+        try:
+            tracked.add(p.relative_to(root).as_posix())
+        except ValueError:
+            tracked.add(str(p))
+    out = []
+    for p in _walk_all(root):
+        if p.suffix != ".py" or _skipped(p, root):
+            continue
+        if _rel(p, root) not in tracked:
+            out.append(_rel(p, root))
+    return sorted(out)
 
 
 def _skipped(path, root):
@@ -790,6 +824,17 @@ def main(argv=None):
     print("=" * 74)
     print("仓库门禁: %s" % root)
     print("=" * 74)
+    unseen = untracked_sources(root)
+    if unseen:
+        print("!! %d 个未跟踪的 .py 文件 —— 门禁只扫 git 跟踪的文件, 它们**没被验到**:"
+              % len(unseen))
+        for r in unseen[:20]:
+            print("     " + r)
+        if len(unseen) > 20:
+            print("     … 还有 %d 个" % (len(unseen) - 20))
+        print("   跑门禁前先 `git add` 新文件(本机全绿 / CI 红的常见成因);")
+        print("   只是临时脚本的话, 删掉或加进忽略即可 —— 这一条**不计入红绿**。")
+        print()
     total = 0
     for name, fn in GATES:
         if args.only and args.only != name:

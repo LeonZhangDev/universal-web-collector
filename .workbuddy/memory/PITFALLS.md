@@ -1494,3 +1494,52 @@ V41 把"评分"归到"需要'属性的属性'语义"那一档而推迟; V42 证�
 全量跑完，`test_gateguard.py::test_the_readme_case_count_matches_what_pytest_really_collects`
 **又红了**: 实测收集 **1367**，README 只写了 [1341, 1342] —— **是我自己刚改完就忘了改**。
 两次(§V42 / 本轮)都是 R-CI-1 抓的。结论没变: 数字必须是门禁算出来的，不能靠自觉。
+
+### 第 29 条：门禁只扫 git 跟踪的文件 —— 新文件没入库就是"没验到"
+
+`gateguard.tracked_files()` 按 `git ls-files` 扫，设计理由是"判据是仓库里有什么，
+不是我的工作区有什么"(否则一个未跟踪的临时文件就能改变红绿)。但它有**另一面**:
+
+> 一个刚写好的新文件在 `git add` 之前**根本不在名单里** —— 本机那句"六闸全绿"
+> 其实是**没验到它**。
+
+V44 的真实现象: 本机六闸全绿 → 推上去 CI 的 backend job 红 1 条
+`test_the_real_repo_has_no_structural_problems`:
+
+```
+AssertionError: 结构门禁红了: {'unused-imports': ['unused-import', 'unused-import']}
+```
+
+红的正是新加的 `tests/test_features_v44.py` 里 2 个残留 import(`os` / `subprocess` ——
+删掉一条"逻辑本来就该报错"的用例后剩下的)。两处判据都是纯文本正则、与平台无关，
+所以差异**只可能来自文件集合** —— 据此定位到 `tracked_files`(本机跑门禁时新文件
+还没 `git add`；CI 上它已在 index 里)。
+
+**纪律**: 跑门禁之前先 `git add` 新文件。配套已落地的三处:
+
+| 补了什么 | 为什么 |
+| --- | --- |
+| `test_the_real_repo_has_no_structural_problems` 报错带 `p.message` | 见下面同族 K |
+| `gateguard.untracked_sources()` + CLI 提示 | "没验到"必须看得见: **有条数、点名到文件**，但**不计入红绿** |
+| `SKIP_DIRS` 加 `.worktrees` | git worktree 有自己的 index；让本仓库门禁去判另一个分支的旧代码没有意义，且在本机刷出 102 条噪音(**CI 上没有这个目录**，所以不影响 CI 红绿) |
+
+`untracked_sources` 为什么**不算红**: 临时脚本也会落在里面，红了就是假红 —— 而假红
+的下场通常是"被加进豁免清单"(第 18 条)。要的是"看得见"，不是"挡住"。
+
+### 同族 K：判据挂代号 ≠ 报错不能带文案
+
+第 ⑨ 条说判据只能挂**代号**(假红都出在挂中文子串上)。这次补的是另一半:
+**报错要能定位**。原来只给 `p.kind`，于是 CI 上只看到
+`['unused-import', 'unused-import']` —— 哪两个文件得另写脚本复现才找得出来。
+
+判据 `assert not red` 仍然读代号；只是 `red[name]` 从 `[p.kind]` 改成
+`["%s: %s" % (p.kind, p)]`。**代号管"红不红"，文案管"哪里红"。**
+
+### 同族 L：往"文件末尾"追加前，先读到真正的末尾
+
+用 Edit 往末尾追加时只看了前 634 行就以为到头了 —— 插入点落在某个函数体的中间，
+把它的最后一行 `assert all(...)` 切给了新函数，于是新用例报
+`NameError: name 'files' is not defined`。
+
+判据: 追加后跑 `git diff HEAD -- <file>` 目视，**必须只有 `+` 没有 `-`**(除确实要改的
+那几行)。这是第 18 条"产出类改动最后目视完整输出"的同一族。

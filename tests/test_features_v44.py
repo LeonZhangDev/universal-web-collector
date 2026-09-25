@@ -26,8 +26,6 @@
 7. **没跑的闸不许算绿**(D1): `checked=0` 的闸 `ok=False` 且写明为什么没跑。
 """
 import json
-import os
-import subprocess
 import zipfile
 
 import pytest

@@ -11,6 +11,7 @@
 """
 
 import ast
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -576,7 +577,10 @@ def test_the_real_repo_has_no_structural_problems():
             continue
         gate = fn(ROOT)
         if not gate.ok:
-            red[name] = [p.kind for p in gate.effective_problems()]
+            # 判据挂**代号**(假红都出在挂中文文案上); 但**报错必须能定位** ——
+            # 只给 kind 的话, 红在 CI 上就得靠猜是哪一行(V44 这次就是这样:
+            # 只看到 `['unused-import', 'unused-import']`, 得另写脚本复现才找出来)。
+            red[name] = ["%s: %s" % (p.kind, p) for p in gate.effective_problems()]
     assert not red, "结构门禁红了: %r" % red
 
 
@@ -633,6 +637,50 @@ def test_tracked_files_comes_from_git_not_from_a_directory_walk():
     assert git.returncode == 0
     assert len(files) == len([x for x in git.stdout.splitlines() if x]) > 150
     assert all(f.is_absolute() for f in files)
+
+
+# --------------------------------------------------------------------------
+# "没验到"必须看得见: 未跟踪的 .py
+# --------------------------------------------------------------------------
+#
+# ⚠️ 上面那条的另一面: 门禁只扫 git 跟踪的文件, 于是**一个新文件在 `git add`
+# 之前根本没被验到**。V44 的真实现象是: 本机六闸全绿(新测试文件还没入库),
+# 推上去 CI 红 —— 红的正是那个新文件里 2 个没用的 import。
+# --------------------------------------------------------------------------
+
+
+def _real_repo(tmp_path):
+    """一个真 git 仓库(`tracked_files` 靠 `git ls-files`, 所以用例也得用真的)。"""
+    for args in (["init", "-q"], ["config", "user.email", "a@b.c"],
+                 ["config", "user.name", "t"]):
+        subprocess.run(["git"] + args, cwd=str(tmp_path), check=True,
+                       capture_output=True)
+    return tmp_path
+
+
+@pytest.mark.skipif(shutil.which("git") is None,
+                    reason="[deps:git] 需要 git 可执行文件")
+def test_untracked_sources_names_the_file_the_gate_never_looked_at(tmp_path):
+    root = _real_repo(tmp_path)
+    (root / "tracked.py").write_text("x = 1\n", encoding="utf-8", newline="")
+    (root / "new_file.py").write_text("import os\n", encoding="utf-8", newline="")
+    subprocess.run(["git", "add", "tracked.py"], cwd=str(root), check=True,
+                   capture_output=True)
+
+    got = gateguard.untracked_sources(root)
+    assert "new_file.py" in got, got        # 没被验到的要点名
+    assert "tracked.py" not in got, got     # 已入库的不该点名
+
+
+@pytest.mark.skipif(shutil.which("git") is None,
+                    reason="[deps:git] 需要 git 可执行文件")
+def test_untracked_sources_is_empty_when_everything_is_in_the_index(tmp_path):
+    root = _real_repo(tmp_path)
+    (root / "tracked.py").write_text("x = 1\n", encoding="utf-8", newline="")
+    subprocess.run(["git", "add", "tracked.py"], cwd=str(root), check=True,
+                   capture_output=True)
+
+    assert gateguard.untracked_sources(root) == []   # 0 就是 0, 不是"读不出来"
 
 
 @pytest.mark.parametrize("name", ["gate.py", "add_site.py", "gateguard.py"])

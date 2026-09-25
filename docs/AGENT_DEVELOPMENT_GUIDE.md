@@ -3823,7 +3823,7 @@ if checked == 0:
 | --- | --- |
 | `tests/test_local_albums.py`（新） | **86 项**(只读指纹 / AST 写调用扫描 / 越界五种 / 扫描口径 / 随机池不重叠不缺项 / 失效收藏 / 17 个接口 / 配置兜底 + V41 的排除模式 / 往年今日 / 重复标记 / 扫描对账) |
 | 前端构建 | `npm run build` 通过(92 modules)、`test:task-query` 通过 |
-| 全量 pytest | 本机 Windows 收集 **1398** → **1392 passed + 6 skipped**（V44 新增 `tests/test_features_v44.py` 31 项）；CI/Linux 收集 **1399**(差额仍是 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数) |
+| 全量 pytest | 本机 Windows 收集 **1400** → **1394 passed + 6 skipped**（V44 新增 `tests/test_features_v44.py` 31 项 + `test_gateguard.py` 2 项）；CI/Linux 收集 **1401**(差额仍是 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数) |
 
 ### 22.8 对标同类产品后吸收的四个能力（V41，2026-09-24 六）
 
@@ -4215,11 +4215,42 @@ V42 能把"名字与内容不符"**标**出来, 但标完之后用户没有下�
 | 项 | 结果 |
 | --- | --- |
 | `tests/test_features_v44.py`(新) | **31 项**(dry-run 默认值 / 真的改 / isobmff 不误改 / checked 计数 / 色系分档 / 读不出返回 None / 未知色系 400 / **count 与 list 口径** / 虚拟相册实时 / 导出不截断 / webhook 留痕与签名 / 没跑的闸不算绿) |
-| 全量 pytest | 本机收集 **1398** → 1392 passed + 6 skipped; CI/Linux **1399** |
-| 门禁 | `gateguard.py` 六闸全绿(16 / 3 / 133 / 5 / 138 / 185) |
+| 全量 pytest | 本机收集 **1400** → 1394 passed + 6 skipped; CI/Linux **1401** |
+| 门禁 | `gateguard.py` 六闸全绿(16 / 3 / 137 / 6 / 142 / 190) |
 | 前端 | `npm run build` 通过(92 modules)、`test:task-query` 通过 |
 
 ⚠️ 门禁**第三次**在同一个地方救场: 全量跑完当场红, 报"实测收集 1398, README
 只写了 [1367, 1368]"。三次(V42/V43/V44)都是同一条用例抓的 —— 数字必须门禁算。
+
+### 25.8 ⚠️ 门禁第四次救场: 本机全绿 / CI 红, 因为新文件还没入库
+
+推上去之后 CI 的 backend job 红了 1 条:
+
+```
+AssertionError: 结构门禁红了: {'unused-imports': ['unused-import', 'unused-import']}
+assert not {'unused-imports': ['unused-import', 'unused-import']}
+```
+
+而本机六闸是全绿的。两处判据都是纯文本正则(与平台无关), 所以差异只可能来自
+**扫到的文件集合** —— 根因是 `gateguard.tracked_files()` 按 `git ls-files` 扫:
+
+> 判据是"仓库里有什么", 不是"我的工作区有什么"。
+
+这句本来是防止"未跟踪的临时文件影响红绿", 但它有**另一面**: 一个刚写好的新
+文件在 `git add` 之前**根本不在名单里**, 于是本机门禁"验过了没问题"其实是
+**没验到**。这次红的正是新加的 `tests/test_features_v44.py` 里 2 个残留 import。
+
+定位过程本身也暴露了一个缺陷: 失败信息里只有 `p.kind`, 没有 `p.message`, 于是
+"哪两个文件"得另外写脚本复现才找得出来。两处都已补上:
+
+| 改了什么 | 为什么 |
+| --- | --- |
+| 删掉 `tests/test_features_v44.py` 里未使用的 `import os` / `import subprocess` | 真正的缺陷 |
+| `test_the_real_repo_has_no_structural_problems` 的报错带上 `p.message` | 判据仍挂**代号**(不挂文案), 但**报错要能定位** —— 只给 kind 就得靠猜 |
+| 新增 `gateguard.untracked_sources()` + CLI 提示 | "没验到"必须看得见。它有条数、点名到文件, 但**不计入红绿**(临时脚本也会落在里面, 红了就是假红, 而假红的下场通常是被加进豁免清单) |
+| `SKIP_DIRS` 加 `.worktrees` | git worktree 的检出目录有自己的 index, 让本仓库门禁去判另一个分支的旧代码没有意义, 且会在本机刷出上百条噪音(CI 上没有这个目录) |
+| 新增 2 条用例钉住 `untracked_sources` | 一正一反: 未跟踪的要点名、都在 index 里则必须是 `[]`(0 就是 0) |
+
+**纪律**: 跑门禁之前先 `git add` 新文件 —— 否则本机那句"全绿"不包含它们。
 
 

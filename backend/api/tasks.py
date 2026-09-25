@@ -22,8 +22,10 @@ from collectors.gallery_base import (
 )
 from core import database as db
 from core import events
+from core import exporter
 from core import layout
 from core import filekind
+from core import webhooks
 from core import mediacheck
 from core import partials
 from core import thumbs
@@ -65,6 +67,16 @@ from models.schemas import (
     LibraryRateIn,
     LibraryRateOut,
     LibraryReplayIn,
+    ColorsExtractOut,
+    ExportIn,
+    ExportOut,
+    GateResult,
+    GatesOut,
+    NormalizeIn,
+    NormalizeOut,
+    WebhookFireOut,
+    WebhookIn,
+    WebhookOut,
     LibraryReplayOut,
     LibrarySearchDeletedOut,
     LibrarySearchIn,
@@ -823,6 +835,10 @@ def resource_library(
         None, description="排序档位(取值见 /library/facets 的 sorts); 未知取值回 400"
     ),
     order: Optional[str] = Query("desc", description="asc / desc"),
+    color: Optional[str] = Query(
+        None,
+        description="按主色系筛选(取值见 /library/facets 的 colors); 未知取值回 400",
+    ),
 ):
     """跨任务资源库: 按相册 / 类型 / 标签 / 关键词浏览**已落盘**的产物。
 
@@ -835,17 +851,20 @@ def resource_library(
     而不是静默忽略: 静默忽略的表现是"点了没反应", 那比报错难查得多。
     """
     try:
+        # ⚠️ color 必须同时传给 count 与 list: 只传一处的话, 总数与页内容口径
+        # 不一致 —— 表现为"翻到最后一页数量对不上", 很难察觉。
         total = db.library_count(q=q, kind=kind, task_id=task_id, album=album,
                                  tag=tag, favorite=favorite,
                                  tag_children=tag_children,
-                                 min_rating=min_rating, special=special)
+                                 min_rating=min_rating, special=special,
+                                 color=color)
         offset = (page - 1) * page_size
         rows = db.library_list(
             q=q, kind=kind, task_id=task_id, album=album,
             limit=page_size, offset=offset, tag=tag, favorite=favorite,
             tag_children=tag_children,
             min_rating=min_rating, special=special,
-            sort=sort, order=order,
+            sort=sort, order=order, color=color,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2210,4 +2229,245 @@ def sse_events():
         gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ==========================================================================
+# V44: 文件头规范化 / 主色 / 导出 / 虚拟相册 / Webhook / 自检面板
+# ==========================================================================
+
+
+def _decorate_library_rows(rows):
+    """给资源行补上列表页要用的 `refs` / `tags`。
+
+    ⚠️ 两个都**批量取**: 逐行查的话一页 40 条就是 80 次往返, 而列表页是最高频的
+    接口 —— 这种 N+1 是最容易被写出来、也最难被察觉的一类慢。
+    """
+    refs = db.resource_refs_many([r["local_path"] for r in rows])
+    tagmap = db.tags_of([r["id"] for r in rows])
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["refs"] = refs.get(d.get("local_path"), 0)
+        d["tags"] = tagmap.get(d["id"], [])
+        d["favorite"] = bool(d.get("favorite"))
+        d["rating"] = int(d.get("rating") or 0)
+        items.append(d)
+    return items
+
+
+@router.post("/library/normalize", response_model=NormalizeOut)
+def library_normalize(payload: NormalizeIn):
+    """把"扩展名与文件头不符"的文件改成**文件头说的那个**扩展名。
+
+    V42 的 `/library/verify` 能把这类文件**标**出来, 但标出来之后用户没有下一步
+    动作 —— 只能自己去看、自己去改。这里补的就是那一步。
+
+    ⚠️ 默认 `dry_run=true`: 改名落到用户磁盘上且不可逆, 所以它和删除是同一档的
+    动作 —— 前端先把 `changed` 列出来, 用户确认后再带 `dry_run=false` 执行。
+
+    ⚠️ 只换扩展名不动主名(`00001.jpg` -> `00001.png`)。主名里的序号是用户
+    "按名字找文件"的唯一线索。
+    """
+    try:
+        res = db.normalize_resources(ids=payload.ids, dry_run=payload.dry_run,
+                                     limit=payload.limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return NormalizeOut(**res)
+
+
+@router.post("/library/colors/extract", response_model=ColorsExtractOut)
+def library_colors_extract(
+    limit: int = Query(200, ge=1, le=5000, description="本轮最多处理多少张"),
+    only_missing: bool = Query(True, description="只处理还没提过色的"),
+):
+    """批量提取图片主色, 之后就能 `GET /library?color=blue` 按颜色找图。
+
+    digiKam 把"按颜色检索"做成独立标签页是有道理的: 用户记得的往往不是文件名,
+    而是"那张偏蓝的图"。
+
+    ⚠️ 返回 `written` 与 `checked` **两个**数(第 27 条): 只回成功数的话,
+    "一张都没提"既可能是库里没图, 也可能是 ffmpeg 不在 —— 两者必须能分开看。
+    ⚠️ ffmpeg 不在时回 **501** 而不是"成功 0 条": 后者会让按钮看起来点过了。
+    """
+    try:
+        written, checked = db.extract_colors(limit=limit,
+                                             only_missing=only_missing)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
+    return ColorsExtractOut(written=written, checked=checked,
+                            families=db.color_facets())
+
+
+@router.post("/library/export", response_model=ExportOut)
+def library_export(payload: ExportIn):
+    """把一个相册(或一组指定资源)打包成 zip, 带 `manifest.json`。
+
+    打包的目的是"把东西交出去/带走", 而一堆脱离了库的文件是**没有来源信息**的:
+    三个月后没人知道 `00001.jpg` 从哪来。manifest 就是把这条线索一起带走。
+
+    ⚠️ 超出 `max_items` 回 **400** 而不是静默只导出前 N 个: 用户会以为导全了。
+    """
+    try:
+        res = exporter.export(album=payload.album, ids=payload.ids,
+                              max_items=payload.max_items)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"write failed: {exc}")
+    return ExportOut(**res)
+
+
+@router.get("/library/searches/{sid}/items")
+def library_search_items(
+    sid: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """把一个**保存的搜索**当成可点开的相册(虚拟相册)。
+
+    V43 存的是筛选条件, 前端"应用"时要自己把条件拼回 query —— 那意味着
+    "智能文件夹"只是个快捷键, 不是一个能点进去的东西。这里让它成为实体:
+    条件仍在库里, 后端原样回灌 `library_filters`, 所以**不会**变成拼出来的 SQL。
+
+    ⚠️ 条件是**实时**算的(不是快照): 新下的图如果符合条件会立刻出现在里面。
+    ⚠️ 存坏的条件回 400 并说明 `broken` —— 与"这个相册是空的"必须分开(第 26 条)。
+    """
+    row = db.get_search(sid)
+    if not row:
+        raise HTTPException(status_code=404, detail="search not found")
+    params = dict(row.get("params") or {})
+    try:
+        total = db.library_count(**params)
+        rows = db.library_list(limit=page_size, offset=(page - 1) * page_size,
+                               **params)
+    except (ValueError, TypeError) as exc:
+        # TypeError: 库里的条件里有一个 library_filters 不认的键(存坏了)
+        raise HTTPException(status_code=400, detail=f"saved search is broken: {exc}")
+    return {
+        "items": _decorate_library_rows(rows),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+        "name": row.get("name", ""),
+        "params": params,
+    }
+
+
+@router.get("/webhooks", response_model=List[WebhookOut])
+def webhook_list():
+    """列出 webhook。⚠️ 不返回 `secret`, 只给 `has_secret` —— 密钥一旦进响应体,
+    就会被日志/浏览器插件顺手带走。"""
+    return [WebhookOut(**h) for h in db.list_webhooks()]
+
+
+@router.post("/webhooks", response_model=WebhookOut)
+def webhook_create(payload: WebhookIn):
+    """新增/覆盖一个 webhook(按 URL 唯一)。
+
+    `events` 必须是 `/system/gates` 下发的**代号**: 存一个不认识的代号, 以后永远
+    不会有事件命中它, 而界面上看不出它配错了 —— 所以这里直接拒(第 27 条)。
+    """
+    try:
+        hid = db.add_webhook(payload.url, payload.events, payload.secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return WebhookOut(**db.get_webhook(hid))
+
+
+@router.delete("/webhooks/{hid}")
+def webhook_delete(hid: int):
+    """删除一个 webhook。删除是幂等的(本来就不存在也回 200 + deleted=false)。"""
+    row = db.get_webhook(hid)
+    return {"id": int(hid), "deleted": bool(db.delete_webhook(hid)),
+            "url": (row or {}).get("url", "")}
+
+
+@router.post("/webhooks/{hid}/test", response_model=WebhookFireOut)
+def webhook_test(hid: int):
+    """手动投一次, 用来确认"配的对不对"。
+
+    这一步是必须的: webhook 配错的表现是"什么都没发生", 而没有任何界面能显示
+    "我们试过了、对方拒了"。投完之后 `last_status` / `last_error` 会留在库里,
+    列表页能直接看到上一次的结果(第 G 条: 静默失败必须有痕)。
+    """
+    hook = db.get_webhook(hid)
+    if not hook:
+        raise HTTPException(status_code=404, detail="webhook not found")
+    events_ = hook.get("events") or list(db.WEBHOOK_EVENTS)
+    event = events_[0] if events_ else "task.done"
+    row = db.query_one("SELECT secret FROM webhooks WHERE id=?", (hid,))
+    # ⚠️ sqlite3.Row 没有 `.get()`: 写成 `(row or {}).get(...)` 会在运行时才炸,
+    # 而且只在这条"手动测试"的路径上炸 —— 平时用不到就发现不了。
+    res = webhooks.deliver(hid, hook["url"], row["secret"] if row else None,
+                           event, {"test": True})
+    ok = 1 if (res["status"] is not None and 200 <= res["status"] < 300) else 0
+    return WebhookFireOut(delivered=ok, attempted=1, results=[res])
+
+
+#: 这几道闸**不放在 HTTP 请求里跑**, 以及为什么 —— 跳过必须**说出来**, 不能
+#: 静默不跑然后显示"全绿"(那正是 `Gate.checked` 存在的理由)。
+_GATE_NOT_RUN = {
+    "doc-counts": ("这道闸要跑一次 pytest 收集(几十秒), 不适合放在 HTTP 请求里; "
+                   "请在本地跑 python scripts/gateguard.py"),
+}
+
+_GATEGUARD = None
+
+
+def _load_gateguard():
+    """加载 `scripts/gateguard.py`(按文件路径, 因为 scripts 不是一个包)。"""
+    global _GATEGUARD
+    if _GATEGUARD is None:
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[2]
+        path = root / "scripts" / "gateguard.py"
+        spec = importlib.util.spec_from_file_location("_uwc_gateguard", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _GATEGUARD = (mod, root)
+    return _GATEGUARD
+
+
+@router.get("/system/gates", response_model=GatesOut)
+def system_gates():
+    """自检面板: 仓库级门禁**当前**的状态。
+
+    "绿了就是能用"不是靠自觉维持的, 是靠 `Gate.checked` 这个必填字段 —— 一道闸
+    一项都没核到时 `ok=False`。这里把这个判据**暴露给用户**: 门禁不再是只有
+    开发者在 CI 里才看得到的东西。
+
+    ⚠️ `checked=0` 的闸在这里是**红**的(`ok=false`), 并且 `problems` 里写明
+    为什么没跑 —— "没验到"与"验过了没问题"必须是两个结果(第 ⑦ 条)。
+    """
+    try:
+        mod, root = _load_gateguard()
+    except (OSError, ImportError, SyntaxError) as exc:
+        raise HTTPException(status_code=501, detail=f"gateguard unavailable: {exc}")
+
+    gates = []
+    for name, fn in mod.GATES:
+        if name in _GATE_NOT_RUN:
+            why = _GATE_NOT_RUN[name]
+            gates.append(GateResult(name=name, checked=0, ok=False,
+                                    problems=[{"kind": "not-run", "message": why}]))
+            continue
+        g = fn(root)
+        gates.append(GateResult(
+            name=name,
+            checked=g.checked,
+            ok=g.ok,
+            problems=[{"kind": p.kind, "message": p.message}
+                      for p in g.effective_problems()],
+        ))
+    return GatesOut(
+        gates=gates,
+        ok=all(g.ok for g in gates),
+        # webhook 事件代号清单也由这里下发(键 + 中文名), 前端不自带一份
+        events=[{"key": k, "label": v} for k, v in db.WEBHOOK_EVENTS.items()],
     )

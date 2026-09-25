@@ -86,6 +86,9 @@ export function listLibrary(opts = {}) {
   // 前端不硬编码键名 —— 后端新增维度时界面自动多出一项。
   // ⚠️ 未知键后端回 400(不是静默忽略), 这样"点了没反应"不会伪装成"没有这类"。
   if (opts.special) params.special = opts.special;
+  // 主色系筛选: 取值由 /library/facets 的 colors 下发(键 + 中文名 + 代表色),
+  // 前端不硬编码色系。⚠️ 未知键后端回 400 —— 静默忽略会变成"按颜色筛了没反应"。
+  if (opts.color) params.color = opts.color;
   if (opts.page) params.page = opts.page;
   if (opts.page_size) params.page_size = opts.page_size;
   // 排序档位: 取值由 /library/facets 的 sorts 下发, 前端不硬编码 —— 后端加一档
@@ -208,6 +211,61 @@ export function exportUrlArchive() {
 }
 export function clearUrlArchive() {
   return api.delete("/library/url-archive").then((r) => r.data);
+}
+// ---- V44: 文件头规范化(把"叫错名字"的文件改成文件头说的那个扩展名) ----
+// ⚠️ dryRun 默认 true: 改名**落到用户磁盘上**且不可逆, 所以它和删除是同一档动作 ——
+// 默认只给计划, 界面先把 changed 列出来, 用户确认后再带 dryRun=false 执行。
+export function libraryNormalize({ ids = [], dryRun = true, limit = 200 } = {}) {
+  return api
+    .post("/library/normalize", { ids, dry_run: dryRun, limit })
+    .then((r) => r.data);
+}
+// ---- V44: 主色检索(按颜色找图) ----
+// 返回 written / checked **两个**数: 只显示"成功"的话, "一张都没提"既可能是库里
+// 没图、也可能是 ffmpeg 不在(后端那时回 501), 两者必须能分开看。
+export function extractLibraryColors(limit = 200, onlyMissing = true) {
+  return api
+    .post("/library/colors/extract", null, {
+      params: { limit, only_missing: onlyMissing },
+    })
+    .then((r) => r.data);
+}
+// ---- V44: 打包导出(带 manifest) ----
+export function exportLibrary({ album = null, ids = [], maxItems = 500 } = {}) {
+  const body = { max_items: maxItems };
+  if (album) body.album = album;
+  if (ids && ids.length) body.ids = ids;
+  return api.post("/library/export", body).then((r) => r.data);
+}
+// ---- V44: 虚拟相册(保存的搜索变成能点进去的实体) ----
+// 条件仍在库里、由后端回灌, 所以是**实时**的, 不是存下来的快照。
+export function listVirtualAlbumItems(id, page = 1, pageSize = 60) {
+  return api
+    .get(`/library/searches/${id}/items`, { params: { page, page_size: pageSize } })
+    .then((r) => r.data);
+}
+// ---- V44: Webhook ----
+// ⚠️ 列表里不返回 secret(只有 has_secret): 密钥一旦进响应体就会被日志/插件带走。
+// ⚠️ last_status / last_error 是"上一次投递"的结果 —— 失败必须看得见, 否则用户
+// 看到的是"配好了、没动静"。
+export function listWebhooks() {
+  return api.get("/webhooks").then((r) => r.data);
+}
+export function createWebhook(url, events = [], secret = "") {
+  return api
+    .post("/webhooks", { url, events, secret: secret || null })
+    .then((r) => r.data);
+}
+export function deleteWebhook(id) {
+  return api.delete(`/webhooks/${id}`).then((r) => r.data);
+}
+export function testWebhook(id) {
+  return api.post(`/webhooks/${id}/test`).then((r) => r.data);
+}
+// ---- V44: 自检面板(仓库级门禁当前状态) ----
+// ⚠️ checked=0 的闸是**红**的并且写明为什么没跑 —— "没验到"≠"验过了没问题"。
+export function getSystemGates() {
+  return api.get("/system/gates").then((r) => r.data);
 }
 // ---- 文件访问 ----
 // 资源库是跨任务视图, 条目上只有 local_path —— 所以走按路径定位的 /files/raw,

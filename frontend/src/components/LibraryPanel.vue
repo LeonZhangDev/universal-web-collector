@@ -8,12 +8,15 @@ import { computed, onMounted, ref } from "vue";
 import {
   clearUrlArchive,
   deleteLibrarySearch,
+  exportLibrary,
   exportUrlArchive,
+  extractLibraryColors,
   getLibraryFacets,
   importUrlArchive,
   libraryArchiveUrl,
   libraryBulkDelete,
   libraryEditTags,
+  libraryNormalize,
   libraryRate,
   librarySetFavorite,
   libraryVerify,
@@ -23,6 +26,7 @@ import {
   listLibraryFailures,
   listLibrarySearches,
   listLibraryTags,
+  listVirtualAlbumItems,
   replayLibraryFailures,
   saveLibrarySearch,
   setTagColor,
@@ -57,6 +61,9 @@ const query = ref({
   // V42: 星级下限(0 = 不限)与整理型维度(取值由 /library/facets 下发)
   min_rating: 0,
   special: "",
+  // V44: 主色系筛选。色系由 /library/facets 的 colors 下发(键 + 中文名 + 代表色),
+  // 前端不硬编码 —— 后端加一个色系时界面自动多一项。
+  color: "",
   // V43: 排序。档位代号由 /library/facets 的 sorts 下发 —— 前端不硬编码,
   // 后端加一档时界面自动多一项; 未知代号后端会回 400(不静默忽略)。
   sort: "",
@@ -463,6 +470,68 @@ const RATE_OPTS = [1, 2, 3, 4, 5];
 const dupData = ref(null);
 const dupBusy = ref(false);
 
+// ---- V44: 主色检索 ----
+// ⚠️ `written` 与 `checked` 两个数字都要显示: 只说"成功"的话, "一张都没提"
+// 既可能是库里没图、也可能是 ffmpeg 不在(后端那时回 501) —— 两者必须能分开看。
+const busyColor = ref(false);
+async function runExtractColors() {
+  busyColor.value = true;
+  try {
+    const r = await extractLibraryColors(500, true);
+    toast(`提取主色: 写入 ${r.written} / 检查 ${r.checked}`, "ok");
+    await load();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    busyColor.value = false;
+  }
+}
+
+// ---- V44: 打包导出 ----
+// 导出的是**当前相册**(没选相册就是空条件 -> 后端会要求给 album 或 ids)。
+const busyExport = ref(false);
+async function runExport() {
+  busyExport.value = true;
+  try {
+    const r = await exportLibrary({ album: query.value.album || null, ids: [] });
+    const skip = r.skipped?.length ? `, 跳过 ${r.skipped.length} 个` : "";
+    toast(`已打包 ${r.count} 个文件 -> ${r.name}${skip}`, "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    busyExport.value = false;
+  }
+}
+
+// ---- V44: 文件头规范化 ----
+// ⚠️ **默认 dry-run**: 改名落到用户磁盘上且不可逆。所以这里第一步只出计划,
+// 让用户看清"要改成什么"之后才执行 —— 不做"点了就直接改"。
+const busyNorm = ref(false);
+async function runNormalize() {
+  busyNorm.value = true;
+  try {
+    const plan = await libraryNormalize({ ids: [], dryRun: true });
+    if (!plan.changed?.length) {
+      toast(`检查了 ${plan.checked} 个: 没有名字与内容不符的`, "ok");
+      return;
+    }
+    const sample = plan.changed[0];
+    const ok = confirm(
+      `有 ${plan.changed.length} 个文件的扩展名与文件头不符。\n` +
+        `例如: ${sample.from} → ${sample.to}\n\n` +
+        `只换扩展名、不动主名。确定改名?`
+    );
+    if (!ok) return;
+    const done = await libraryNormalize({ ids: [], dryRun: false });
+    toast(`已改名 ${done.changed.length} 个`, "ok");
+    await load();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    busyNorm.value = false;
+  }
+}
+
 async function loadDuplicates() {
   if (dupBusy.value) return;
   dupBusy.value = true;
@@ -736,6 +805,7 @@ function currentParams() {
     favorite: query.value.favorite,
     min_rating: query.value.min_rating,
     special: query.value.special,
+    color: query.value.color,
   };
 }
 
@@ -886,6 +956,14 @@ onMounted(() => {
           {{ a.album }} ({{ a.n }})
         </option>
       </select>
+      <!-- V44 主色筛选: 色系(键 + 中文名)由 /library/facets 的 colors 下发,
+           前端不硬编码 —— 后端加一个色系时界面自动多一项。 -->
+      <select v-model="query.color" class="lib-sel" @change="search">
+        <option value="">全部颜色</option>
+        <option v-for="c in facets?.colors || []" :key="c.key" :value="c.key">
+          {{ c.label }}
+        </option>
+      </select>
       <!-- 收藏筛选: 独立于标签, 可叠加 -->
       <button
         class="ghost fav-btn"
@@ -920,6 +998,33 @@ onMounted(() => {
           >{{ s.label }}</button>
         </div>
       </div>
+      <!-- V44: 主色检索 / 打包导出 / 文件头规范化。
+           ⚠️ "修正扩展名"是**两步**的: 先出计划(dry-run), 确认后才真改 ——
+           改名落到磁盘上且不可逆, 不做"点了就直接改"。 -->
+      <button
+        class="ghost"
+        :disabled="busyColor"
+        title="给还没提过色的图片提取主色(需要 ffmpeg)"
+        @click="runExtractColors"
+      >
+        {{ busyColor ? "提色中…" : "提取主色" }}
+      </button>
+      <button
+        class="ghost"
+        :disabled="busyExport"
+        title="把当前相册打包成 zip(带 manifest.json)"
+        @click="runExport"
+      >
+        {{ busyExport ? "打包中…" : "打包导出" }}
+      </button>
+      <button
+        class="ghost"
+        :disabled="busyNorm"
+        title="按文件头把叫错名字的文件改成正确的扩展名"
+        @click="runNormalize"
+      >
+        {{ busyNorm ? "检查中…" : "修正扩展名" }}
+      </button>
     </div>
 
     <!-- V43 保存的搜索(智能文件夹)。每条都带**命中数**:

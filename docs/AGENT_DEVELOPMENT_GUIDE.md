@@ -3823,7 +3823,7 @@ if checked == 0:
 | --- | --- |
 | `tests/test_local_albums.py`（新） | **86 项**(只读指纹 / AST 写调用扫描 / 越界五种 / 扫描口径 / 随机池不重叠不缺项 / 失效收藏 / 17 个接口 / 配置兜底 + V41 的排除模式 / 往年今日 / 重复标记 / 扫描对账) |
 | 前端构建 | `npm run build` 通过(92 modules)、`test:task-query` 通过 |
-| 全量 pytest | 本机 Windows 收集 **1367** → **1361 passed + 6 skipped**（V43 新增 `tests/test_features_v43.py` 26 项）；CI/Linux 收集 **1368**(差额仍是 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数) |
+| 全量 pytest | 本机 Windows 收集 **1398** → **1392 passed + 6 skipped**（V44 新增 `tests/test_features_v44.py` 31 项）；CI/Linux 收集 **1399**(差额仍是 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数) |
 
 ### 22.8 对标同类产品后吸收的四个能力（V41，2026-09-24 六）
 
@@ -4124,5 +4124,102 @@ V43 落地的是**平铺版** —— 存一组筛选条件 —— 而它根本�
 
 这是它第二次在同一个地方救场(第一次见 §23.7), 而两次都是**我自己刚改完就忘了改文档**。
 结论没变: 数字必须是门禁算出来的, 不能靠自觉。
+
+## 25. 把上一轮的"建议"落成代码（V44，2026-09-25 三）
+
+上一轮(§23/§24)对标完之后留了一张拓展清单。这一轮把它里**能纯代码完成**的部分
+落地, 剩下的四项明确写清"要什么才能做", 而不是含糊地"以后再说"。
+
+### 25.1 先分两堆: 能自己做完的 vs 要外部条件的
+
+| 落地 | 依赖 |
+| --- | --- |
+| 文件头规范化(`POST /library/normalize`) | 无(基于 V42 的 `core/filekind.py`) |
+| 主色检索(`/library/colors/extract` + `?color=`) | ffmpeg(已是硬依赖) |
+| 打包导出(`POST /library/export`) | 无(zipfile) |
+| 虚拟相册(`/library/searches/{sid}/items`) | 无(基于 V43 的 `library_searches`) |
+| Webhook(`/webhooks`) | 无(urllib + hmac) |
+| 自检面板(`/system/gates`) | 无(复用 `scripts/gateguard.py`) |
+| 采集器插件 SDK 文档 | 无(把既有契约写出来) |
+
+| **推迟**(不是"不该做") | 缺什么 |
+| --- | --- |
+| 人脸聚类 | 本地模型(insightface, 数百 MB)+ onnxruntime-gpu |
+| 语义搜索 | CLIP 模型(数百 MB) |
+| 地图视图 | 合规底图 + GCJ-02 偏移(合规要前置) |
+| 智能文件夹**嵌套规则** | 规则引擎(AND/OR 组合); 平铺版 V43 已落地 |
+
+⚠️ 推迟理由**写在最小可做版本旁边**(§24.4 立的规矩): 人脸聚类的最小版是
+"检测 → 聚类 → 人工打标 → 按人脸筛选", 它只差一个模型依赖, 不差设计。
+
+### 25.2 文件头规范化: 默认 dry-run, 认不准不动
+
+V42 能把"名字与内容不符"**标**出来, 但标完之后用户没有下一步动作。这里补的就是
+那一步。两条边界:
+
+* **默认 `dry_run=True`**。改名落到用户磁盘上且不可逆, 所以它和删除是同一档的
+  动作 —— 前端先列计划、用户确认后再执行。默认值只有一处是对的, 所以端点与
+  库函数**各自**都有测试钉住(§25.8)。
+* **ISOBMFF 一族不许改**。mp4/mov/m4a/heic/avif 共用容器, `.jpg` 装的其实是
+  `ftyp` 时, 我们断定不了它该是哪一个 —— 这时改名就是把猜测写到磁盘上。
+  `KIND_PRIMARY_EXT` 故意**不含** `isobmff`(与 `filekind.py` 的取舍同源)。
+
+次序也是契约: **先改文件, 成功后再写库**。反过来时, 改名一旦失败, 库里记的就是
+一个不存在的路径 —— 那比"名字没改对"严重得多, 而且不报错。
+
+### 25.3 ⚠️ 主色检索走 ffmpeg, 不引 Pillow
+
+第一版是用 Pillow 写的。写完才发现: 本项目**刻意不依赖 Pillow** —— 缩略图
+(`core/thumbs.py`)与完整性检查(`core/mediacheck.py`)全部走 ffmpeg, `pyproject`
+里也没有它。为一个"取主色"的小功能开一个新依赖口子, 后果是"少装一个包 → 整片
+测试 collection 红", 而红的原因看起来跟这个功能毫无关系。
+
+改成 ffmpeg: 缩到 32×32 输出 `rawvideo rgb24`, 自己统计**出现最多的量化桶**
+(不是全图平均色 —— 平均色会把蓝天绿地算成灰, 那不是任何人的检索词)。
+
+库里存的是**色系代号**(`red`/`blue`/`gray`), 不是 RGB。因为筛选要落在 SQL 上做
+等值匹配才能走索引; 存色值就得在 SQL 里做 HSV 换算, 那既走不了索引也没法解释。
+
+### 25.4 ⚠️ 抓出的一处**真实**静默失效
+
+给 `library_filters` 加了 `color` 参数之后, 颜色筛选**完全没生效**, 而且不报错:
+`library_count` / `library_list` 是**按位置**调用 `library_filters` 的, 多出来的
+参数不会自己传过去。表现就是"按颜色筛了但结果没变" —— 正是本项目的典型坑形。
+
+所以加一个筛选维度时, **所有**按位置转发参数的调用点都要同步(心法①)。
+`tests/test_features_v44.py::test_color_filter_reaches_both_count_and_list`
+专门钉住 `total` 与 `items` 口径一致。
+
+### 25.5 打包导出 / 虚拟相册 / Webhook 的三条边界
+
+* **导出超限报错, 不截断**: 只导前 500 个会让用户以为导全了。磁盘上已不在的
+  文件进 `skipped`, 不记的话"导出数"和"库里有"对不上而没人看得出。
+* **虚拟相册的条件是实时的**, 不是存下来的快照; 条件仍在库里由后端回灌
+  `library_filters`, 所以永远不会变成拼出来的 SQL。
+* **Webhook 投递失败必须留痕**(第 G 条): `last_status`/`last_error` 回写库,
+  界面能直接看到"上一次是 500 / 连不上"。另外列表**不返回 `secret`**(只给
+  `has_secret`) —— 密钥进了响应体就会被日志和浏览器插件顺手带走。
+
+### 25.6 自检面板: 让门禁不再是只有开发者才看得到的东西
+
+`GET /system/gates` 复用 `scripts/gateguard.py` 的 `GATES`(判据只此一份),
+把每道闸的 `checked` 与 `ok` 暴露出来。
+
+⚠️ `doc-counts` 这道闸**不放在 HTTP 请求里跑**(它要跑一次 pytest 收集), 所以它
+返回的是 `checked=0` + `ok=false` + `problems[].kind="not-run"`。这正是
+`Gate.checked` 存在的理由: "没验到"与"验过了没问题"必须是两个结果 ——
+一个不跑的闸不许显示成绿的。
+
+### 25.7 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/test_features_v44.py`(新) | **31 项**(dry-run 默认值 / 真的改 / isobmff 不误改 / checked 计数 / 色系分档 / 读不出返回 None / 未知色系 400 / **count 与 list 口径** / 虚拟相册实时 / 导出不截断 / webhook 留痕与签名 / 没跑的闸不算绿) |
+| 全量 pytest | 本机收集 **1398** → 1392 passed + 6 skipped; CI/Linux **1399** |
+| 门禁 | `gateguard.py` 六闸全绿(16 / 3 / 133 / 5 / 138 / 185) |
+| 前端 | `npm run build` 通过(92 modules)、`test:task-query` 通过 |
+
+⚠️ 门禁**第三次**在同一个地方救场: 全量跑完当场红, 报"实测收集 1398, README
+只写了 [1367, 1368]"。三次(V42/V43/V44)都是同一条用例抓的 —— 数字必须门禁算。
 
 

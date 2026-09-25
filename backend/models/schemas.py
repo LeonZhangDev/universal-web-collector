@@ -215,6 +215,9 @@ class LibraryFacetsOut(BaseModel):
     # 界面会静默少一个选项, 而"少一个选项"没人会报 bug。
     sorts: List[dict] = []
     default_sort: str = "added"
+    # V44: 色系清单(键 + 中文名 + 代表色)。与 sorts 同理 —— 选项由后端下发,
+    # 前端自带一份的话, 后端加一个色系时界面会静默少一个选项。
+    colors: List[dict] = []
 
 
 class SortOption(BaseModel):
@@ -665,6 +668,108 @@ class LocalFavoriteIn(BaseModel):
     root_id: int
     rel: str                        # 相对根的路径(用 `/`)
     value: bool = True              # False = 取消收藏
+
+
+# ==========================================================================
+# V44: 文件头规范化 / 主色 / 导出 / Webhook / 自检面板
+# ==========================================================================
+
+
+class NormalizeIn(BaseModel):
+    """按文件头改名。
+
+    ⚠️ `dry_run` 默认 **True**: 改名落到用户磁盘上且不可逆, 所以它和删除是同一
+    档的动作 —— 默认先给计划, 前端把计划显示出来, 用户确认后再 `dry_run=false`。
+    """
+
+    ids: List[int] = []             # 空 = 处理所有 error_kind='mismatch' 的
+    dry_run: bool = True
+    limit: int = 200
+
+
+class NormalizeOut(BaseModel):
+    """`checked` 是检查过的条数。三个数一起给(第 27 条): 只回"改了几个"的话,
+    "一条都没匹配上"与"规则配错了"看起来一样。"""
+
+    dry_run: bool = True
+    checked: int = 0
+    changed: List[dict] = []
+    skipped: List[dict] = []
+
+
+class ColorsExtractOut(BaseModel):
+    """批量提色结果。`written` 与 `checked` **都要**给 —— 见 `db.extract_colors`。
+    `families` 顺带下发色系清单(键 + 中文名 + 代表色), 省得前端再调一次 facets。"""
+
+    written: int = 0
+    checked: int = 0
+    families: List[dict] = []
+
+
+class ExportIn(BaseModel):
+    """打包导出。`album` 与 `ids` 至少给一个(两个都不给 = 打包整个库, 通常不是
+    用户点这一下时想要的)。"""
+
+    album: Optional[str] = None
+    ids: List[int] = []
+    max_items: int = 500
+
+
+class ExportOut(BaseModel):
+    path: str = ""
+    name: str = ""
+    count: int = 0
+    size: int = 0
+    checked: int = 0
+    skipped: List[dict] = []
+
+
+class WebhookIn(BaseModel):
+    url: str
+    events: List[str] = []
+    secret: Optional[str] = None    # 为空 = 不签名
+
+
+class WebhookOut(BaseModel):
+    """⚠️ 不返回 `secret` 本身, 只给 `has_secret`: 密钥一旦进了响应体, 就会被
+    日志/浏览器插件/截图顺手带走。"""
+
+    id: int = 0
+    url: str = ""
+    events: List[str] = []
+    has_secret: bool = False
+    enabled: bool = True
+    last_status: Optional[int] = None
+    last_error: Optional[str] = None
+    created: float = 0
+
+
+class WebhookFireOut(BaseModel):
+    """投递结果。`delivered` 与 `attempted` 两个都要(第 27 条)。"""
+
+    delivered: int = 0
+    attempted: int = 0
+    results: List[dict] = []
+
+
+class GateResult(BaseModel):
+    """一道闸的结果。
+
+    ⚠️ `checked` **必填**且默认 0, 而 0 就是红 —— "一道闸都没核到"和"核过了没问题"
+    必须是两个结果(第 ⑦ 条), 否则"闸崩了"会显示为全绿。
+    """
+
+    name: str
+    checked: int = 0
+    ok: bool = False
+    problems: List[dict] = []
+
+
+class GatesOut(BaseModel):
+    gates: List[GateResult] = []
+    ok: bool = True
+    # webhook 事件代号清单(键 + 中文名), 前端不自带一份
+    events: List[dict] = []
 
 
 class LocalFavoriteForgetIn(BaseModel):

@@ -153,6 +153,50 @@ def inspect(path):
     return claimed, actual
 
 
+#: 格式族 -> 建议用的扩展名(改名时用)。与 `_EXT_KIND` 反向, 但只取**一个代表**。
+#:
+#: ⚠️ 故意**不含 `isobmff`**: mp4 / mov / m4a / heic / avif 共用同一个容器,
+#: 只靠前 12 字节区分不出来。把一个 `.heic` 改成 `.mp4` 是**误判**(它本来就是
+#: 那个文件, 只是我们没细看), 而漏掉一次改名只是少修一个。与上面 sniff 的
+#: 取舍方向一致 —— 拿不准就别动, 尤其改名是**会落到磁盘上**的动作。
+#:
+#: `html` 在表里: 那是 CDN 把错误页当图片发过来了, 改名成 `.html` 才是把问题
+#: **暴露**出来(用户双击就知道这不是图), 继续叫 `.jpg` 只会让损坏的文件
+#: 一直混在图库里。
+KIND_PRIMARY_EXT = {
+    "jpeg": "jpg", "png": "png", "gif": "gif", "webp": "webp",
+    "bmp": "bmp", "tiff": "tif", "ico": "ico", "matroska": "mkv",
+    "mp3": "mp3", "wav": "wav", "flac": "flac", "ogg": "ogg",
+    "pdf": "pdf", "zip": "zip", "rar": "rar", "7z": "7z",
+    "html": "html",
+}
+
+
+def suggest_ext(path):
+    """按文件头给出**建议的新扩展名**(不带点); 不该改/改不了时返回 None。
+
+    只在"两侧都认得出且不相等"时给结论 —— 认不出的一侧说明我们没有把握,
+    这时动手改名就是用猜测覆盖用户磁盘上的文件。
+    """
+    claimed, actual = inspect(path)
+    if not claimed or not actual or claimed == actual:
+        return None
+    return KIND_PRIMARY_EXT.get(actual)
+
+
+def suggest_rename(path):
+    """按文件头给出建议的新**文件名**; 不该改时返回 None。
+
+    只换扩展名, 不动主名 —— 主名里有序号(`00001`)与来源信息, 换了会破坏
+    "按名字找文件"这条用户习惯。
+    """
+    ext = suggest_ext(path)
+    if not ext:
+        return None
+    p = Path(path)
+    return f"{p.stem}.{ext}"
+
+
 def mismatch_reason(path):
     """名字与内容不符时返回**给人看**的说明; 相符或无法判断时返回 None。
 

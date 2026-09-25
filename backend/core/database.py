@@ -6,7 +6,12 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+from pathlib import Path
+
 from core.config import settings
+from core import colors as _colors
+from core import filekind as _filekind
+from core import layout as _layout
 
 DB_PATH = settings.db_path
 
@@ -246,6 +251,26 @@ CREATE TABLE IF NOT EXISTS library_searches(
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_library_searches_name
     ON library_searches(name);
+
+-- Webhook: 把"任务完成 / 失败 / 体检异常"这类事件推给外部系统。
+-- ⚠️ 时刻列按新表约定 = created_at + REAL(epoch 秒)(老表才是 created_time 字符串)。
+-- ⚠️ events 存**事件代号**的 JSON 数组, 不存中文 —— 代号是契约, 文案会变。
+-- ⚠️ last_status / last_error 是"上一次投递"的结果。投递失败**必须留痕**:
+--    静默吞掉一个发不出去的 webhook, 用户会以为"配好了"而实际上从没收到过
+--    (第 G 条: 静默降级必须有痕)。
+CREATE TABLE IF NOT EXISTS webhooks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL,
+    events TEXT NOT NULL,
+    -- HMAC 签名密钥; 为空表示不签名。⚠️ 密钥只存在库里与用户配置里,
+    -- 代码里不出现任何常量密钥。
+    secret TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_status INTEGER,
+    last_error TEXT,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhooks_url ON webhooks(url);
 """
 
 # 索引在列迁移之后创建(旧库可能缺列)
@@ -310,6 +335,10 @@ _ADD_COLUMNS = [
     ("local_roots", "exclude", "TEXT"),
     # V42: 五星评分(0 = 未评分)。与 favorite 同理, 是资源自身的属性而不是标签。
     ("resources", "rating", "INTEGER NOT NULL DEFAULT 0"),
+    # V44: 主色所属的**色系代号**(见 core/colors.py)。存代号不存色值 —— 筛选要
+    # 走 SQL 等值匹配(能命中索引), 色值则随时可重算。NULL = 还没提过色
+    # ("没算出"), 与"提过但归为 gray"是两回事(第 26 条)。
+    ("resources", "dominant_color", "TEXT"),
 ]
 
 
@@ -1102,6 +1131,10 @@ SPECIAL_FILTERS = {
     "nodims": "r.type = 'image' AND (r.width IS NULL OR r.width = 0)",
     # 同理: duration IS NULL = 没装 ffprobe / 没测, 不是"这个视频 0 秒"。
     "noduration": "r.type = 'video' AND r.duration IS NULL",
+    # V44: dominant_color IS NULL = **还没提过色**(多半是批量提色没跑过),
+    # 不是"这张图没有颜色"。与 nodims / noduration 同款: 缺的是测量结果,
+    # 不是属性本身 —— 混进"灰色"里会让"没提色"看起来像"提过色了"。
+    "nocolor": "r.type = 'image' AND r.dominant_color IS NULL",
 }
 
 #: 体检维度的中文名与解释。文案放后端, 前端只拿键查表。
@@ -1115,6 +1148,7 @@ SPECIAL_LABELS = {
     "mismatch": ("名字与内容不符", "扩展名说是 A, 文件头是 B(多半还能打开)"),
     "nodims": ("没量到尺寸", "图片的宽高为空或 0"),
     "noduration": ("没量到时长", "视频时长为空(多半是没装 ffprobe, 不等于文件坏)"),
+    "nocolor": ("没提过主色", "图片还没跑过批量提色, 不等于它是灰的"),
 }
 
 #: 资源库的排序档位: 键 → (SQL 列表达式, 中文名)。
@@ -1137,7 +1171,7 @@ LIBRARY_DEFAULT_SORT = "added"
 #: 多一个键是"每次列表面板都炸"(看不见)。
 LIBRARY_QUERY_KEYS = (
     "q", "kind", "album", "task_id", "tag", "tag_children",
-    "favorite", "min_rating", "special",
+    "favorite", "min_rating", "special", "color",
 )
 
 
@@ -1199,6 +1233,9 @@ def clean_search_params(params):
         raise ValueError(f"unknown special filter: {out['special']}")
     if out.get("min_rating") is not None and not 1 <= out["min_rating"] <= 5:
         raise ValueError("min_rating out of range")
+    # 色系同理: 存一个不存在的色系, 以后每次列这个搜索都会"筛出 0 条"而看不出原因
+    if out.get("color") and out["color"] not in _colors.COLOR_FAMILIES:
+        raise ValueError(f"unknown color: {out['color']}")
     return out
 
 
@@ -1276,7 +1313,7 @@ def delete_search(sid):
 
 def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
                     tag=None, favorite=None, tag_children=False,
-                    min_rating=None, special=None):
+                    min_rating=None, special=None, color=None):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
     单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
@@ -1308,6 +1345,14 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
     if min_rating:
         where.append("r.rating >= ?")
         args.append(int(min_rating))
+
+    if color and color != "all":
+        # 与 special 同款: 未知色系必须**报错**而不是"筛不出东西"。筛出 0 条会
+        # 被读成"库里没有蓝色的图", 而真相是"用户传了个我们不认识的键"。
+        if color not in _colors.COLOR_FAMILIES:
+            raise ValueError(f"unknown color: {color}")
+        where.append("r.dominant_color = ?")
+        args.append(color)
 
     if status:
         where.append("r.status=?")
@@ -1452,10 +1497,14 @@ def failure_count(kinds=None, include_gone=False):
 
 def library_count(q=None, kind=None, task_id=None, album=None, status="done",
                   tag=None, favorite=None, tag_children=False,
-                  min_rating=None, special=None):
-    """资源库总数(与 library_list 同一口径)。"""
+                  min_rating=None, special=None, color=None):
+    """资源库总数(与 library_list 同一口径)。
+
+    ⚠️ `color` 必须在这里**显式**往下传: `library_filters` 是按位置被调用的,
+    少传一个就表现为"按颜色筛了但没生效" —— 不报错, 只是结果不对。
+    """
     where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
-                                  tag_children, min_rating, special)
+                                  tag_children, min_rating, special, color)
     row = query_one(
         f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
         f"WHERE {where}",
@@ -1467,10 +1516,14 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
 def library_list(q=None, kind=None, task_id=None, album=None, status="done",
                  limit=50, offset=0, tag=None, favorite=None,
                  tag_children=False, min_rating=None, special=None,
-                 sort=None, order=None):
-    """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。"""
+                 sort=None, order=None, color=None):
+    """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。
+
+    ⚠️ 与 `library_count` 必须共用**同一份**筛选参数(含 `color`), 否则总数与
+    页内容口径不一致 —— 表现为"翻到最后一页数量对不上", 很难察觉。
+    """
     where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
-                                  tag_children, min_rating, special)
+                                  tag_children, min_rating, special, color)
     # 排序代号在这里翻译(白名单), 结果只可能是 LIBRARY_SORTS 里的列表达式。
     order_by = library_order_by(sort, order)
     rows = query(
@@ -1784,6 +1837,8 @@ def library_facets():
         # 少一个选项 —— 而"少一个选项"没人会报 bug(第 9 条)。
         "sorts": library_sorts(),
         "default_sort": LIBRARY_DEFAULT_SORT,
+        # 色系清单同理: 由后端下发(键 + 中文名 + 代表色), 前端不自带一份。
+        "colors": color_facets(),
         "total": library_count(),
     }
 
@@ -2147,3 +2202,235 @@ def finish_watch_run(watch_id, task_id, hits):
         "UPDATE watches SET last_task_id=?, hits=hits+? WHERE id=?",
         (task_id, hits or 0, watch_id),
     )
+
+
+# ==========================================================================
+# V44-1: 文件头规范化 —— 把"叫错名字"的文件改成**文件头说的那个**扩展名
+# ==========================================================================
+
+def normalize_resources(ids=None, dry_run=True, limit=200):
+    """按文件头改扩展名; 默认只出计划(`dry_run=True`)。
+
+    为什么默认 dry_run
+    ------------------
+    改名**落到用户的磁盘上**, 而且不可逆 —— 改完之后"原来叫什么"这条信息就没了。
+    所以它和删除是同一档的动作: 默认先给计划, 由调用方显式确认再执行。
+
+    次序(第 1 条: 次序即契约)
+    ------------------------
+    先改文件, 成功之后再写库。反过来(先写库再改文件)时, 改名一旦失败, 库里记的
+    就是一个**不存在**的路径 —— 那比"名字没改对"严重得多, 而且不报错。
+
+    ⚠️ 只换扩展名, 不动主名: `00001.jpg` -> `00001.png`。主名里的序号与来源信息
+    是用户"按名字找文件"的唯一线索。
+
+    返回三个数(第 27 条)
+    --------------------
+    `checked`(检查过几条) / `changed` / `skipped`。只回"改了几个"的话,
+    "一条都没匹配上"与"规则配错了"看起来完全一样。
+    """
+    wanted = [int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()]
+    join = ("SELECT r.*, t.download_dir AS task_dir, t.name AS album "
+            "FROM resources r LEFT JOIN tasks t ON t.id = r.task_id ")
+    if wanted:
+        marks = ",".join("?" * len(wanted))
+        rows = query(join + f"WHERE r.id IN ({marks}) AND r.status='done'",
+                     tuple(wanted))
+    else:
+        rows = query(join + "WHERE r.status='done' AND r.error_kind='mismatch' "
+                     "ORDER BY r.id LIMIT ?", (int(limit or 200),))
+
+    changed, skipped = [], []
+    checked = 0
+    for row in rows:
+        checked += 1
+        path = row["local_path"]
+        if not path or not Path(path).exists():
+            skipped.append({"id": row["id"], "reason": "missing"})
+            continue
+        claimed, actual = _filekind.inspect(path)
+        # 任一侧认不出 -> 我们没把握, 不动手(宁可漏报不可误报)
+        if not claimed or not actual:
+            skipped.append({"id": row["id"], "reason": "unknown"})
+            continue
+        if claimed == actual:
+            skipped.append({"id": row["id"], "reason": "ok"})
+            continue
+        ext = _filekind.KIND_PRIMARY_EXT.get(actual)
+        if not ext:
+            # 认得出不符, 但这一族不能细分(如 isobmff) -> 改了就是误判
+            skipped.append({"id": row["id"], "reason": "ambiguous", "kind": actual})
+            continue
+
+        old = Path(path)
+        final_path = old.with_suffix("." + ext)
+        if final_path == old:
+            skipped.append({"id": row["id"], "reason": "ok"})
+            continue
+
+        # 目标被别的文件占了 -> 交给 layout.claim 消解(重名消解的唯一实现,
+        # 不在这里另写一套 `name(2)` 的规则)
+        if final_path.exists() and not _layout.same_file(final_path, old):
+            root = Path(row["task_dir"] or settings.download_dir or ".")
+            try:
+                rel = final_path.relative_to(root)
+
+                def _owner(candidate):
+                    found = query_one(
+                        "SELECT url FROM resources WHERE local_path=? AND status='done'",
+                        (str(root / candidate),),
+                    )
+                    return found["url"] if found else None
+
+                final_path = root / _layout.claim(str(rel), row["album"],
+                                                  _owner, row["url"])
+            except ValueError:
+                # 文件不在下载根下面(任务改过目录/手动挪过) -> 不猜, 留痕跳过
+                skipped.append({"id": row["id"], "reason": "conflict"})
+                continue
+
+        record = {"id": row["id"], "from": str(old), "to": str(final_path),
+                  "claimed": claimed, "actual": actual}
+        if dry_run:
+            changed.append(record)
+            continue
+
+        try:
+            # os.replace = 原子替换; 不做"先删再建"(中途崩会丢文件)
+            os.replace(str(old), str(final_path))
+        except OSError as exc:
+            skipped.append({"id": row["id"], "reason": "rename-failed",
+                            "detail": str(exc)})
+            continue
+
+        execute("UPDATE resources SET local_path=?, filename=? WHERE id=?",
+                (str(final_path), final_path.name, row["id"]))
+        if row["error_kind"] == "mismatch":
+            # 名字已经和内容对上了, 这个标记该消失 —— 留着会让体检数字一直挂着
+            execute("UPDATE resources SET error_kind=NULL WHERE id=?", (row["id"],))
+        changed.append(record)
+
+    return {"dry_run": bool(dry_run), "checked": checked,
+            "changed": changed, "skipped": skipped}
+
+
+# ==========================================================================
+# V44-2: 主色(按颜色找图)
+# ==========================================================================
+
+def set_dominant_color(resource_id, color):
+    """写入主色色系。`color=None` 表示**清掉重提**, 与"不认识的键"区分开。"""
+    if color is not None and color not in _colors.COLOR_FAMILIES:
+        raise ValueError(f"unknown color: {color}")
+    return execute("UPDATE resources SET dominant_color=? WHERE id=?",
+                   (color, resource_id)).rowcount
+
+
+def extract_colors(limit=200, only_missing=True):
+    """批量提取图片主色, 返回 `(写入条数, 检查条数)`。
+
+    ⚠️ 返回**两个**数(第 27 条): 只回"成功几条"的话, "一张都没提"既可能是库里
+    没图, 也可能是 Pillow 没装、或路径全错 —— 这几种必须能分开看。
+
+    ⚠️ 提不出来(`dominant()` 返回 None)**不写库**: 写进去等于宣称"这张图没颜色",
+    而真相是"没能读出来"(第 26 条)。下次批量跑会再试一次。
+    """
+    if not _colors.available():
+        # ffmpeg 不在 -> 明确报错(端点回 501), 不许"成功处理 0 张"糊过去
+        raise RuntimeError("ffmpeg is not available; color extraction needs ffmpeg")
+    where = "r.status='done' AND r.type='image' AND r.local_path IS NOT NULL"
+    if only_missing:
+        where += " AND r.dominant_color IS NULL"
+    rows = query(f"SELECT r.id, r.local_path FROM resources r "
+                 f"WHERE {where} ORDER BY r.id LIMIT ?", (int(limit or 200),))
+    written = 0
+    for row in rows:
+        family = _colors.dominant(row["local_path"])
+        if not family:
+            continue
+        set_dominant_color(row["id"], family)
+        written += 1
+    return written, len(rows)
+
+
+def color_facets():
+    """色系清单(带中文名与代表色), 供 `/library/facets` 下发。"""
+    return _colors.families()
+
+
+# ==========================================================================
+# V44-3: Webhook —— 把事件推给外部系统
+# ==========================================================================
+
+#: 事件代号 -> 中文名。⚠️ 契约是**代号**, 文案随时可改; 前端只拿键。
+WEBHOOK_EVENTS = {
+    "task.done": "任务完成",
+    "task.failed": "任务失败",
+    "library.verify": "体检发现异常",
+}
+
+
+def add_webhook(url, events, secret=None):
+    """新增/覆盖一个 webhook(按 URL 唯一)。
+
+    `events` 必须是 `WEBHOOK_EVENTS` 里的代号 —— 存一个不认识的代号, 以后
+    永远不会有任何事件能命中它, 而界面上看不出它配错了(第 27 条: 规则生效
+    要有证据, 至少得保证规则本身是合法的)。
+    """
+    clean = (url or "").strip()
+    if not clean.startswith(("http://", "https://")):
+        raise ValueError("url must start with http:// or https://")
+    picked = [str(e) for e in (events or []) if e]
+    for e in picked:
+        if e not in WEBHOOK_EVENTS:
+            raise ValueError(f"unknown webhook event: {e}")
+    existing = query_one("SELECT id FROM webhooks WHERE url=?", (clean,))
+    if existing:
+        execute("UPDATE webhooks SET events=?, secret=?, enabled=1 WHERE id=?",
+                (json.dumps(picked, ensure_ascii=False), secret or None,
+                 existing["id"]))
+        return existing["id"]
+    cur = execute(
+        "INSERT INTO webhooks(url, events, secret, created_at) VALUES(?,?,?,?)",
+        (clean, json.dumps(picked, ensure_ascii=False), secret or None, time.time()),
+    )
+    return cur.lastrowid
+
+
+def _webhook_row(row):
+    return {
+        "id": row["id"],
+        "url": row["url"],
+        "events": json.loads(row["events"] or "[]"),
+        "has_secret": bool(row["secret"]),
+        "enabled": bool(row["enabled"]),
+        "last_status": row["last_status"],
+        "last_error": row["last_error"],
+        "created": row["created_at"],
+    }
+
+
+def list_webhooks(enabled_only=False):
+    sql = "SELECT * FROM webhooks"
+    if enabled_only:
+        sql += " WHERE enabled=1"
+    sql += " ORDER BY id"
+    return [_webhook_row(r) for r in query(sql)]
+
+
+def get_webhook(hid):
+    row = query_one("SELECT * FROM webhooks WHERE id=?", (hid,))
+    return _webhook_row(row) if row else None
+
+
+def delete_webhook(hid):
+    return execute("DELETE FROM webhooks WHERE id=?", (hid,)).rowcount
+
+
+def mark_webhook_result(hid, status=None, error=None):
+    """记录一次投递的结果 —— 失败**必须**留在这里。
+
+    投递失败如果只写日志, 用户看到的是"配好了、没动静", 而日志他不会去看。
+    """
+    return execute("UPDATE webhooks SET last_status=?, last_error=? WHERE id=?",
+                   (status, (error or None) and str(error)[:400], hid)).rowcount

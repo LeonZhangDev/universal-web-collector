@@ -88,7 +88,23 @@ export function listLibrary(opts = {}) {
   if (opts.special) params.special = opts.special;
   if (opts.page) params.page = opts.page;
   if (opts.page_size) params.page_size = opts.page_size;
+  // 排序档位: 取值由 /library/facets 的 sorts 下发, 前端不硬编码 —— 后端加一档
+  // 时界面自动多一项。⚠️ 未知代号后端回 400(不是静默忽略), 否则"排序没生效"
+  // 会和"本来就是这个顺序"长得一样。
+  if (opts.sort) params.sort = opts.sort;
+  if (opts.order) params.order = opts.order;
   return api.get("/library", { params }).then((r) => r.data);
+}
+// 保存的搜索(智能文件夹)。列表**带命中数**: "配了但一条都不匹配"与"没配"在
+// 界面上必须能分开, 所以 count 是 0 也要显示 0, 不能省略。
+export function listLibrarySearches() {
+  return api.get("/library/searches").then((r) => r.data);
+}
+export function saveLibrarySearch(name, params = {}) {
+  return api.post("/library/searches", { name, params }).then((r) => r.data);
+}
+export function deleteLibrarySearch(id) {
+  return api.delete(`/library/searches/${id}`).then((r) => r.data);
 }
 export function listLibraryAlbums() {
   return api.get("/library/albums").then((r) => r.data);

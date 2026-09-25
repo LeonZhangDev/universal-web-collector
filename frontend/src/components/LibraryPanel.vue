@@ -7,6 +7,7 @@
 import { computed, onMounted, ref } from "vue";
 import {
   clearUrlArchive,
+  deleteLibrarySearch,
   exportUrlArchive,
   getLibraryFacets,
   importUrlArchive,
@@ -20,8 +21,10 @@ import {
   listLibraryAlbums,
   listLibraryDuplicates,
   listLibraryFailures,
+  listLibrarySearches,
   listLibraryTags,
   replayLibraryFailures,
+  saveLibrarySearch,
   setTagColor,
   thumbUrl,
 } from "../api";
@@ -54,6 +57,10 @@ const query = ref({
   // V42: 星级下限(0 = 不限)与整理型维度(取值由 /library/facets 下发)
   min_rating: 0,
   special: "",
+  // V43: 排序。档位代号由 /library/facets 的 sorts 下发 —— 前端不硬编码,
+  // 后端加一档时界面自动多一项; 未知代号后端会回 400(不静默忽略)。
+  sort: "",
+  order: "desc",
   page: 1,
   page_size: 40,
 });
@@ -334,6 +341,91 @@ function clearOrganize() {
   query.value.special = "";
   query.value.min_rating = 0;
   search();
+}
+
+// ---- V43: 排序 + 保存的搜索(智能文件夹) ----
+// 排序档位由后端在 `/library` 与 `/library/facets` 两处**同一份定义**下发;
+// 前端只拿 key 与中文名, 不认识任何列名。未知代号后端回 400 而不是静默按默认
+// 排序 —— 否则"排序没生效"和"本来就是这个顺序"长得一模一样。
+const sortOptions = ref([]);
+const defaultSort = ref("added");
+const sortOpen = ref(false);
+function pickSort(key) {
+  // 再点当前档位 = 回到默认(与标签/星级的"再点一次取消"同一套手感)
+  query.value.sort = query.value.sort === key ? "" : key;
+  sortOpen.value = false;
+  search();
+}
+function toggleOrder() {
+  query.value.order = query.value.order === "asc" ? "desc" : "asc";
+  search();
+}
+const currentSortLabel = computed(() => {
+  const k = query.value.sort || defaultSort.value;
+  return (sortOptions.value.find((s) => s.key === k) || {}).label || k;
+});
+
+const searches = ref([]);
+const searchName = ref("");
+const searchBusy = ref(false);
+// 当前正在看的是哪个保存的搜索。⚠️ 一旦用户手动改了任何筛选条件就必须清掉,
+// 否则侧栏会一直高亮"搜索 A"而列表其实已经是别的东西 —— 这种不一致不报错,
+// 只会让人以为自己记错了。
+const activeSearch = ref(null);
+
+async function loadSearches() {
+  searchBusy.value = true;
+  try {
+    searches.value = await listLibrarySearches();
+  } catch (e) {
+    searches.value = [];
+  } finally {
+    searchBusy.value = false;
+  }
+}
+async function saveCurrentSearch() {
+  const name = (searchName.value || "").trim();
+  if (!name) {
+    toast("先给这个搜索起个名字", "warn");
+    return;
+  }
+  try {
+    const r = await saveLibrarySearch(name, currentParams());
+    // "新建"与"覆盖"要说清: 同名覆盖是常态, 但用户得知道刚才那一条被换掉了。
+    toast(r.created ? `已保存「${r.name}」` : `已覆盖同名的「${r.name}」`, "ok");
+    searchName.value = "";
+    await loadSearches();
+    activeSearch.value = r.id;
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+function applySearch(s) {
+  const p = s.params || {};
+  // ⚠️ **整体替换**而不是逐项合并: 侧栏上显示的命中数是按"存下来的那组条件"
+  // 算的, 若带着上一轮的残留条件去查, 列表条数会和那个数字对不上 —— 而这种
+  // 偏差不报错, 只表现为"这个搜索的数好像不太准"。
+  query.value.q = p.q || "";
+  query.value.kind = p.kind || "all";
+  query.value.album = p.album || "";
+  query.value.tag = p.tag || "";
+  query.value.tag_children = !!p.tag_children;
+  query.value.favorite = !!p.favorite;
+  query.value.min_rating = p.min_rating || 0;
+  query.value.special = p.special || "";
+  query.value.page = 1;
+  activeSearch.value = s.id;
+  load();
+}
+async function removeSearch(s) {
+  try {
+    const r = await deleteLibrarySearch(s.id);
+    if (activeSearch.value === s.id) activeSearch.value = null;
+    toast(r.deleted ? `已删除「${s.name}」` : "这条搜索已经不在了", "ok");
+    await loadSearches();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
 }
 
 // 打星。`rating=0` = 清除评分(回到"未评分"), 不是"打 0 分" —— 提示文案要说清,
@@ -631,18 +723,29 @@ function mediaMeta(r) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
 
+// 当前的**筛选条件**(不含分页/排序)。抽出来是为了让"查询"与"保存这个搜索"
+// 用同一份对象 —— 两处各拼一遍的话, 用户保存下来的条件会与他看到的列表悄悄
+// 差一项, 而这种偏差不报错, 只表现为"这个搜索好像不太对"。
+function currentParams() {
+  return {
+    q: query.value.q,
+    kind: query.value.kind,
+    album: query.value.album,
+    tag: query.value.tag,
+    tag_children: query.value.tag_children,
+    favorite: query.value.favorite,
+    min_rating: query.value.min_rating,
+    special: query.value.special,
+  };
+}
+
 async function load() {
   loading.value = true;
   try {
     const r = await listLibrary({
-      q: query.value.q || undefined,
-      kind: query.value.kind,
-      album: query.value.album || undefined,
-      tag: query.value.tag || undefined,
-      tag_children: query.value.tag_children || undefined,
-      favorite: query.value.favorite || undefined,
-      min_rating: query.value.min_rating || undefined,
-      special: query.value.special || undefined,
+      ...currentParams(),
+      sort: query.value.sort || undefined,
+      order: query.value.order || undefined,
       page: query.value.page,
       page_size: query.value.page_size,
     });
@@ -652,6 +755,13 @@ async function load() {
     stats.value = r.stats || null;
     // 徽章中文由后端下发(见 api/tasks.py 的 error_kind_labels)
     if (r.error_kind_labels) errorKindLabels.value = r.error_kind_labels;
+    // 排序档位也由后端在 facets 里下发, 这里的回显只用于**校正**本地 state:
+    // 未知代号会被后端 400 挡掉, 所以一旦请求成功, 本地值就一定与真实顺序一致。
+    if (r.sort) query.value.sort = r.sort === defaultSort.value ? "" : r.sort;
+    if (r.order) query.value.order = r.order;
+    // 排序档位与默认档位一起下发: 前端只存代号, 中文名始终来自后端(第 9 条)。
+    if (r.sorts?.length) sortOptions.value = r.sorts;
+    if (r.default_sort) defaultSort.value = r.default_sort;
   } catch (e) {
     toast(e.response?.data?.detail || String(e), "err");
   } finally {
@@ -684,6 +794,9 @@ function search() {
   // 换筛选条件必须回到第一页 —— 否则在第 5 页改关键词会看到一个空列表,
   // 而用户以为"搜不到", 其实结果在第 1 页。
   query.value.page = 1;
+  // 手动改条件 = 不再是"正在看某个保存的搜索"。不清掉的话侧栏会一直高亮
+  // 那一条, 而列表早就是别的东西了。
+  activeSearch.value = null;
   load();
 }
 function pickKind(k) {
@@ -714,6 +827,7 @@ onMounted(() => {
   load();
   loadAlbums();
   loadTags();
+  loadSearches();
 });
 </script>
 
@@ -785,6 +899,68 @@ onMounted(() => {
       <button class="ghost" @click="togglePage">
         {{ pageAllOn ? "取消本页" : "全选本页" }}
       </button>
+      <!-- V43 排序: 档位名来自后端(facets/library 同源), 这里只画。
+           再点当前档位 = 回到默认; 方向单独一个按钮切换。 -->
+      <div class="sort-wrap">
+        <button class="ghost sort-btn" @click="sortOpen = !sortOpen">
+          排序: {{ currentSortLabel }} <i class="caret">▾</i>
+        </button>
+        <button
+          class="ghost mini"
+          :title="query.order === 'asc' ? '当前升序, 点一下改降序' : '当前降序, 点一下改升序'"
+          @click="toggleOrder"
+        >{{ query.order === "asc" ? "↑" : "↓" }}</button>
+        <div v-if="sortOpen" class="sort-pop">
+          <button
+            v-for="s in sortOptions"
+            :key="s.key"
+            class="sort-item"
+            :class="{ on: (query.sort || defaultSort) === s.key }"
+            @click="pickSort(s.key)"
+          >{{ s.label }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- V43 保存的搜索(智能文件夹)。每条都带**命中数**:
+         "配了但一条都不匹配"与"没配"在界面上必须能分开, 所以 0 就显示 0;
+         count 为 null 表示**没算出结果**(库里的条件读坏了), 显示成 "—" ——
+         这与 0 是两件事(第 26 条)。 -->
+    <div class="sw-bar">
+      <span class="tb-label">智能文件夹</span>
+      <span class="sw-list">
+        <span
+          v-for="s in searches"
+          :key="s.id"
+          class="sw-chip"
+          :class="{ on: activeSearch === s.id, broken: s.broken }"
+        >
+          <button
+            class="sw-pick"
+            :title="s.broken ? '这个搜索的条件在库里读不出来' : '应用这组筛选'"
+            @click="applySearch(s)"
+          >
+            {{ s.name }}
+            <em class="sw-n">{{ s.count === null ? "—" : s.count }}</em>
+          </button>
+          <button class="sw-del" title="删除" @click="removeSearch(s)">×</button>
+        </span>
+        <span v-if="!searches.length && !searchBusy" class="sw-empty">
+          把当前条件存下来, 以后一键回到这一屏
+        </span>
+      </span>
+      <span class="grow"></span>
+      <input
+        v-model="searchName"
+        class="sw-name"
+        placeholder="给这组条件起个名字…"
+        @keyup.enter="saveCurrentSearch"
+      />
+      <button
+        class="ghost mini"
+        :disabled="searchBusy"
+        @click="saveCurrentSearch"
+      >保存当前筛选</button>
     </div>
 
     <!-- 标签条: 点一下筛, 再点一下取消。只在真有标签时占版面。
@@ -1308,6 +1484,57 @@ onMounted(() => {
   margin: -6px 0 14px;
 }
 .tb-label { color: var(--muted); font-size: 12px; flex: none; }
+/* ---- V43 排序下拉 ---- */
+.sort-wrap { position: relative; display: flex; align-items: center; gap: 4px; flex: none; }
+.sort-btn .caret { font-style: normal; opacity: .6; margin-left: 2px; }
+.sort-pop {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 20;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px; min-width: 120px; display: flex; flex-direction: column;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .28);
+}
+.sort-item {
+  background: none; border: 0; color: var(--text); text-align: left;
+  padding: 5px 9px; border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.sort-item:hover { background: var(--border); }
+.sort-item.on { color: var(--accent); }
+/* ---- V43 保存的搜索(智能文件夹) ---- */
+.sw-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin: -6px 0 14px;
+}
+.sw-list { display: contents; }
+.sw-chip {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border); border-radius: 20px;
+  background: var(--panel-2); overflow: hidden;
+}
+.sw-chip.on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+/* 条件读不出来的: 边框提示, 但**不隐藏** —— 让它消失等于把"坏了"变成"没有"。 */
+.sw-chip.broken { border-style: dashed; border-color: var(--warn, #d29922); }
+.sw-pick {
+  background: none; border: 0; color: inherit; cursor: pointer;
+  padding: 3px 4px 3px 10px; font-size: 12px;
+}
+.sw-chip.on .sw-pick { color: var(--accent); }
+.sw-n {
+  font-style: normal; opacity: .6; margin-left: 5px; font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.sw-del {
+  background: none; border: 0; color: var(--muted); cursor: pointer;
+  padding: 3px 8px 3px 4px; font-size: 13px; line-height: 1;
+}
+.sw-del:hover { color: var(--err, #f85149); }
+.sw-empty { color: var(--muted); font-size: 11px; }
+.sw-name {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); padding: 4px 8px; font-size: 12px; width: 170px;
+}
 .tb-more { color: var(--muted); font-size: 11px; }
 /* 含子标签: 只在当前标签真有子标签时才出现 */
 .tb-sub {

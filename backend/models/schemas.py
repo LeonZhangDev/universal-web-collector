@@ -211,6 +211,58 @@ class LibraryFacetsOut(BaseModel):
     items: List[FacetItem] = []
     ratings: List[RatingBucket] = []
     total: int = 0
+    # 排序档位由后端下发(键 + 中文名)。前端不自己维护一份: 后端加一档时
+    # 界面会静默少一个选项, 而"少一个选项"没人会报 bug。
+    sorts: List[dict] = []
+    default_sort: str = "added"
+
+
+class SortOption(BaseModel):
+    key: str
+    label: str
+
+
+class LibrarySearchIn(BaseModel):
+    """保存一个搜索(智能文件夹)。
+
+    `params` 是**具名筛选参数**原样存下来(白名单校验后), 回灌时仍走
+    `library_filters` 的具名参数 —— 所以永远不会变成拼接出来的 SQL。
+    """
+
+    name: str
+    params: dict = {}
+
+
+class LibrarySearchOut(BaseModel):
+    """一个保存的搜索。`count` **必须**给:
+
+    "配了但一条都不匹配"与"没配"在界面上长得一模一样(第 27 条), 而 0 就是 0
+    (真的数过了)。`broken=True` 表示库里的条件读不出来 —— 这时 `count` 为
+    `None`(没算出结果), 与 `count=0`(算出 0 条)是两件事(第 26 条)。
+    """
+
+    id: int = 0
+    name: str = ""
+    params: dict = {}
+    count: Optional[int] = None
+    created_at: float = 0.0
+    broken: bool = False
+
+
+class LibrarySearchSavedOut(BaseModel):
+    """保存一个搜索的结果。`created=False` 表示**覆盖了同名的那个**(不是失败)。"""
+
+    id: int = 0
+    name: str = ""
+    created: bool = False
+
+
+class LibrarySearchDeletedOut(BaseModel):
+    """删除结果。`deleted=False` 表示本来就不存在 —— 删除是幂等的, 不是错误。"""
+
+    id: int = 0
+    name: str = ""
+    deleted: bool = False
 
 
 class DuplicateGroupOut(BaseModel):

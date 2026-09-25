@@ -66,6 +66,10 @@ from models.schemas import (
     LibraryRateOut,
     LibraryReplayIn,
     LibraryReplayOut,
+    LibrarySearchDeletedOut,
+    LibrarySearchIn,
+    LibrarySearchOut,
+    LibrarySearchSavedOut,
     LibraryTagsIn,
     LibraryTagsOut,
     LibraryVerifyIn,
@@ -815,6 +819,10 @@ def resource_library(
     ),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    sort: Optional[str] = Query(
+        None, description="排序档位(取值见 /library/facets 的 sorts); 未知取值回 400"
+    ),
+    order: Optional[str] = Query("desc", description="asc / desc"),
 ):
     """跨任务资源库: 按相册 / 类型 / 标签 / 关键词浏览**已落盘**的产物。
 
@@ -837,6 +845,7 @@ def resource_library(
             limit=page_size, offset=offset, tag=tag, favorite=favorite,
             tag_children=tag_children,
             min_rating=min_rating, special=special,
+            sort=sort, order=order,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -858,6 +867,16 @@ def resource_library(
         "page": page,
         "page_size": page_size,
         "pages": (total + page_size - 1) // page_size,
+        # 回显**实际生效**的排序(未知代号已经在上面被 400 挡掉, 所以这里一定是
+        # 合法值)。前端拿它来高亮当前档位 —— 自己记 state 的话, 一次失败的请求
+        # 就会让高亮和真实顺序不一致, 而且看不出哪里不对。
+        "sort": sort or db.LIBRARY_DEFAULT_SORT,
+        "order": "asc" if (order or "").strip().lower() == "asc" else "desc",
+        # 档位清单与默认档位**与 facets 同源**(都出自 db.library_sorts())。
+        # 在这里也给一份是为了让排序下拉在**第一次列表请求**就有内容, 不必为了
+        # 拿档位再打一次 facets(那会把 9 个 count 也一起算一遍)。
+        "sorts": db.library_sorts(),
+        "default_sort": db.LIBRARY_DEFAULT_SORT,
         "stats": db.library_stats(),
         # 卡片上"缺失 / 疑似损坏 / 名字与内容不符"这几枚徽章的中文。由后端下发:
         # 前端自己维护一份的话, 后端加一类时界面会静默显示成代号(第 9 条)。
@@ -901,6 +920,43 @@ def library_facets():
     `items[].key` 可直接喂给 `GET /library?special=<key>`。
     """
     return LibraryFacetsOut(**db.library_facets())
+
+
+@router.get("/library/searches", response_model=List[LibrarySearchOut])
+def library_search_list():
+    """保存的搜索(智能文件夹)清单, **每项带命中数**。
+
+    `count` 是必须的: "配了但一条都不匹配"与"没配"在界面上长得一模一样, 而
+    "规则生效了要有计数当证据"是第 27 条 —— 排除模式、体检维度都遵守同一条。
+    `count` 为 `None` 表示**没算出结果**(库里的条件读不出来), 与 `0`(算出 0 条)
+    是两件事(第 26 条)。
+    """
+    return [LibrarySearchOut(**d) for d in db.list_searches()]
+
+
+@router.post("/library/searches", response_model=LibrarySearchSavedOut)
+def library_search_save(payload: LibrarySearchIn):
+    """新建/覆盖一个保存的搜索。同名覆盖。
+
+    条件在**保存时**就过白名单与合法性校验(见 `db.clean_search_params`):
+    一个存坏的搜索会让每次列表都抛异常, 把整个侧栏打挂 —— 保存时拒绝是唯一
+    能保证"存下来的都跑得动"的位置。
+    """
+    try:
+        sid, created = db.save_search(payload.name, payload.params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return LibrarySearchSavedOut(id=sid, name=payload.name.strip(), created=created)
+
+
+@router.delete("/library/searches/{sid}", response_model=LibrarySearchDeletedOut)
+def library_search_delete(sid: int):
+    """删除一个保存的搜索。`deleted=False` 表示本来就不存在(删除是幂等的)。"""
+    row = db.get_search(sid)
+    n = db.delete_search(sid)
+    return LibrarySearchDeletedOut(
+        id=int(sid), name=(row or {}).get("name", ""), deleted=bool(n)
+    )
 
 
 @router.get("/library/duplicates", response_model=DuplicatesOut)

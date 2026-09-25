@@ -232,6 +232,20 @@ CREATE TABLE IF NOT EXISTS url_archive(
     -- 没有那个信息, 硬填一个数字就是伪造证据(见第 26 条)。
     added_at REAL NOT NULL
 );
+
+-- 保存的搜索(智能文件夹): 把一组筛选条件命名存下来, 侧栏一键复用。
+-- 存的是**具名参数**(JSON 对象), 回灌时仍然走 library_filters 的具名参数,
+-- 所以永远不会变成拼接出来的 SQL(第 7 条)。
+-- ⚠️ 时刻列按新表约定 = created_at + REAL(epoch 秒); 并且**必须在保存时**就
+-- 校验条件合法性 —— 否则一个存坏的搜索会让每次列表都抛异常, 把整个面板打挂。
+CREATE TABLE IF NOT EXISTS library_searches(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    params TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_library_searches_name
+    ON library_searches(name);
 """
 
 # 索引在列迁移之后创建(旧库可能缺列)
@@ -1103,6 +1117,162 @@ SPECIAL_LABELS = {
     "noduration": ("没量到时长", "视频时长为空(多半是没装 ffprobe, 不等于文件坏)"),
 }
 
+#: 资源库的排序档位: 键 → (SQL 列表达式, 中文名)。
+#: ⚠️ **前端传的是"代号", 这里必须是唯一的翻译点**(第 7 条) —— 拿前端传来的
+#: 字符串直接拼进 ORDER BY 就是 SQL 注入, 而它偏偏"跑得通", 所以不会有人发现。
+LIBRARY_SORTS = {
+    "added": ("r.id", "加入顺序"),
+    "size": ("COALESCE(r.size, 0)", "文件大小"),
+    "rating": ("COALESCE(r.rating, 0)", "星级"),
+    "name": ("COALESCE(r.local_path, '')", "文件名"),
+    "type": ("COALESCE(r.type, '')", "类型"),
+}
+
+#: 默认档位。与 `library_list` 里 `r.id DESC` 的老行为**逐位一致**, 这样不传
+#: 排序参数的调用方(以及既有测试)看到的结果不会变。
+LIBRARY_DEFAULT_SORT = "added"
+
+#: 允许被"保存的搜索"持久化的筛选键。**白名单**而非黑名单: 存进来的东西以后
+#: 会被原样回灌到 `library_filters`, 少一个键是"这个搜索少筛了一项"(看得见),
+#: 多一个键是"每次列表面板都炸"(看不见)。
+LIBRARY_QUERY_KEYS = (
+    "q", "kind", "album", "task_id", "tag", "tag_children",
+    "favorite", "min_rating", "special",
+)
+
+
+def library_order_by(sort=None, order=None):
+    """把排序代号翻成 ORDER BY 片段。未知代号抛 ValueError(由 API 转 400)。
+
+    ⚠️ 每一档都拼一个**次级键 `r.id`**: 同值行(同一秒落盘、同样大小、同为 5 星)
+    在 SQLite 里的相对次序由扫描顺序决定, 翻页时同一行可能出现在两页、也可能
+    一页都不出现 —— 这类错**不报错**, 只表现为"我明明看到过那一条"。
+
+    ⚠️ `order` 只认 `asc`, 其余一律当 `desc`: 排序方向写错时用户能一眼看出来
+    (列表顺序反了), 而为此回 400 只会让前端多一条要处理的错误路径。
+    """
+    key = (sort or LIBRARY_DEFAULT_SORT).strip() or LIBRARY_DEFAULT_SORT
+    if key not in LIBRARY_SORTS:
+        raise ValueError(f"unknown sort: {sort}")
+    column = LIBRARY_SORTS[key][0]
+    desc = (order or "desc").strip().lower() != "asc"
+    tie = "" if column == "r.id" else ", r.id DESC"
+    return f"ORDER BY {column} {'DESC' if desc else 'ASC'}{tie}"
+
+
+def library_sorts():
+    """排序档位清单(带中文名), 供 `/library/facets` 下发。"""
+    return [{"key": k, "label": v[1]} for k, v in LIBRARY_SORTS.items()]
+
+
+def clean_search_params(params):
+    """把外部传入的筛选条件收成一份**可安全回灌**的字典。
+
+    做三件事, 每件都对应一类静默失败:
+
+    1. **白名单过滤**(而不是黑名单): 存进来的东西以后会被原样回灌到
+       `library_filters`, 少一个键是"这个搜索少筛了一项"(看得见), 多一个键是
+       "每次打开侧栏都炸"(看不见)。所以未知键直接抛错, 不悄悄丢。
+    2. **丢掉空值**: 空字符串/0/False 在 `library_filters` 里本来就等于"不限",
+       存下来只会让搜索的定义读起来含混(到底筛没筛这一项?)。
+    3. **当场校验 `special`**: 一个非法取值如果被存进去, 会在**每次列出搜索**
+       时抛 ValueError —— 整个侧栏打不开。保存时拒绝是唯一能保证"存下来的
+       都跑得动"的位置。
+    """
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    out = {}
+    for key, value in params.items():
+        if key not in LIBRARY_QUERY_KEYS:
+            raise ValueError(f"unknown filter key: {key}")
+        if value is None or value == "" or value is False or value == 0:
+            continue
+        if key in ("tag_children", "favorite"):
+            out[key] = bool(value)
+        elif key in ("min_rating", "task_id"):
+            out[key] = int(value)
+        elif key == "kind" and value == "all":
+            continue
+        else:
+            out[key] = str(value)
+    if out.get("special") and out["special"] not in SPECIAL_FILTERS:
+        raise ValueError(f"unknown special filter: {out['special']}")
+    if out.get("min_rating") is not None and not 1 <= out["min_rating"] <= 5:
+        raise ValueError("min_rating out of range")
+    return out
+
+
+def save_search(name, params):
+    """新建/覆盖一个保存的搜索。同名覆盖 —— 用户改完条件再存是常态, 报"已存在"
+    只会逼他先删再建。返回 `(id, created)`。"""
+    clean = (name or "").strip()
+    if not clean:
+        raise ValueError("name is required")
+    if len(clean) > 100:
+        raise ValueError("name too long (max 100)")
+    kept = clean_search_params(params)
+    existing = query_one("SELECT id FROM library_searches WHERE name=?", (clean,))
+    if existing:
+        execute("UPDATE library_searches SET params=? WHERE id=?",
+                (json.dumps(kept, ensure_ascii=False), existing["id"]))
+        return existing["id"], False
+    cur = execute(
+        "INSERT INTO library_searches(name, params, created_at) VALUES(?,?,?)",
+        (clean, json.dumps(kept, ensure_ascii=False), now_ts()),
+    )
+    return cur.lastrowid, True
+
+
+def _search_row(row, with_count=True):
+    d = {
+        "id": row["id"],
+        "name": row["name"],
+        "created_at": row["created_at"],
+    }
+    broken = False
+    try:
+        parsed = json.loads(row["params"] or "{}")
+        if not isinstance(parsed, dict):
+            raise ValueError("params must be an object")
+    except (TypeError, ValueError):
+        # 手改过库/旧版本写的脏值: 降级成空条件而不是让整个面板 500。
+        parsed = {}
+        broken = True
+    d["params"] = parsed
+    if broken:
+        # ⚠️ 条件读不出来时**不数**: 数出来的那个数字不管是多少都在说谎。
+        # 空条件数出来是"整个库的条数", 于是这条搜索会被伪装成"一条正常但很宽
+        # 的搜索" —— 用户看到 4821 只会以为自己的条件存丢了。所以是 `None`
+        # (没算出结果), 并且带 `broken` 让人知道该看哪里(第 26 条)。
+        d["count"] = None
+        d["broken"] = True
+        return d
+    if with_count:
+        # ⚠️ 命中数是**必须**的(第 27 条): "配了但一条都不匹配"和"没配"在界面上
+        # 长得一模一样, 而 0 就是 0(真的数过了), 不许显示成 "—"。
+        try:
+            d["count"] = library_count(**parsed)
+        except ValueError:
+            d["count"] = None
+            d["broken"] = True
+    return d
+
+
+def list_searches():
+    """全部保存的搜索, 按名字序(稳定, 与新建顺序无关)。"""
+    rows = query("SELECT * FROM library_searches ORDER BY name COLLATE NOCASE")
+    return [_search_row(r) for r in rows]
+
+
+def get_search(sid):
+    row = query_one("SELECT * FROM library_searches WHERE id=?", (int(sid),))
+    return _search_row(row) if row else None
+
+
+def delete_search(sid):
+    cur = execute("DELETE FROM library_searches WHERE id=?", (int(sid),))
+    return cur.rowcount or 0
+
 
 def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
                     tag=None, favorite=None, tag_children=False,
@@ -1296,16 +1466,19 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
 
 def library_list(q=None, kind=None, task_id=None, album=None, status="done",
                  limit=50, offset=0, tag=None, favorite=None,
-                 tag_children=False, min_rating=None, special=None):
+                 tag_children=False, min_rating=None, special=None,
+                 sort=None, order=None):
     """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。"""
     where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
                                   tag_children, min_rating, special)
+    # 排序代号在这里翻译(白名单), 结果只可能是 LIBRARY_SORTS 里的列表达式。
+    order_by = library_order_by(sort, order)
     rows = query(
         f"""SELECT r.*, t.name AS task_name, t.collector AS collector,
                    t.created_time AS task_time
             FROM resources r JOIN tasks t ON t.id = r.task_id
             WHERE {where}
-            ORDER BY r.id DESC LIMIT ? OFFSET ?""",
+            {order_by} LIMIT ? OFFSET ?""",
         tuple(args) + (int(limit), int(offset)),
     )
     return rows
@@ -1607,6 +1780,10 @@ def library_facets():
     return {
         "items": out,
         "ratings": [{"stars": s, "n": stars.get(s, 0)} for s in range(6)],
+        # 排序档位也由后端下发: 前端自己维护一份的话, 后端加一档时界面会静默
+        # 少一个选项 —— 而"少一个选项"没人会报 bug(第 9 条)。
+        "sorts": library_sorts(),
+        "default_sort": LIBRARY_DEFAULT_SORT,
         "total": library_count(),
     }
 

@@ -92,7 +92,14 @@ CREATE TABLE IF NOT EXISTS resources(
     -- 收藏(0/1)。与"标签"分开是刻意的: 收藏是**一个布尔属性**(排序、计数、批量
     -- 切换都很直接), 而标签是**多值**。把它也做成一个特殊标签的话, "星标"和
     -- "标签"两套 UI 就得共用一条数据通路, 取值冲突时要额外规则去仲裁。
-    favorite INTEGER NOT NULL DEFAULT 0
+    favorite INTEGER NOT NULL DEFAULT 0,
+    -- V42: 五星评分(0 = 未评分)。与收藏**并存而不是合并**: 收藏回答"还要不要
+    -- 再看到它"(布尔, 两堆), 评分回答"它有多好"(序数, 可排序)。Eagle / digiKam /
+    -- TagStudio / Immich 全都两套并存 —— 在几千张里挑"最好的那几张"时, 布尔只能
+    -- 分成两堆, 序数是唯一能把结果排出来的东西。
+    -- ⚠️ **0 表示"还没评过", 不是"0 分"**: 界面上的"未评分"筛选必须读这一列,
+    -- 不能靠"看起来没有星星"去猜。
+    rating INTEGER NOT NULL DEFAULT 0
 );
 
 -- 资源标签(多对多)。⚠️ 用**明细表**而不是 resources 里的一列:
@@ -206,6 +213,25 @@ CREATE TABLE IF NOT EXISTS local_favorites(
     path TEXT PRIMARY KEY,
     created_at REAL NOT NULL
 );
+
+-- V42: 「已下载 URL 归档」(对标 yt-dlp / gallery-dl 的 `--download-archive`)。
+--
+-- 它解决的是**换机器 / 重装之后增量断掉**。资源库当然知道自己下过什么, 但那份
+-- 记录只活在这一个库文件里; 归档是**能随身带走的纯文本**, 带到新机器上就能让
+-- 增量继续跳过旧内容 —— 而增量是订阅巡检唯一不重复下载的依据。
+--
+-- ⚠️ 它**不是**"资源库的下游副本": 归档里的 URL 在本机可能根本没有对应文件
+-- (那是别人/别的机器下的), 所以它只用于**提示与可选的跳过**, 永远不参与
+-- "这个文件在不在、能不能删"的判断 —— 那归 resources.local_path 管。
+CREATE TABLE IF NOT EXISTS url_archive(
+    url TEXT PRIMARY KEY,
+    -- 归档行里带了 sha256 就一起存(可选)。判重只按 URL —— 归档是"我记得下过
+    -- 这个地址", 不是"我手里有这份字节", 混进来会让"下过"变成"还在"。
+    hash TEXT,
+    -- **导入时刻**(epoch 秒)。⚠️ 不是"这条当初下载的时刻": 归档文本里通常
+    -- 没有那个信息, 硬填一个数字就是伪造证据(见第 26 条)。
+    added_at REAL NOT NULL
+);
 """
 
 # 索引在列迁移之后创建(旧库可能缺列)
@@ -220,6 +246,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);
 -- 标签是"按标签找资源"的入口, 没有这条索引时每次筛选都是全表扫 tags
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON resource_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_resources_favorite ON resources(favorite);
+CREATE INDEX IF NOT EXISTS idx_resources_rating ON resources(rating);
 """
 
 
@@ -267,6 +294,8 @@ _ADD_COLUMNS = [
     ("resources", "duration", "REAL"),
     # V41: 相册集的排除模式(glob 列表, JSON 数组)。见 localalbums.parse_exclude
     ("local_roots", "exclude", "TEXT"),
+    # V42: 五星评分(0 = 未评分)。与 favorite 同理, 是资源自身的属性而不是标签。
+    ("resources", "rating", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -1032,8 +1061,52 @@ def normalize_tag(tag):
     return TAG_SEP.join(p.strip() for p in parts)
 
 
+#: 「体检视图」的筛选键 → SQL 判据。**每个维度的定义只在这里出现一次**。
+#:
+#: 为什么需要它: 资源库能按标签/相册/类型筛, 但"哪些还没打标签""哪些被判成
+#: 重复""哪些文件坏了"这类问题**没有入口** —— 它们不是某个字段的取值, 而是
+#: 一条跨字段的判断。TagStudio 用 `special:untagged` 这类查询语法解决, Czkawka
+#: 干脆做成十种扫描模式; 两者都在说同一件事: **整理型的问题必须单独成项**,
+#: 指望用户自己拼出 `tag 为空 AND 类型=图片` 是不现实的。
+#:
+#: ⚠️ 键的中文名在 `SPECIAL_LABELS` 里由**后端下发**(第 9 条: 界面上人看的文案
+#: 与判据必须同源, 前端自己编一套就会出现"改名后端不知道")。
+SPECIAL_FILTERS = {
+    "untagged": "NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id = r.id)",
+    "unrated": "r.rating = 0",
+    "rated": "r.rating > 0",
+    "duplicate": "r.duplicate_of IS NOT NULL",
+    "corrupt": "r.error_kind = 'corrupt'",
+    "missing": "r.error_kind = 'missing'",
+    # 扩展名**声称**的格式与文件头对不上(见 core/filekind.py)。这类文件多半能打开
+    # —— 它只是"叫错了名字", 不是"内容是坏的", 所以与 corrupt 分开记账:
+    # 混在一起会让"内容损坏"这个数字变得没法解释。
+    "mismatch": "r.error_kind = 'mismatch'",
+    # ⚠️ 这一条说的是"**没量到尺寸**", 不是"尺寸是 0": width 为 NULL 是"没测",
+    # 为 0 才是可疑产物。两者在这里同属一类是因为它们**同样无法用于排序/筛选**,
+    # 但理由不同, 所以文案里必须说清(见第 26 条)。
+    "nodims": "r.type = 'image' AND (r.width IS NULL OR r.width = 0)",
+    # 同理: duration IS NULL = 没装 ffprobe / 没测, 不是"这个视频 0 秒"。
+    "noduration": "r.type = 'video' AND r.duration IS NULL",
+}
+
+#: 体检维度的中文名与解释。文案放后端, 前端只拿键查表。
+SPECIAL_LABELS = {
+    "untagged": ("未打标签", "一条标签都没有, 以后很难靠标签找到它"),
+    "unrated": ("未评分", "还没给过星级"),
+    "rated": ("已评分", "打过 1-5 星"),
+    "duplicate": ("疑似重复", "与同任务里另一条高度相似(只标记, 没删文件)"),
+    "corrupt": ("内容损坏", "字节下来了但解不开"),
+    "missing": ("文件已丢失", "落盘后被外部删掉或移动了"),
+    "mismatch": ("名字与内容不符", "扩展名说是 A, 文件头是 B(多半还能打开)"),
+    "nodims": ("没量到尺寸", "图片的宽高为空或 0"),
+    "noduration": ("没量到时长", "视频时长为空(多半是没装 ffprobe, 不等于文件坏)"),
+}
+
+
 def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
-                    tag=None, favorite=None, tag_children=False):
+                    tag=None, favorite=None, tag_children=False,
+                    min_rating=None, special=None):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
     单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
@@ -1048,9 +1121,23 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
     tag_children=True 时连**子标签**一起收(点 `系列` 能看到 `系列/角色A`):
     层级是名字里的前缀, 所以这是一次前缀匹配。默认关 —— 精确匹配是老行为,
     也是"我就要这一个标签"时唯一正确的语义。
+
+    `min_rating` / `special` 是 V42 的整理型筛选: 前者按星级下限, 后者取
+    `SPECIAL_FILTERS` 里的键。**未知键直接忽略而不报错**是错的 —— 那会让
+    "我点了没反应"变成静默失败, 所以这里抛 ValueError 由 API 层转 400。
     """
     where = ["1=1"]
     args = []
+
+    if special:
+        clause = SPECIAL_FILTERS.get(special)
+        if not clause:
+            raise ValueError(f"unknown special filter: {special}")
+        where.append("(" + clause + ")")
+
+    if min_rating:
+        where.append("r.rating >= ?")
+        args.append(int(min_rating))
 
     if status:
         where.append("r.status=?")
@@ -1194,10 +1281,11 @@ def failure_count(kinds=None, include_gone=False):
 
 
 def library_count(q=None, kind=None, task_id=None, album=None, status="done",
-                  tag=None, favorite=None, tag_children=False):
+                  tag=None, favorite=None, tag_children=False,
+                  min_rating=None, special=None):
     """资源库总数(与 library_list 同一口径)。"""
     where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
-                                  tag_children)
+                                  tag_children, min_rating, special)
     row = query_one(
         f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
         f"WHERE {where}",
@@ -1208,10 +1296,10 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
 
 def library_list(q=None, kind=None, task_id=None, album=None, status="done",
                  limit=50, offset=0, tag=None, favorite=None,
-                 tag_children=False):
+                 tag_children=False, min_rating=None, special=None):
     """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。"""
     where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
-                                  tag_children)
+                                  tag_children, min_rating, special)
     rows = query(
         f"""SELECT r.*, t.name AS task_name, t.collector AS collector,
                    t.created_time AS task_time
@@ -1457,6 +1545,201 @@ def set_favorite(resource_ids, value=True):
     )
     n = cur.rowcount or 0
     return n
+
+
+def set_rating(resource_ids, rating=0):
+    """批量设置星级(0-5), 返回影响条数。
+
+    `0` = 清除评分(回到"未评分"), 不是"打 0 分"。
+
+    ⚠️ 取值在这里**硬拦**而不是交给界面: 评分会被排序与筛选消费
+    (`/library?min_rating=`), 一个 7 星的资源会让"≥5 星"的口径说不清 ——
+    而界面那一侧只负责画星星, 它不该知道上限是多少。
+    """
+    ids = [int(i) for i in (resource_ids or [])]
+    if not ids:
+        return 0
+    try:
+        value = int(rating)
+    except (TypeError, ValueError):
+        raise ValueError("rating must be an integer")
+    if value < 0 or value > 5:
+        raise ValueError("rating must be between 0 and 5")
+    marks = ",".join("?" * len(ids))
+    cur = execute(
+        f"UPDATE resources SET rating=? WHERE id IN ({marks})",
+        (value,) + tuple(ids),
+    )
+    return cur.rowcount or 0
+
+
+def library_facets():
+    """资源库的「体检视图」: 每个整理型维度各有多少条。
+
+    为什么单列一个接口: "哪些还没打标签""哪些被判成重复""哪些文件坏了"这类
+    问题**没有入口** —— 它们不是某个字段的取值, 而是一条跨字段判断。TagStudio
+    用 `special:` 查询语法、Czkawka 做成十种扫描模式, 都在说同一件事: 整理型
+    的问题必须单独成项, 指望用户自己拼条件是不现实的。
+
+    ⚠️ 每一项都带 `n`, 而且 **0 就是 0**(真的数过了)。这与"没法数"是两件事,
+    界面不能把 0 显示成"—"或"未知"(第 26 条)。
+    """
+    out = []
+    for key, clause in SPECIAL_FILTERS.items():
+        row = query_one(
+            f"SELECT COUNT(*) AS n FROM resources r "
+            f"WHERE r.status='done' AND ({clause})"
+        )
+        label, hint = SPECIAL_LABELS.get(key, (key, ""))
+        out.append({
+            "key": key,
+            "label": label,
+            "hint": hint,
+            "n": row["n"] if row else 0,
+        })
+    # 评分区间: 与 `min_rating` 筛选配套。给出每一档的条数, 让"我只想看 5 星"
+    # 不必先猜有多少。
+    by_rating = query(
+        "SELECT rating AS r, COUNT(*) AS n FROM resources "
+        "WHERE status='done' GROUP BY rating"
+    )
+    stars = {int(r["r"] or 0): r["n"] for r in by_rating}
+    return {
+        "items": out,
+        "ratings": [{"stars": s, "n": stars.get(s, 0)} for s in range(6)],
+        "total": library_count(),
+    }
+
+
+def duplicate_groups(limit=50):
+    """把 `duplicate_of` 的**平铺指向**还原成"组", 并给出建议保留的那一条。
+
+    为什么要有"建议保留": 只标记"这批互相疑似重复"是不够的 —— 用户真正要做的
+    决定是**留哪个**。dupeGuru 的做法是每组固定一个 reference(界面上删不掉),
+    Czkawka 用 `-D AEN/AEB` 让用户选保留策略(最新 / 最大)。这里给一个默认建议,
+    并把**理由一起回给界面**: 推荐是最好的默认值, 但"为什么推荐它"必须看得见,
+    否则它只是另一个黑箱。
+
+    建议规则(按优先级):
+      1. 像素数高的(同图的不同尺寸版本里, 大图几乎总是要留的那个);
+      2. 像素数相同则体积大的;
+      3. 都一样则 **id 最小**那条 —— 它先到, 最可能是"原件"。
+
+    ⚠️ 与产品一贯口径一致: **只标记, 不删任何文件**。dHash 会误判(实测纯色图
+    互相距离 0), 所以这里给的是"建议", 决定权在人。
+    """
+    cols = ("r.id, r.duplicate_of, r.task_id, r.type, r.size, r.width, r.height, "
+            "r.local_path, r.filename, r.hash, r.rating, r.favorite, r.created_time")
+    rows = query(
+        f"SELECT {cols} FROM resources r WHERE r.duplicate_of IS NOT NULL "
+        f"ORDER BY r.duplicate_of, r.id"
+    )
+    if not rows:
+        return []
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(int(r["duplicate_of"]), []).append(dict(r))
+    root_ids = sorted(grouped)
+    marks = ",".join("?" * len(root_ids))
+    roots = {
+        int(r["id"]): dict(r)
+        for r in query(
+            f"SELECT {cols} FROM resources r WHERE r.id IN ({marks})",
+            tuple(root_ids),
+        )
+    }
+
+    def _pixels(row):
+        return (row.get("width") or 0) * (row.get("height") or 0)
+
+    groups = []
+    for root_id in root_ids:
+        members = [roots[root_id]] if root_id in roots else []
+        members += grouped[root_id]
+        ranked = sorted(members, key=lambda d: (-_pixels(d), -(d.get("size") or 0), d["id"]))
+        keep = ranked[0]
+        best_px = _pixels(keep)
+        best_size = keep.get("size") or 0
+        if best_px > 0 and best_px > max((_pixels(d) for d in ranked[1:]), default=0):
+            reason = "highest_res"
+        elif best_size > max((d.get("size") or 0 for d in ranked[1:]), default=0):
+            reason = "largest"
+        else:
+            reason = "oldest"
+        groups.append({
+            "keep_id": keep["id"],
+            "keep_reason": reason,
+            "n": len(members),
+            "bytes": sum(d.get("size") or 0 for d in members),
+            "members": ranked,
+        })
+    # 大组在前(最值得先看), 同规模按最新
+    groups.sort(key=lambda g: (-g["n"], -g["keep_id"]))
+    return groups[: int(limit)] if limit else groups
+
+
+def url_archive_add(entries):
+    """导入「已下载 URL 归档」, 返回 (新增条数, 已存在而跳过的条数)。
+
+    `entries` 是 [(url, hash_or_None), ...]。
+
+    ⚠️ 用 `INSERT OR IGNORE` 而不是先查后插: 导入动辄上万行, 逐行 SELECT 是
+    两万次往返; 而"新增了几条"要如实回报 —— 所以用 `changes()` 之外的方式会
+    变成"导入成功"却不知道成功多少(第 27 条: 规则生效要有计数)。
+    """
+    added = 0
+    skipped = 0
+    now = now_ts()
+    for url, h in entries:
+        if not url:
+            continue
+        cur = execute(
+            "INSERT OR IGNORE INTO url_archive(url, hash, added_at) VALUES (?,?,?)",
+            (str(url).strip(), h, now),
+        )
+        if cur.rowcount:
+            added += 1
+        else:
+            skipped += 1
+    return added, skipped
+
+
+def url_archive_urls(limit=None, offset=0):
+    """归档里的 URL 列表(导出用)。"""
+    sql = "SELECT url, hash FROM url_archive ORDER BY url"
+    args = ()
+    if limit:
+        sql += " LIMIT ? OFFSET ?"
+        args = (int(limit), int(offset))
+    return query(sql, args)
+
+
+def url_archive_count():
+    row = query_one("SELECT COUNT(*) AS n FROM url_archive")
+    return row["n"] if row else 0
+
+
+def url_archive_has(urls):
+    """哪些 URL 在归档里 —— 批量预检用, 一次查完。"""
+    clean = [str(u).strip() for u in (urls or []) if u]
+    if not clean:
+        return set()
+    hits = set()
+    # SQLite 的 SQLITE_MAX_VARIABLE_NUMBER 在新版是 32766, 但一次塞几万条 URL
+    # 仍然不礼貌 —— 分块查, 块大小与常见上限保持距离。
+    for i in range(0, len(clean), 500):
+        chunk = clean[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for r in query(
+            f"SELECT url FROM url_archive WHERE url IN ({marks})", tuple(chunk)
+        ):
+            hits.add(r["url"])
+    return hits
+
+
+def url_archive_clear():
+    cur = execute("DELETE FROM url_archive")
+    return cur.rowcount or 0
 
 
 def resource_refs(local_path):

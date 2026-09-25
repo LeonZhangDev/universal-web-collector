@@ -121,6 +121,14 @@ KIND_NETWORK = "network"        # 连接/超时/TLS
 #: ⚠️ 单独一类是必要的: 用户看到"文件不见了"时的第一个反应是"程序把我的文件删了",
 #: 而这三者的取证方向完全不同(查源站 / 查网络 / 查本地是谁动的)。
 KIND_MISSING = "missing"        # 落盘后本地文件被外部删除
+#: 扩展名声称的格式与文件头对不上(见 core/filekind.py)。⚠️ 与 corrupt **分开**:
+#: corrupt = 字节下来了但解不开(重下有可能救), mismatch = 下来的是别的东西
+#: (多半是源站把错误页/占位图当图片发了, 重下还是它)。两者混在一处会让
+#: "内容损坏"这个数字没法解释。
+#: ⚠️ 它由**巡检**写入(`/library/verify`), 资源的 status 仍是 done —— 所以
+#: 它不会进死信重放队列(那条路径只收 failed/skipped/gone), 这是有意的:
+#: 重下解决不了它。
+KIND_MISMATCH = "mismatch"      # 名字与内容不符(重下也救不了)
 KIND_UNKNOWN = "unknown"        # 分类之外 —— 通常是我们自己的 bug
 
 #: 归属于"不让你访问"而非"不存在"的状态码。
@@ -173,6 +181,7 @@ KIND_LABELS = {
     KIND_SERVER: "源站服务端错误",
     KIND_NETWORK: "网络中断或超时",
     KIND_MISSING: "本地文件已丢失",
+    KIND_MISMATCH: "名字与内容不符",
     KIND_UNKNOWN: "未知原因",
 }
 

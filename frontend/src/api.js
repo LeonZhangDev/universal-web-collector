@@ -81,6 +81,11 @@ export function listLibrary(opts = {}) {
   if (opts.tag) params.tag = opts.tag;
   if (opts.tag_children) params.tag_children = "true";
   if (opts.favorite) params.favorite = "true";
+  if (opts.min_rating) params.min_rating = opts.min_rating;
+  // 整理型筛选(未打标签 / 疑似重复 / 内容损坏 …)。取值由 /library/facets 下发,
+  // 前端不硬编码键名 —— 后端新增维度时界面自动多出一项。
+  // ⚠️ 未知键后端回 400(不是静默忽略), 这样"点了没反应"不会伪装成"没有这类"。
+  if (opts.special) params.special = opts.special;
   if (opts.page) params.page = opts.page;
   if (opts.page_size) params.page_size = opts.page_size;
   return api.get("/library", { params }).then((r) => r.data);
@@ -152,8 +157,41 @@ export function replayLibraryFailures({
   return api.post("/library/replay", body).then((r) => r.data);
 }
 // 落盘后完整性巡检: 库里有记录、磁盘上却不在或被截断的那些。只标记不删除。
+// V42 起还查"名字与内容不符"(扩展名说是图片、文件头是 HTML): 那类文件多半能打开,
+// 只是**叫错了名字**, 所以它单独计数(mismatched), 不与 truncated 混在一起。
 export function libraryVerify(payload = {}) {
   return api.post("/library/verify", payload).then((r) => r.data);
+}
+// 批量打星(0-5)。rating=0 = 清除评分回到"未评分", 不是"打 0 分"。
+// 上限由后端硬拦(越界 400), 前端只负责画星星。
+export function libraryRate(ids, rating = 0) {
+  return api.post("/library/rate", { ids, rating }).then((r) => r.data);
+}
+// 「体检视图」: 每个整理型维度各有多少条。
+// ⚠️ items[].n 是**真数过**的结果 —— 0 就是 0, 不许显示成 "—"(把"没有"画成"未知")。
+export function getLibraryFacets() {
+  return api.get("/library/facets").then((r) => r.data);
+}
+// 疑似重复**分组**视图: 每组给一条建议保留(keep_reason 是代号, 中文在 reasons 里)。
+// 只标记不删 —— dHash 会误判(纯色图互相距离 0), 所以这里是"建议"不是"动作"。
+export function listLibraryDuplicates(limit = 50) {
+  return api.get("/library/duplicates", { params: { limit } }).then((r) => r.data);
+}
+// ---- 已下载 URL 归档(对标 yt-dlp / gallery-dl 的 --download-archive) ----
+// 归档是**能随身带走的纯文本**: 换机器 / 重装后带过来, 增量采集还能认出"这个我下过"。
+// ⚠️ 导入结果给的 added / skipped 两个数都要显示 —— 只说"成功"的话, 用户没法判断
+// 这份归档是不是真被吃进去了("导入了但没生效"是这类功能最典型的失败方式)。
+export function importUrlArchive(text = "", urls = null) {
+  const body = {};
+  if (text) body.text = text;
+  if (urls) body.urls = urls;
+  return api.post("/library/url-archive", body).then((r) => r.data);
+}
+export function exportUrlArchive() {
+  return api.get("/library/url-archive").then((r) => r.data);
+}
+export function clearUrlArchive() {
+  return api.delete("/library/url-archive").then((r) => r.data);
 }
 // ---- 文件访问 ----
 // 资源库是跨任务视图, 条目上只有 local_path —— 所以走按路径定位的 /files/raw,

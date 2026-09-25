@@ -6,13 +6,19 @@
 // 各列一条并给出引用数(refs) —— 让人知道"删这个文件会不会影响另一个任务"。
 import { computed, onMounted, ref } from "vue";
 import {
+  clearUrlArchive,
+  exportUrlArchive,
+  getLibraryFacets,
+  importUrlArchive,
   libraryArchiveUrl,
   libraryBulkDelete,
   libraryEditTags,
+  libraryRate,
   librarySetFavorite,
   libraryVerify,
   listLibrary,
   listLibraryAlbums,
+  listLibraryDuplicates,
   listLibraryFailures,
   listLibraryTags,
   replayLibraryFailures,
@@ -32,6 +38,9 @@ const tags = ref([]);
 const tagPalette = ref([]);
 const tagSep = ref("/");
 const loading = ref(false);
+// 卡片徽章的中文(missing / corrupt / mismatch)。由 `/library` 下发, 前端
+// **不自己编** —— 否则后端加一类, 界面会静默显示成代号(第 9 条)。
+const errorKindLabels = ref({});
 
 const query = ref({
   q: "",
@@ -42,6 +51,9 @@ const query = ref({
   // "我就要这一个标签"时唯一正确的语义, 含子标签是额外的便利。
   tag_children: false,
   favorite: false,
+  // V42: 星级下限(0 = 不限)与整理型维度(取值由 /library/facets 下发)
+  min_rating: 0,
+  special: "",
   page: 1,
   page_size: 40,
 });
@@ -56,6 +68,11 @@ const KINDS = [
 //: 而 .txt 回退过来是一个文本文件, `<img>` 拿到的必然是一张破图。
 //: 视频可以: ffmpeg 取首帧当海报图(见 core/thumbs.py)。
 const THUMBABLE = ["image", "video"];
+
+// 卡片上值得挂徽章的 error_kind。⚠️ 写死**这三个**而不是"非空就显示":
+// resources 上的 error_kind 还有 http-4xx / network 等**下载期**原因, 那些已经
+// 由 status=failed 表达过一遍, 再挂一枚徽章等于同一件事说两遍。
+const BADGED_KINDS = ["missing", "corrupt", "mismatch"];
 
 // ---- 多选 + 批量操作 ----
 // 选中集合存 id 且**跨翻页保留**(与任务表格同一套语义: 资源库一页 40 项,
@@ -258,10 +275,12 @@ async function runVerify() {
     if (!r.marked) {
       toast(`已检查 ${r.checked} 项, 文件都还在`, "ok");
     } else {
-      // 措辞刻意区分"缺失"与"截断": 前者是文件没了, 后者是文件还在但可能看不全,
-      // 处置方式不同(重下 vs 可能还能用), 合成一句"发现 N 个问题"就丢掉了这个区别。
+      // 措辞刻意区分三类: 缺失(文件没了) / 截断(文件还在但可能看不全) /
+      // 不符(下来的是别的东西, 多半是错误页)。处置方式不同 —— 前两类重下有救,
+      // 第三类重下还是它 —— 合成一句"发现 N 个问题"就丢掉了这个区别。
       toast(
-        `检查 ${r.checked} 项: 缺失 ${r.missing} 项, 疑似截断 ${r.truncated} 项`,
+        `检查 ${r.checked} 项: 缺失 ${r.missing} 项, 疑似截断 ${r.truncated} 项, ` +
+          `名字与内容不符 ${r.mismatched || 0} 项`,
         r.missing ? "err" : "warn"
       );
     }
@@ -271,6 +290,192 @@ async function runVerify() {
   } finally {
     verifying.value = false;
   }
+}
+
+// ---- V42: 体检视图 / 评分 / 重复分组 / URL 归档 ----
+// 这四件事的共同点: 它们回答的都是"库**现在的状态**怎么样", 而不是"某个字段
+// 等于多少"。这类问题在字段级筛选里没有入口 —— 指望用户自己拼出"没打标签 AND
+// 类型是图片"是不现实的(TagStudio 用 `special:` 语法、Czkawka 做成十种扫描模式,
+// 说的是同一件事)。所以它们各自成项, 每一项都带**计数**。
+const facets = ref(null);
+const facetsBusy = ref(false);
+
+async function loadFacets() {
+  if (facetsBusy.value) return;
+  facetsBusy.value = true;
+  try {
+    facets.value = await getLibraryFacets();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    facetsBusy.value = false;
+  }
+}
+function toggleFacets() {
+  if (facets.value) {
+    facets.value = null;
+    return;
+  }
+  loadFacets();
+}
+// 点一个维度 = 按它筛选; 再点一次 = 取消。
+// ⚠️ n === 0 时**仍然可点**(点了会看到空列表并明确写着"没有这类"), 不做成禁用 ——
+// 禁用会让人以为是"还没算出来", 而 0 是后端真数过的结论(第 26 条)。
+function pickSpecial(key) {
+  query.value.special = query.value.special === key ? "" : key;
+  search();
+}
+// 星级筛选。点当前档位再点一次 = 取消(与标签同一套手感)
+function pickRating(n) {
+  query.value.min_rating = query.value.min_rating === n ? 0 : n;
+  search();
+}
+function clearOrganize() {
+  query.value.special = "";
+  query.value.min_rating = 0;
+  search();
+}
+
+// 打星。`rating=0` = 清除评分(回到"未评分"), 不是"打 0 分" —— 提示文案要说清,
+// 否则用户以为自己"评了 0 分"而界面看不出差别。
+async function rate(ids, value) {
+  if (!ids.length) return;
+  try {
+    const r = await libraryRate(ids, value);
+    toast(
+      value ? `已给 ${r.updated} 项打 ${value} 星` : `已清除 ${r.updated} 项的评分`,
+      "ok"
+    );
+    await load();
+    if (facets.value) loadFacets();
+  } catch (e) {
+    // 越界由后端拦(400), 原样透出 —— 换成"操作失败"用户不知道该点几颗
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+function rateOne(r, value) {
+  // 再点同一颗 = 清除。否则"手滑点错了"没有回退路径(只能去批量栏找清除)。
+  rate([r.id], r.rating === value ? 0 : value);
+}
+// 批量栏里的打星: 本页选中项全是同一档时, 再点那档 = 清除
+const selRating = computed(() => {
+  const onPage = items.value.filter((r) => selected.value.has(r.id));
+  if (!onPage.length) return 0;
+  const first = Number(onPage[0].rating || 0);
+  return onPage.every((r) => Number(r.rating || 0) === first) ? first : 0;
+});
+const RATE_OPTS = [1, 2, 3, 4, 5];
+
+// 疑似重复分组。**只标记不删**是本产品的一贯原则(dHash 会误判 —— 纯色图互相
+// 距离 0), 所以这里默认只展示; 真要清理由用户确认, 且默认只删记录不动文件。
+const dupData = ref(null);
+const dupBusy = ref(false);
+
+async function loadDuplicates() {
+  if (dupBusy.value) return;
+  dupBusy.value = true;
+  try {
+    dupData.value = await listLibraryDuplicates(50);
+    if (!dupData.value.groups.length) toast("没有疑似重复的资源", "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    dupBusy.value = false;
+  }
+}
+// keep_reason 是**代号**, 中文从 reasons 里查 —— 前端不硬编码(第 9 条)
+function keepLabel(key) {
+  return (
+    dupData.value?.reasons.find((x) => x.key === key)?.label || key || "最早"
+  );
+}
+// 只保留建议项: 删掉同组里其它**记录**, 文件不动。
+// ⚠️ 必须确认且说清"不动文件": 用户看到"只保留"三个字时默认理解可能是"删文件"。
+async function keepOnly(g) {
+  const others = (g.members || []).filter((m) => m.id !== g.keep_id);
+  if (!others.length) return;
+  if (
+    !confirm(
+      `这一组共 ${g.n} 条, 将删除其余 ${others.length} 条资源库记录。\n\n` +
+        `磁盘上的文件**不会**被删除(判据可能误报, 删文件不可逆)。确认继续?`
+    )
+  )
+    return;
+  try {
+    const r = await libraryBulkDelete(
+      others.map((m) => m.id),
+      false
+    );
+    toast(`已删除 ${r.deleted} 条记录, 文件保留`, "ok");
+    await loadDuplicates();
+    await load();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+
+// URL 归档: 换机器 / 重装之后让增量还能认出"这个我下过"。
+// ⚠️ 导入结果把 added / skipped 两个数**都显示** —— 只说"导入成功"的话, 用户
+// 没法判断这份归档是不是真被吃进去了(第 27 条)。
+const archiveText = ref("");
+const archiveBusy = ref(false);
+const archiveResult = ref(null);
+const archiveOpen = ref(false);
+
+async function importArchive() {
+  if (!archiveText.value.trim()) {
+    toast("先粘贴归档内容(每行一条 URL)", "warn");
+    return;
+  }
+  archiveBusy.value = true;
+  try {
+    const r = await importUrlArchive(archiveText.value);
+    archiveResult.value = r;
+    toast(`导入完成: 新增 ${r.added} 条, 已存在 ${r.skipped} 条, 共 ${r.total} 条`, "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    archiveBusy.value = false;
+  }
+}
+async function exportArchive() {
+  archiveBusy.value = true;
+  try {
+    const r = await exportUrlArchive();
+    if (!r.urls.length) {
+      toast("归档还是空的", "warn");
+      return;
+    }
+    // 归档的本体是**纯文本** —— 它的全部价值就在于"能被带到另一台机器上",
+    // 所以这里直接落成一个 .txt 文件, 而不是只在页面里显示一段 JSON。
+    const blob = new Blob([r.urls.join("\n") + "\n"], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `download-archive-${r.total}.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`已导出 ${r.total} 条 URL`, "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    archiveBusy.value = false;
+  }
+}
+async function resetArchive() {
+  if (!confirm("清空 URL 归档?\n\n只清这一张表, 不碰资源库与任何文件。")) return;
+  try {
+    const r = await clearUrlArchive();
+    archiveResult.value = null;
+    toast(`已清空 ${r.cleared} 条`, "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+
+// 巡检标记的中文: 从后端下发的 `kinds` 里取。⚠️ 前端不维护映射表 ——
+// 维护一份就会在后端新增类别(mismatch 就是这么加的)时静默显示成代号。
+function verifyKindLabel(kind) {
+  return verifyResult.value?.kinds.find((k) => k.kind === kind)?.label || kind;
 }
 
 // ---- 死信(跨任务失败资源)与重放 ----
@@ -436,6 +641,8 @@ async function load() {
       tag: query.value.tag || undefined,
       tag_children: query.value.tag_children || undefined,
       favorite: query.value.favorite || undefined,
+      min_rating: query.value.min_rating || undefined,
+      special: query.value.special || undefined,
       page: query.value.page,
       page_size: query.value.page_size,
     });
@@ -443,6 +650,8 @@ async function load() {
     total.value = r.total || 0;
     pages.value = r.pages || 1;
     stats.value = r.stats || null;
+    // 徽章中文由后端下发(见 api/tasks.py 的 error_kind_labels)
+    if (r.error_kind_labels) errorKindLabels.value = r.error_kind_labels;
   } catch (e) {
     toast(e.response?.data?.detail || String(e), "err");
   } finally {
@@ -522,6 +731,23 @@ onMounted(() => {
       <button class="ghost mini" :disabled="failBusy" @click="loadFailures">
         {{ failBusy ? "读取中…" : "失败诊断" }}
       </button>
+      <!-- V42: 三项"库现在怎么样"的视图。它们与"失败诊断"是**两件事**:
+           那个问"该拿到却没拿到的是什么", 这些问"已经拿到的里面, 哪些还没整理 /
+           哪些互相重复 / 哪些叫错了名字"。 -->
+      <button
+        class="ghost mini"
+        :class="{ on: facets }"
+        :disabled="facetsBusy"
+        @click="toggleFacets"
+      >{{ facetsBusy ? "读取中…" : "体检" }}</button>
+      <button class="ghost mini" :disabled="dupBusy" @click="loadDuplicates">
+        {{ dupBusy ? "读取中…" : "查重复" }}
+      </button>
+      <button
+        class="ghost mini"
+        :class="{ on: archiveOpen }"
+        @click="archiveOpen = !archiveOpen"
+      >URL 归档</button>
       <div class="kind-tabs">
         <button
           v-for="k in KINDS"
@@ -612,20 +838,159 @@ onMounted(() => {
       <button v-if="query.tag" class="ghost mini" @click="pickTag(query.tag)">清除筛选</button>
     </div>
 
+    <!-- 当前生效的整理型筛选。⚠️ 必须常驻显示: 体检面板是可以收起的, 而
+         "列表少了大半"这件事如果不说清原因, 用户的第一反应是"东西丢了"。 -->
+    <div class="org-bar" v-if="query.special || query.min_rating">
+      <span class="org-lab">整理筛选</span>
+      <span class="org-chip on" v-if="query.special">
+        {{ (facets?.items || []).find((x) => x.key === query.special)?.label || query.special }}
+      </span>
+      <span class="org-chip on" v-if="query.min_rating">≥ {{ query.min_rating }} 星</span>
+      <button class="ghost mini" @click="clearOrganize">清除</button>
+    </div>
+
+    <!-- 体检视图: 每个整理型维度各有多少条。点一下即筛选。
+         ⚠️ n === 0 的项**仍然可点**: 0 是后端真数过的结论, 不是"还没算"
+         (做成禁用会让人以为还没算出来, 与"没法数"混为一谈)。 -->
+    <div v-if="facets" class="facet-box">
+      <div class="fc-head">
+        <b>体检</b>
+        <span class="fc-sub">共 {{ facets.total }} 项已落盘</span>
+        <span class="grow"></span>
+        <button class="ghost mini" :disabled="facetsBusy" @click="loadFacets">刷新</button>
+        <button class="ghost mini" @click="facets = null">收起</button>
+      </div>
+      <div class="fc-grid">
+        <button
+          v-for="f in facets.items"
+          :key="f.key"
+          class="facet"
+          :class="{ on: query.special === f.key }"
+          :title="f.hint"
+          @click="pickSpecial(f.key)"
+        >
+          <span class="fc-name">{{ f.label }}</span>
+          <em class="fc-n">{{ f.n }}</em>
+        </button>
+      </div>
+      <!-- 星级分布: 与上面的维度是**两套东西** —— 上面是"状态", 这里是"我给的
+           评价"。分开摆是因为它们的处置方式不同(前者要整理, 后者只是挑出来看)。 -->
+      <div class="fc-stars">
+        <span class="fc-lab">评分</span>
+        <button
+          v-for="b in facets.ratings"
+          :key="b.stars"
+          class="star-chip"
+          :class="{ on: query.min_rating > 0 && b.stars >= query.min_rating }"
+          :title="b.stars === 0 ? '未评分(含还没评过)' : `≥ ${b.stars} 星`"
+          @click="b.stars ? pickRating(b.stars) : pickSpecial('unrated')"
+        >
+          <span v-if="b.stars">{{ "★".repeat(b.stars) }}</span>
+          <span v-else>未评分</span>
+          <em>{{ b.n }}</em>
+        </button>
+      </div>
+      <p class="fc-note">
+        每一项都带条数, 且 0 就是 0(真的数过了)。点一下即按该维度筛选。
+      </p>
+    </div>
+
+    <!-- 疑似重复分组。只标记不删 —— dHash 会误判, 所以"只保留建议项"默认
+         只删记录不动文件, 并且要二次确认。 -->
+    <div v-if="dupData" class="dup-box">
+      <div class="dp-head">
+        <b>疑似重复 {{ dupData.total }} 组</b>
+        <span class="dp-sub">只标记, 不删文件</span>
+        <span class="grow"></span>
+        <button class="ghost mini" :disabled="dupBusy" @click="loadDuplicates">刷新</button>
+        <button class="ghost mini" @click="dupData = null">收起</button>
+      </div>
+      <p v-if="!dupData.groups.length" class="dp-note">没有疑似重复的资源。</p>
+      <div v-else class="dp-list">
+        <div class="dp-group" v-for="g in dupData.groups.slice(0, 20)" :key="g.keep_id">
+          <div class="dp-ghead">
+            <em class="dp-n">{{ g.n }} 条</em>
+            <span class="dp-bytes">{{ fmtSize(g.bytes) }}</span>
+            <span class="grow"></span>
+            <button class="ghost mini" :title="'按像素/体积/先后给出'" @click="keepOnly(g)">
+              只保留建议项
+            </button>
+          </div>
+          <div
+            class="dp-row"
+            v-for="m in g.members"
+            :key="m.id"
+            :class="{ keep: m.id === g.keep_id }"
+          >
+            <em v-if="m.id === g.keep_id" class="dp-keep">保留</em>
+            <span v-else class="dp-dot"></span>
+            <span class="dp-name" :title="m.local_path">{{ baseName(m.local_path) }}</span>
+            <span class="dp-dim">{{ mediaMeta(m) || "—" }}</span>
+            <span class="dp-size">{{ fmtSize(m.size) }}</span>
+            <span class="dp-why" v-if="m.id === g.keep_id">{{ keepLabel(g.keep_reason) }}</span>
+          </div>
+        </div>
+        <div v-if="dupData.groups.length > 20" class="dp-more">
+          只列出前 20 组
+        </div>
+      </div>
+      <p class="dp-note">
+        判据是感知指纹(dHash), 会误判 —— 纯色图之间距离恒为 0。这里给的是建议, 决定权在你。
+      </p>
+    </div>
+
+    <!-- URL 归档(对标 yt-dlp / gallery-dl 的 --download-archive):
+         归档是**能随身带走的纯文本**, 换机器 / 重装后带过来, 增量采集就还能
+         认出"这个我下过"。 -->
+    <div v-if="archiveOpen" class="arc-box">
+      <div class="ar-head">
+        <b>已下载 URL 归档</b>
+        <span class="ar-sub" v-if="archiveResult">共 {{ archiveResult.total }} 条</span>
+        <span class="grow"></span>
+        <button class="ghost mini" :disabled="archiveBusy" @click="exportArchive">导出 txt</button>
+        <button class="ghost mini danger" :disabled="archiveBusy" @click="resetArchive">清空</button>
+        <button class="ghost mini" @click="archiveOpen = false">收起</button>
+      </div>
+      <textarea
+        v-model="archiveText"
+        class="ar-input"
+        rows="4"
+        placeholder="粘贴归档内容, 每行一条 URL(支持 yt-dlp 的 `extractor id` 两列格式); # 开头与空行会被忽略"
+      ></textarea>
+      <div class="ar-actions">
+        <button class="ghost mini" :disabled="archiveBusy || !archiveText.trim()" @click="importArchive">
+          {{ archiveBusy ? "导入中…" : "导入" }}
+        </button>
+        <span class="ar-note">
+          ⚠️ 归档只用于"我记得下过这个地址", 不参与"文件在不在"的判断 ——
+          那归资源库管。
+        </span>
+      </div>
+      <!-- 导入结果必须给出 added / skipped: 只说"导入成功"的话, 用户没法判断
+           这份归档是不是真被吃进去了 -->
+      <p v-if="archiveResult" class="ar-res">
+        新增 {{ archiveResult.added }} 条, 已存在而跳过 {{ archiveResult.skipped }} 条,
+        当前共 {{ archiveResult.total }} 条
+      </p>
+    </div>
+
     <!-- 巡检结果: 只在有问题时占版面, 全部完好就一句话 -->
     <div v-if="verifyResult && verifyResult.marked" class="verify-box">
       <div class="vb-head">
         <b>校验发现 {{ verifyResult.marked }} 项异常</b>
         <span class="vb-sub">
           已检查 {{ verifyResult.checked }} 项 ·
-          缺失 {{ verifyResult.missing }} · 疑似截断 {{ verifyResult.truncated }}
+          缺失 {{ verifyResult.missing }} · 疑似截断 {{ verifyResult.truncated }} ·
+          名字与内容不符 {{ verifyResult.mismatched || 0 }}
         </span>
         <span class="grow"></span>
         <button class="ghost mini" @click="verifyResult = null">知道了</button>
       </div>
       <div class="vb-list">
         <div class="vb-row" v-for="it in verifyResult.items.slice(0, 50)" :key="it.id">
-          <em class="vb-kind" :class="it.kind">{{ it.kind === "missing" ? "缺失" : "截断" }}</em>
+          <!-- 三类分色: 缺失(红) / 截断(黄) / 不符(紫)。"不符"多数还能打开,
+               它只是**叫错了名字**, 所以不该与"内容坏了"长得一样。 -->
+          <em class="vb-kind" :class="it.kind">{{ verifyKindLabel(it.kind) }}</em>
           <span class="vb-name" :title="it.path">{{ it.name }}</span>
           <span class="vb-reason">{{ it.reason }}</span>
         </div>
@@ -721,6 +1086,18 @@ onMounted(() => {
         :title="selAllFav ? '取消收藏所选' : '收藏所选'"
         @click="toggleFavorite([...selected], !selAllFav)"
       >{{ selAllFav ? "★ 取消收藏" : "☆ 收藏" }}</button>
+      <span class="sep"></span>
+      <!-- 批量打星: 已选里全是同一档时, 再点该档 = 清除 -->
+      <span class="rate-pick">
+        <button
+          v-for="n in RATE_OPTS"
+          :key="n"
+          class="rst"
+          :class="{ on: selRating && n <= selRating }"
+          :title="selRating === n ? `清除这 ${selectedCount} 项的评分` : `给所选打 ${n} 星`"
+          @click="rate([...selected], selRating === n ? 0 : n)"
+        >{{ selRating && n <= selRating ? "★" : "☆" }}</button>
+      </span>
       <span class="grow"></span>
       <span class="hint">选择跨翻页保留</span>
       <button class="ghost mini" @click="clearSel">清空</button>
@@ -752,15 +1129,16 @@ onMounted(() => {
           <span v-else class="ph">{{ r.type === "video" ? "🎬" : "📄" }}</span>
           <em class="tagkind">{{ r.type }}</em>
           <em v-if="r.duplicate_of" class="tagdup" title="感知指纹判定疑似重复">重复</em>
-          <!-- 巡检标记: missing/corrupt 由 /library/verify 写入 error_kind。
+          <!-- 巡检标记: missing/corrupt/mismatch 由 /library/verify 写入 error_kind。
                ⚠️ 它也可能出现在**成功**资源上(status=done + corrupt),
                所以这里只做标记, 不隐藏卡片、也不改状态 —— 文件通常还在,
-               只是可能看不全。 -->
+               只是可能看不全(mismatch 尤其如此: 它只是叫错了名字)。 -->
           <em
-            v-if="r.error_kind === 'missing' || r.error_kind === 'corrupt'"
+            v-if="BADGED_KINDS.includes(r.error_kind)"
             class="tagbad"
+            :class="r.error_kind"
             :title="r.note || ''"
-          >{{ r.error_kind === "missing" ? "缺失" : "疑似损坏" }}</em>
+          >{{ errorKindLabels[r.error_kind] || r.error_kind }}</em>
           <label class="pick" :title="isSel(r.id) ? '取消选择' : '选择'">
             <input type="checkbox" :checked="isSel(r.id)" @change="toggleRow(r.id)" />
           </label>
@@ -784,6 +1162,21 @@ onMounted(() => {
             <span v-if="r.refs > 1" class="refs" title="该文件被多个任务共用, 删任务不会删文件">
               共用 ×{{ r.refs }}
             </span>
+          </div>
+          <!-- 评分: 与收藏**并存而不是合并** —— 收藏只能把东西分成"要/不要"两堆,
+               而在几千张里挑"最好的那几张"时, 需要的是**能排序**的序数。
+               ⚠️ 点当前那一档 = 清除(否则手滑点错没有回退路径)。 -->
+          <div
+            class="rate-row"
+            :title="r.rating ? `已评 ${r.rating} 星, 再点一次清除` : '点一颗星打分'"
+          >
+            <button
+              v-for="n in RATE_OPTS"
+              :key="n"
+              class="rst"
+              :class="{ on: n <= (r.rating || 0) }"
+              @click.stop="rateOne(r, n)"
+            >{{ n <= (r.rating || 0) ? "★" : "☆" }}</button>
           </div>
           <!-- 标签: 点一下就地筛选。标签是用户自己定的, 所以顺序按存储顺序(字母序)即可,
                不做"重要度排序" —— 那需要用户去维护优先级, 是另一种负担。
@@ -1070,4 +1463,121 @@ onMounted(() => {
 .lib-pager { display: flex; align-items: center; gap: 5px; margin-top: 18px; }
 .pnum.on { color: var(--accent); border-color: var(--accent); }
 .ptot { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+/* ---- V42: 整理筛选 / 体检 / 重复 / 归档 ---- */
+/* 当前生效的整理型筛选。常驻显示: 体检面板可收起, 而"列表少了大半"不说清原因
+   的话, 第一反应会是"东西丢了"。 */
+.org-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin: -6px 0 12px; font-size: 12px;
+}
+.org-lab { color: var(--muted); }
+.org-chip {
+  padding: 2px 9px; border-radius: 20px; font-size: 11px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+}
+.org-chip.on {
+  color: var(--accent); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+/* 体检面板: 中性色(不是警告色) —— "有多少没打标签"是待办, 不是故障。
+   用 warn 色会让人以为库坏了。 */
+.facet-box {
+  margin-bottom: 12px; padding: 10px 12px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.fc-head { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+.fc-sub { color: var(--muted); font-size: 12px; }
+.fc-head .grow { flex: 1; }
+.fc-grid {
+  margin-top: 8px; display: grid; gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.facet {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 5px 9px; border-radius: 7px; cursor: pointer; font-size: 12px;
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+  transition: color .15s, border-color .15s, background .15s;
+}
+.facet:hover { color: var(--text); }
+.facet.on {
+  color: var(--accent); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.fc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 条数用等宽数字: 一列数字对不齐时, 扫一眼比大小的动作会被打回成逐个读 */
+.fc-n { font-style: normal; font-variant-numeric: tabular-nums; opacity: .7; font-size: 11px; }
+.fc-stars { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.fc-lab { color: var(--muted); font-size: 12px; }
+.star-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+  border-radius: 20px; font-size: 11px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+}
+.star-chip:hover { color: var(--text); }
+.star-chip.on { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
+.star-chip em { font-style: normal; font-variant-numeric: tabular-nums; opacity: .7; }
+.fc-note, .dp-note { margin: 8px 0 0; font-size: 11px; color: var(--muted); }
+/* 重复分组 */
+.dup-box {
+  margin-bottom: 12px; padding: 10px 12px; border-radius: 9px;
+  background: color-mix(in srgb, var(--warn) 8%, var(--panel-2));
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
+}
+.dp-head { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+.dp-sub { color: var(--muted); font-size: 12px; }
+.dp-head .grow, .dp-ghead .grow { flex: 1; }
+.dp-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow: auto; }
+.dp-group { padding: 6px 8px; border-radius: 7px; background: var(--panel); border: 1px solid var(--border); }
+.dp-ghead { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.dp-n { font-style: normal; color: var(--text); }
+.dp-bytes { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dp-row {
+  display: flex; align-items: baseline; gap: 6px; margin-top: 3px;
+  font-size: 11px; color: var(--muted);
+}
+.dp-row.keep { color: var(--text); }
+.dp-keep {
+  font-style: normal; font-size: 10px; padding: 0 5px; border-radius: 4px; flex: none;
+  background: color-mix(in srgb, var(--ok) 70%, #000); color: #fff;
+}
+.dp-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--border); flex: none; }
+.dp-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-dim, .dp-size { flex: none; font-variant-numeric: tabular-nums; }
+.dp-why { flex: none; font-size: 10px; color: var(--muted); }
+.dp-more { font-size: 11px; color: var(--muted); margin-top: 4px; }
+/* URL 归档 */
+.arc-box {
+  margin-bottom: 12px; padding: 10px 12px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.ar-head { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+.ar-sub { color: var(--muted); font-size: 12px; }
+.ar-head .grow { flex: 1; }
+.ar-input {
+  display: block; width: 100%; margin-top: 8px; resize: vertical;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 7px;
+  padding: 6px 8px; color: var(--text); font-size: 12px; font-family: inherit;
+}
+.ar-input:focus { outline: none; border-color: var(--accent); }
+.ar-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.ar-note { font-size: 11px; color: var(--muted); }
+.ar-res { margin: 6px 0 0; font-size: 12px; color: var(--text); }
+/* 评分: 未点亮时压得很淡 —— 一页 40 张卡 × 5 颗亮星会把整屏变成星星 */
+.rate-row { display: flex; gap: 1px; margin-top: 4px; }
+.rst {
+  background: none; border: none; padding: 0 1px; cursor: pointer;
+  font-size: 12px; line-height: 1; color: var(--muted); opacity: .35;
+  transition: opacity .12s, color .12s;
+}
+.rst.on { color: var(--warn); opacity: 1; }
+.rate-row:hover .rst, .rate-pick:hover .rst { opacity: .75; }
+.rate-row:hover .rst.on, .rate-pick:hover .rst.on { opacity: 1; }
+.rate-pick { display: inline-flex; align-items: center; gap: 1px; }
+.rate-pick .rst { font-size: 13px; }
+/* "名字与内容不符"用紫: 它与"缺失/损坏"不是同一类 —— 多数还能打开, 只是叫错了
+   名字。用同一个红色会让人以为文件坏了。 */
+.tagbad.mismatch, .vb-kind.mismatch {
+  background: color-mix(in srgb, var(--accent) 78%, #000); color: #fff;
+}
 </style>

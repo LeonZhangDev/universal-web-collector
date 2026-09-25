@@ -1,4 +1,4 @@
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -160,10 +160,102 @@ class LibraryVerifyOut(BaseModel):
     checked: int = 0
     missing: int = 0
     truncated: int = 0
+    #: V42: 扩展名与文件头对不上的条数(见 core/filekind.py)。与 truncated **分开**
+    #: 计数: 前者"重下还是它", 后者"重下有救"。合成一个数就没法指导下一步动作。
+    mismatched: int = 0
     #: 被标记的条目数。**只标记不删除** —— 与 phash / mediacheck 的一贯原则一致:
     #: 判据可能误报(尤其是"文件被外部程序改小了"这种), 删文件是不可逆的。
     marked: int = 0
     items: List[LibraryVerifyItem] = []
+    #: V42: 本接口可能写下的 `error_kind` -> 中文标签。**由后端下发**:
+    #: 巡检现在有三类(missing / corrupt / mismatch), 界面自己维护一份中文映射
+    #: 的话, 后端加第四类时界面会静默显示成代号(第 9 条)。
+    kinds: List[Dict[str, str]] = []
+
+
+class LibraryRateIn(BaseModel):
+    """批量打星。`rating=0` 表示**清除评分**(回到"未评分")。
+
+    ⚠️ 上限在后端硬拦(见 `db.set_rating`), 界面只负责画星星 —— 否则"≥5 星"
+    这种筛选口径会被一个 7 分的资源搅浑, 而前端那一侧并不知道自己画的是什么。
+    """
+
+    ids: List[int] = []
+    rating: int = 0
+
+
+class LibraryRateOut(BaseModel):
+    updated: int = 0
+    rating: int = 0
+
+
+class FacetItem(BaseModel):
+    """「体检视图」里的一个维度。
+
+    ⚠️ `n` 必带, 而且 **0 就是 0**(真的数过了)。这与"没法数"是两件事 ——
+    界面不许把 0 显示成 `—`(第 26 条)。
+    """
+
+    key: str
+    label: str = ""
+    hint: str = ""
+    n: int = 0
+
+
+class RatingBucket(BaseModel):
+    stars: int = 0
+    n: int = 0
+
+
+class LibraryFacetsOut(BaseModel):
+    items: List[FacetItem] = []
+    ratings: List[RatingBucket] = []
+    total: int = 0
+
+
+class DuplicateGroupOut(BaseModel):
+    """一组疑似重复 + 建议保留的那一条。
+
+    `keep_reason` 是**代号**(`highest_res` / `largest` / `oldest`), 中文由
+    `DuplicatesOut.reasons` 下发 —— 与 `error_kind` 同一条纪律: 判据挂在代号上,
+    不能挂在中文串上(第 9 条)。
+    """
+
+    keep_id: int = 0
+    keep_reason: str = ""
+    n: int = 0
+    bytes: int = 0
+    members: List[Dict[str, Any]] = []
+
+
+class DuplicatesOut(BaseModel):
+    groups: List[DuplicateGroupOut] = []
+    total: int = 0
+    reasons: List[Dict[str, str]] = []
+
+
+class UrlArchiveIn(BaseModel):
+    """导入「已下载 URL 归档」。
+
+    `text` 直接吃 yt-dlp / gallery-dl 的归档文件原文(每行一条, `#` 开头与空行
+    忽略; 行内可用空格分隔额外的 sha), `urls` 是结构化输入, 两者给一个即可。
+    """
+
+    text: Optional[str] = None
+    urls: Optional[List[str]] = None
+
+
+class UrlArchiveOut(BaseModel):
+    """导入/导出结果。
+
+    ⚠️ `added` 与 `skipped` **必须都给**: 只说"导入成功"的话, 用户没法判断
+    这份归档是不是真的被吃进去了(第 27 条: 规则生效要有计数)。
+    """
+
+    total: int = 0
+    added: int = 0
+    skipped: int = 0
+    urls: List[str] = []
 
 
 class FailureKindItem(BaseModel):

@@ -23,12 +23,18 @@ from collectors.gallery_base import (
 from core import database as db
 from core import events
 from core import layout
+from core import filekind
 from core import mediacheck
 from core import partials
 from core import thumbs
 from core.config import settings
 from core.content_identity import canonical_content_key
-from core.errors import KIND_CORRUPT, KIND_LABELS, KIND_MISSING
+from core.errors import (
+    KIND_CORRUPT,
+    KIND_LABELS,
+    KIND_MISMATCH,
+    KIND_MISSING,
+)
 from core.filters import fmt_size, parse_size
 from core.manifest import read_manifest
 from core.task_dedup import create_or_dispose
@@ -48,11 +54,16 @@ from models.schemas import (
     BatchTaskOut,
     BulkActionIn,
     BulkActionOut,
+    DuplicatesOut,
+    DuplicateGroupOut,
     LibraryBulkDeleteIn,
     LibraryBulkOut,
+    LibraryFacetsOut,
     LibraryFailuresOut,
     LibraryFavoriteIn,
     LibraryFavoriteOut,
+    LibraryRateIn,
+    LibraryRateOut,
     LibraryReplayIn,
     LibraryReplayOut,
     LibraryTagsIn,
@@ -60,6 +71,8 @@ from models.schemas import (
     LibraryVerifyIn,
     LibraryVerifyItem,
     LibraryVerifyOut,
+    UrlArchiveIn,
+    UrlArchiveOut,
     MarkReadIn,
     NotificationListOut,
     NotificationOut,
@@ -795,6 +808,11 @@ def resource_library(
         False, description="标签按层级筛: 连 `系列/角色` 这类子标签一起收"
     ),
     favorite: bool = Query(False, description="只看收藏"),
+    min_rating: int = Query(0, ge=0, le=5, description="星级下限(1-5); 0 = 不限"),
+    special: Optional[str] = Query(
+        None,
+        description="体检维度键(未打标签 / 疑似重复 / 内容损坏…), 取值见 /library/facets",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ):
@@ -804,16 +822,24 @@ def resource_library(
     "我手上有什么"。同一张图片被 sha256 去重复用过时会同时出现在两个任务下,
     资源库会**各列一条**并给出 `refs`(被几个任务引用) —— 这是有意的: 用户
     想删的是"某个任务的那条记录", 而真删文件与否由 refs 决定(见 DELETE 端点)。
+
+    `special` 是 V42 加的整理型筛选(取值见 `/library/facets`)。⚠️ 未知键**报 400**
+    而不是静默忽略: 静默忽略的表现是"点了没反应", 那比报错难查得多。
     """
-    total = db.library_count(q=q, kind=kind, task_id=task_id, album=album,
-                             tag=tag, favorite=favorite,
-                             tag_children=tag_children)
-    offset = (page - 1) * page_size
-    rows = db.library_list(
-        q=q, kind=kind, task_id=task_id, album=album,
-        limit=page_size, offset=offset, tag=tag, favorite=favorite,
-        tag_children=tag_children,
-    )
+    try:
+        total = db.library_count(q=q, kind=kind, task_id=task_id, album=album,
+                                 tag=tag, favorite=favorite,
+                                 tag_children=tag_children,
+                                 min_rating=min_rating, special=special)
+        offset = (page - 1) * page_size
+        rows = db.library_list(
+            q=q, kind=kind, task_id=task_id, album=album,
+            limit=page_size, offset=offset, tag=tag, favorite=favorite,
+            tag_children=tag_children,
+            min_rating=min_rating, special=special,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     # ⚠️ refs 与 tags 都**批量取**。逐行查的话一页 40 条就是 80 次往返, 而这是
     # 最高频的接口 —— 列表页的"N+1"是最容易被写出来、也最难被察觉的一类慢。
     refs = db.resource_refs_many([r["local_path"] for r in rows])
@@ -824,6 +850,7 @@ def resource_library(
         d["refs"] = refs.get(d.get("local_path"), 0)
         d["tags"] = tagmap.get(d["id"], [])
         d["favorite"] = bool(d.get("favorite"))
+        d["rating"] = int(d.get("rating") or 0)
         items.append(d)
     return {
         "items": items,
@@ -832,7 +859,140 @@ def resource_library(
         "page_size": page_size,
         "pages": (total + page_size - 1) // page_size,
         "stats": db.library_stats(),
+        # 卡片上"缺失 / 疑似损坏 / 名字与内容不符"这几枚徽章的中文。由后端下发:
+        # 前端自己维护一份的话, 后端加一类时界面会静默显示成代号(第 9 条)。
+        "error_kind_labels": {
+            k: KIND_LABELS.get(k, k)
+            for k in (KIND_MISSING, KIND_CORRUPT, KIND_MISMATCH)
+        },
     }
+
+
+@router.post("/library/rate", response_model=LibraryRateOut)
+def library_rate(payload: LibraryRateIn):
+    """批量打星(0-5)。`rating=0` 表示**清除评分**(回到"未评分")。
+
+    为什么收藏之外还要有评分: 收藏只能把东西分成"要 / 不要"两堆, 而在几千张里
+    挑"最好的那几张"时, 需要的是**能排序**的序数 —— 布尔做不到这件事。Eagle /
+    digiKam / TagStudio / Immich 全都把两套维度并存, 理由就在这里。
+
+    ⚠️ 上限由后端硬拦(`db.set_rating`), 越界回 400 而不是静默截断: 一个 7 分的
+    资源会让"≥5 星"这个口径说不清。
+    """
+    try:
+        n = db.set_rating(payload.ids, payload.rating)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return LibraryRateOut(updated=n, rating=int(payload.rating))
+
+
+@router.get("/library/facets", response_model=LibraryFacetsOut)
+def library_facets():
+    """资源库的「体检视图」: 每个整理型维度各有多少条。
+
+    "哪些还没打标签""哪些被判成重复""哪些文件坏了"这类问题**没有入口** ——
+    它们不是某个字段的取值, 而是一条跨字段的判断。TagStudio 用 `special:`
+    查询语法、Czkawka 做成十种扫描模式, 说的是同一件事: 整理型的问题必须
+    单独成项, 指望用户自己拼出 `没有标签 AND 类型是图片` 是不现实的。
+
+    ⚠️ 每项都带 `n`, 而且 **0 就是 0**(真的数过了)。这与"没法数"必须分开,
+    界面不许把 0 显示成 `—`(第 26 条)。
+
+    `items[].key` 可直接喂给 `GET /library?special=<key>`。
+    """
+    return LibraryFacetsOut(**db.library_facets())
+
+
+@router.get("/library/duplicates", response_model=DuplicatesOut)
+def library_duplicates(limit: int = Query(50, ge=1, le=500)):
+    """疑似重复**分组**视图, 每组给一条建议保留。
+
+    只标记不删是本产品的一贯原则(dHash 会误判 —— 实测纯色图互相距离 0), 所以
+    这里给的是**建议**而不是动作。但"这批里留哪个"是用户真正要做的决定, 只说
+    "它们互相疑似重复"等于把最难的那一步丢回给人: dupeGuru 的做法是每组固定
+    一个不可删的 reference, Czkawka 用 `-D AEN/AEB` 让用户选保留策略。
+
+    ⚠️ `keep_reason` 是**代号**, 中文由 `reasons` 下发: 判据挂在代号上, 不能挂
+    在中文串上(第 9 条)。
+    """
+    groups = db.duplicate_groups(limit=limit)
+    return DuplicatesOut(
+        groups=[DuplicateGroupOut(**g) for g in groups],
+        total=len(groups),
+        reasons=[
+            {"key": "highest_res", "label": "像素最高"},
+            {"key": "largest", "label": "体积最大"},
+            {"key": "oldest", "label": "最早(最像原件)"},
+        ],
+    )
+
+
+def _parse_archive_text(text):
+    """解析 yt-dlp / gallery-dl 的归档文本 -> [(url, hash_or_None), ...]。
+
+    两种行都收:
+      * gallery-dl / 本产品导出的 —— 一行一个 URL;
+      * yt-dlp 的 `--download-archive` —— `extractor id` 两列(那不是 URL, 但也
+        收下: 它同样能回答"这个东西我下过没有", 而且用户很可能会直接贴过来)。
+
+    ⚠️ 空行与 `#` 开头的行跳过, 但**不因此静默丢数据**: 返回条数由调用方如实
+    回报, 用户能拿"导入 2000 行、进库 1980 条"去对账。
+    """
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        url = parts[0]
+        h = None
+        for tok in parts[1:]:
+            # sha1 40 位 / sha256 64 位; 只认十六进制, 免得把备注当哈希
+            if len(tok) in (32, 40, 64) and all(c in "0123456789abcdefABCDEF" for c in tok):
+                h = tok
+                break
+        out.append((url, h))
+    return out
+
+
+@router.get("/library/url-archive", response_model=UrlArchiveOut)
+def url_archive_export(limit: int = Query(0, ge=0, description="0 = 全部")):
+    """导出「已下载 URL 归档」(JSON)。
+
+    对标 yt-dlp / gallery-dl 的 `--download-archive`: 归档是**能随身带走的纯文本**,
+    换机器 / 重装之后带过来, 增量采集就还能认出"这个我下过" —— 而增量是订阅
+    巡检唯一不重复下载的依据。
+    """
+    rows = db.url_archive_urls(limit=limit or None)
+    return UrlArchiveOut(
+        total=db.url_archive_count(),
+        added=0,
+        skipped=0,
+        urls=[r["url"] for r in rows],
+    )
+
+
+@router.post("/library/url-archive", response_model=UrlArchiveOut)
+def url_archive_import(payload: UrlArchiveIn):
+    """导入归档。`text` 吃归档原文(每行一条), `urls` 吃结构化列表。
+
+    ⚠️ `added` / `skipped` 两个数**都给**: 只回"导入成功"的话, 用户没法判断这份
+    归档是不是真被吃进去了 —— 而"导入了但没生效"正是这类功能最典型的失败方式
+    (第 27 条: 规则生效要有计数)。
+    """
+    entries = _parse_archive_text(payload.text)
+    if not entries and payload.urls:
+        entries = [(u, None) for u in payload.urls]
+    added, skipped = db.url_archive_add(entries)
+    return UrlArchiveOut(
+        total=db.url_archive_count(), added=added, skipped=skipped, urls=[],
+    )
+
+
+@router.delete("/library/url-archive")
+def url_archive_reset():
+    """清空归档(只清这一张表, 不碰资源库与任何文件)。"""
+    return {"cleared": db.url_archive_clear()}
 
 
 @router.get("/library/tags")
@@ -1081,7 +1241,12 @@ def library_verify(payload: LibraryVerifyIn):
     """
     limit = max(1, min(int(payload.limit or 500), 5000))
     rows = db.done_resources_for_scan(task_id=payload.task_id, limit=limit)
-    out = LibraryVerifyOut()
+    # 本接口会写下的三类 error_kind 的中文标签一并下发: 界面不许自己维护一份
+    # (第 9 条 —— 后端加第四类时, 前端那份会静默对不上)。
+    out = LibraryVerifyOut(kinds=[
+        {"kind": k, "label": KIND_LABELS.get(k, k)}
+        for k in (KIND_MISSING, KIND_CORRUPT, KIND_MISMATCH)
+    ])
     for r in rows:
         out.checked += 1
         path = Path(str(r["local_path"]))
@@ -1104,6 +1269,13 @@ def library_verify(payload: LibraryVerifyIn):
                         f"文件比记录里小: 实际 {real} 字节, 记录 {recorded} 字节"
                         f"(疑似被截断)"
                     )
+                else:
+                    # V42: 长度没问题, 再看"它是不是它自称的那个东西"。
+                    # 最典型的是 CDN 回了一个 HTML 错误页, 而 Content-Length 正是
+                    # 那个页面的长度 —— 长度校验当然通过, 于是它被当成图片落盘。
+                    reason = filekind.mismatch_reason(path)
+                    if reason:
+                        kind = KIND_MISMATCH
         if not kind:
             continue
         item = LibraryVerifyItem(
@@ -1114,6 +1286,8 @@ def library_verify(payload: LibraryVerifyIn):
         out.items.append(item)
         if kind == KIND_MISSING:
             out.missing += 1
+        elif kind == KIND_MISMATCH:
+            out.mismatched += 1
         else:
             out.truncated += 1
         try:

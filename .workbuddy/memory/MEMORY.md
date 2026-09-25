@@ -15,13 +15,13 @@
 ## 关键文件
 `api/tasks.py`(HTTP+SSE) · `core/task_manager.py`(状态机/看门狗/下载顺序) · `core/filters.py`(`match_resource` = "有效资源"唯一定义) · `core/errors.py`(`classify`/`KIND_*`) · `core/layout.py` · `core/disk.py` · `core/manifest.py`
 `core/database.py`：加列**必须同时**进 SCHEMA 与 `_ADD_COLUMNS`；⚠️ **新表的时刻列 = `created_at` + REAL(epoch 秒)**，老表是 `created_time` 字符串
-`core/phash.py`(只标记不删) · `core/mediacheck.py`(完整性**算术**判据) · `core/thumbs.py`(按 **sha** 不按路径) · `downloaders/dash.py`(MPD 解析，纯函数) · `downloaders/video.py`(**HEAD 是 CRLF**) · `downloaders/ratelimit.py`(请求桶 + **全局字节桶**)
+`core/phash.py`(只标记不删) · `core/mediacheck.py`(完整性**算术**判据) · **`core/filekind.py`(扩展名 vs 文件头, V42; 宁可漏报不可误报)** · `core/thumbs.py`(按 **sha** 不按路径) · `downloaders/dash.py`(MPD 解析，纯函数) · `downloaders/video.py`(**HEAD 是 CRLF**) · `downloaders/ratelimit.py`(请求桶 + **全局字节桶**)
 **`core/jsonstore.py` = JSON 状态存储唯一实现**（读-改-写必须过它的四条并发纪律，**别手写第二遍**）
 **`core/transport.py` = HTTP 传输唯一实现**（`streamed()`；`curl_cffi` 的响应**不支持 `with`**，有 AST 门禁盯着）
-**`core/localalbums.py` = 本地相册集唯一实现**（只读；登记/扫描/浏览/随机池/收藏 + V41 的排除模式/往年今日/重复标记/扫描对账）· `api/local.py`(出图只收 `(root_id, rel)`，**从不收裸绝对路径**)
-`collectors/gallery_base.py`(声明式契约；`check_site` = 声明唯一验收标准) · `collectors/hls.py` · `core/partials.py`(**按 URL 寻址**) · `main.py`(lifespan) · `tests/isolation.py` · `tests/conftest.py`(R-CI-3 跳过策略)
+**`core/localalbums.py` = 本地相册集唯一实现**（只读；扫描/浏览/随机池/收藏 + V41 排除模式/往年今日/重复标记/扫描对账）· `api/local.py`(出图只收 `(root_id, rel)`，**不收裸绝对路径**)
+`collectors/gallery_base.py`(声明式契约；`check_site` = 声明唯一验收标准) · `collectors/hls.py` · `core/partials.py`(**按 URL 寻址**) · `main.py` · `tests/isolation.py` · `tests/conftest.py`(R-CI-3)
 **`scripts/gate.py` = `Gate`/`Problem` 唯一定义**（`checked` 必填；`checked==0` **一律算红**）· `scripts/gateguard.py`(仓库门禁：六道闸，逐闸报"核了几项") · **`.gitattributes` = 行尾的唯一来源**
-`scripts/probe_site.py`(**五项探针** + 声明草稿 + 证据门禁 + `--json`/`--snapshot`/`--smoke`；**回归**靶子=本地假站点、**找 bug** 靶子=真实站点) · `scripts/probe.py`(浏览器探针，两码事)
+`scripts/probe_site.py`(**五项探针** + 声明草稿 + 证据门禁 + `--json`/`--snapshot`/`--smoke`；**回归**靶子=本地假站点、**找 bug** 靶子=真实站点) · `scripts/probe.py`(浏览器探针)
 `scripts/add_site.py`(**加站门禁**：`--list` 只挑带 `site` 声明的 `SequenceGallerySpider`；`--verify <名>` 跑四闸) · `scripts/drift_check.py`(**一个站点都没查成则退出 2**) · `scripts/probe_feed.py`
 
 ## ⚠️ 静默坑索引（1–27 + 同族 A–H；细节见 `PITFALLS.md`）
@@ -36,7 +36,7 @@
 | 5 | pydantic 吞字段 | 新增字段必须**显式声明**（+ `extra="allow"`） |
 | 6 | 重名须先消解 | `layout.claim`；"目标已存在"当**半成品**续传 |
 | 7 | 前端传"代号/意图" | 取值不在库内必须**显式映射**，不能直接拼 SQL |
-| 8 | 认领 URL 是共享资源 | 复用 `gallery_base._match_score`；同分按**采集器名字字典序** |
+| 8 | 认领 URL 是共享资源 | 复用 `gallery_base._match_score`；同分按采集器名字字典序 |
 | 9 | 把"人看的文案"当数据 | 归类改用 `error_kind`；中文标签由后端下发 |
 | 10 | `except OSError: pass` | 盖在"本来就会失败"的写入上 = 把丢数据改装成静默 |
 | 11 | 引用不存在的接口 | 前端引用 `/files/raw` 而它**从没实现过** → 404 被 `onerror` 藏掉 |
@@ -52,10 +52,10 @@
 | 21 | CI 里 7 条"真解码"用例**只跳不跑** | 装不上 ffmpeg → **CI 从不验"产物内容好不好"**（phash×4 + DASH e2e×3） |
 | 22 | 存在、但不在任何调用链里的测试 = **不存在** | `frontend` 的 `test:task-query` 从落地起没在 CI 跑过 |
 | 23 | 三个"仓库级不变量"脚本只在本地跑 | `selfcheck.py` / `add_site.py --all` / `verify_output.py` |
-| 24 | **标签的语义只能有一个方向** | `[platform:X]` 的 `X` = **这条用例需要哪个平台** → 合法跳过是 `X != 当前平台`；`X == 当前平台` 却还在跳 = 写反了。**写反了单测抓不到**（实现与测试一起错），只有**端到端全量**能抓|
+| 24 | **标签的语义只能有一个方向** | `[platform:X]` 的 `X` = **这条用例需要哪个平台** → 合法跳过是 `X != 当前平台`；写反了单测抓不到，**只有端到端全量能抓**|
 
-| 25 | 别拿**墙钟**当判据 | 断言里出现 `sleep`，先问能不能换成"**显式传时刻**"（`_is_blocked(url, now=t+61)`） |
-| 26 | **"没有结果" ≠ "没算出结果"** | 空的时候是"确实没有"还是"没算"？无解码器报 `no-decoder`、超上限报 `skipped`、无快照报 `None`，**不许一律 `[]`**；且"归谁"要在**计数阶段**分开（别用"是不是空的"反推原因码） |
+| 25 | 别拿**墙钟**当判据 | 断言里出现 `sleep` → 换成显式传时刻（`_is_blocked(url, now=t+61)`） |
+| 26 | **"没有结果" ≠ "没算出结果"** | 无解码器报 `no-decoder`、超上限报 `skipped`、无快照报 `None`，**不许一律 `[]`**；"归谁"要在**计数阶段**分开 |
 | 27 | **"规则生效了"要有计数当证据** | 排除模式这类"配了但可能一条都没匹配"的，必须报命中数 —— 否则"没配"和"配错了"长得一样 |
 | A | 条件请求 ⊥ 续传 | 有 `Range` 不能带 `If-None-Match`（回 304 而非 206） |
 | B | 隔离的窗口期 | `monkeypatch.undo()` 还原 `DB_PATH` → 谁在那时碰库就写**用户真库** |
@@ -87,11 +87,11 @@
 
 ## 本机验证
 `~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；curl 对 127.0.0.1 加 `--noproxy '*'`。别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）。
-⚠️ **口径 = 收集总数**。本机 Windows **1309 收集**（1303 passed + 6 skipped）；CI(Linux) **1310**（CI 实测 1308+2，与 README 逐位对账过）—— 差额恒为 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数×1。**V40 起 CI 装了 ffmpeg，那 7 条"真解码"用例真的跑了**（第 21 条已修，剩下 2 条是 Windows-only）。**改文档前先跑数；差分不闭合先怀疑自己。**
+⚠️ **口径 = 收集总数**。本机 Windows **1341 收集**（1335 passed + 6 skipped）；CI(Linux) **1342**（差额恒为 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数×1，V40 起 CI 装了 ffmpeg，那 7 条"真解码"用例真的跑了）。**改文档前先跑数；差分不闭合先怀疑自己。**
 ⚠️ **`img.xchina.io` 从本机整段 403**（`text/plain`，不是 CF 挑战页）→ 这条**网络**的问题，不是站点改版、不是回归。别拿它当靶子。
 ⚠️ 别前置 `export PATH="/usr/bin:/bin:$PATH"`（会把裸 `python` 换成没 pytest 的 3.13.12）。coreutils 全无，但 `echo`/`git`/`python`/`date` 可用。
-⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50）→ 被杀时**无 `FAILED`、连汇总行都没有**。判据：看进度行有没有 `F`；若输出**只有一行** `[safe-delete]…`，那是上次留下的 `data/_verify_output` 触发的 —— **`mv` 走它**再跑。被 kill 时重定向的输出去丢 → 脚本要 `python -u`。
-⚠️ 想拿 pytest 汇总行：`--basetemp` 指系统临时目录下一个**不存在**的路径；**绝不指进项目目录**。宿主包装器偶发缺失 → 长命令 `MODULE_NOT_FOUND`（**压根没跑**），加 `run_in_background=true` 绕过。
+⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"（阈值 50）→ 被杀时**无 `FAILED`、连汇总行都没有**。判据：看进度行有没有 `F`；若输出**只有一行** `[safe-delete]…`，是上次留下的 `data/_verify_output` 触发的 —— **`mv` 走它**再跑。脚本要 `python -u`。
+⚠️ 想拿 pytest 汇总行：`--basetemp` 指系统临时目录下**不存在**的路径；**绝不指进项目目录**。长命令 `MODULE_NOT_FOUND` 是宿主包装器偶发缺失（**压根没跑**）→ 加 `run_in_background=true`。
 ⚠️ **行尾**：`Path.write_text()` 在 Windows 上把 `\n` 翻成 `\r\n`。`.gitattributes` 是唯一来源；`downloaders/video.py` 与 `scripts/verify_output.py` 的 HEAD 本是 CRLF，别去"统一"。
 ⚠️ **npm 的"包目录存在"≠"包装好了"**：`@rollup/rollup-win32-x64-msvc` 可能是**空目录** → `vite build` 报 `Cannot find module`。
 
@@ -107,11 +107,12 @@
 
 **V28–V38** 见 `PITFALLS.md` 各节（587→819→880→942→997→1063）。
 - **V39** 新站点探针：五项探测 → **真实站点当靶子** → **三档证据门禁**；续 `--json`/`--snapshot`/`--smoke`·`drift_check.py`·`probe_feed.py`·`add_site.py`；抓出第 16/17/18/19 条
-- **V39.5** 让"绿/红"不再可能是假的（`Gate.checked` / `Problem.kind` / `drift_check` 空转非 0 退出）；抓出第 20 条（1105）
-- **V40** **门禁落地**（`gate.py` + `gateguard.py` 六闸 + `.gitattributes` + CI 补 ffmpeg/离线脚本 + R-CI-1/2/3）· **本地相册集**（只读、随机池、收藏）；抓出第 24/25 条（**1290**）
-
-- **V38 复核要点**：当初写的拒绝理由**站不住** —— **"暂时不做"不许写成"不该做"。**
-- **V39 / V39.5 / V40 一句话**：**加站的成本在探测不在写声明**；假绿＝判据挂在"没报错"（要 `checked`，`0` 算红）；假红＝判据挂在中文子串（要 `kind`/`step`/`level` 代号）。修法是**先把它变成结构**；结构也有方向 —— 见第 24 条。
-- **V41** 对标 Immich/PhotoPrism/Eagle 后吸收四项：**排除模式 glob**（命中要计数）/ **往年今日**（`basis="mtime"`，不用 EXIF）/ **重复标记**（复用 `core/phash`，无 ffmpeg 报 `no-decoder` 不报空列表）/ **扫描对账**（`None` ≠ `{"added":0}`）；抓出第 26/27 条 + 同族 H/I（**1309**）
-- **V41 一句话**：**"没有结果"与"没算出结果"必须是两个值**（空列表会被读成"没有重复"）；**"规则生效了"要有计数当证据**（写了却一条没排除，长得和"没配规则"一模一样）。
-- **下一步候选**：更多站点插件（先跑 `probe_site.py`）/ HLS 直播（`EVENT` 或无 `ENDLIST`，缺真站样本）/ 直播断点续录（低）/ 人脸·语义搜索·地图（另一档投入）/ 评分·颜色搜索·智能文件夹（要"属性的属性"语义）—— 全是**"暂时不做"，不是"不该做"**。
+- **V39.5** 让"绿/红"不再可能是假的（`Gate.checked` / `Problem.kind`）；抓出第 20 条（1105）
+- **V40** **门禁落地**（`gate.py` + `gateguard.py` 六闸 + `.gitattributes` + CI 补 ffmpeg + R-CI-1/2/3）· **本地相册集**（只读、随机池、收藏）；抓出第 24/25 条（**1290**）
+- **V41** 对标 Immich/PhotoPrism/Eagle 吸收四项：**排除模式 glob**（命中要计数）/ **往年今日**（`basis="mtime"`）/ **重复标记**（复用 phash，无 ffmpeg 报 `no-decoder`）/ **扫描对账**（`None` ≠ `{"added":0}`）；抓出第 26/27 条 + 同族 H/I（**1309**）
+- **V42** 五方向各对标一次：gallery-dl/yt-dlp → **URL 归档**（`added`+`skipped`）；Eagle/TagStudio/digiKam → **评分**（上限后端硬拦）·**体检视图**（`SPECIAL_FILTERS` 九维，0 就是 0）；Czkawka/dupeGuru → **重复分组+建议保留**·**文件头 sniff**（`core/filekind.py` / `KIND_MISMATCH`）（**1341**）
+- **V38 复核要点**：**"暂时不做"不许写成"不该做"**。
+- **三句话**：加站的成本在探测不在写声明（V39）；假绿＝判据挂在"没报错"、假红＝判据挂在中文子串 —— 修法是**先变成结构**，结构也有方向（V39.5/V40，见第 24 条）；**"没有结果"与"没算出结果"必须是两个值**，**规则生效要有计数**（V41）。
+- **V42 一句话**：**先分清"谁跟我们是同一件事"**（Immich External Library 是同一契约，Google Photos 是托管模型）；同类产品的**默认动作**不能照抄（dupeGuru 默认删，我们只标记）。
+- ⚠️ **文档上的"推迟理由"会过期**：V41 说"评分要属性的属性语义"是**记错了**（它只是一列整数；真正需要那套语义的是智能文件夹）。已更正 —— C 类的文档面。
+- **下一步候选**：更多站点插件（先跑 `probe_site.py`）/ HLS 直播（缺真站样本）/ 直播断点续录（低）/ 人脸·语义搜索·地图（另一档投入）/ 颜色搜索·智能文件夹 —— 全是**"暂时不做"，不是"不该做"**。

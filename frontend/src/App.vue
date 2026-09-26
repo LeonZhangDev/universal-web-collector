@@ -15,21 +15,27 @@ import {
   cancelTask,
   clearPartials,
   createWatch,
+  createWebhook,
   deleteSession,
   deleteTask,
   deleteWatch,
+  deleteWebhook,
   getConfig,
   getCollectors,
   getLoginJob,
   getPartials,
   getStorageOverview,
+  getSystemGates,
   listSessions,
   listTasks,
   listWatches,
+  listWebhookDeliveries,
+  listWebhooks,
   pauseTask,
   resumeTask,
   startLogin,
   stopLogin,
+  testWebhook,
   toggleWatch,
   runWatch,
 } from "./api";
@@ -303,24 +309,38 @@ async function loadWatches() {
     watches.value = await listWatches();
   } catch (e) {}
 }
+// V45: cron 排期。填了 cron 就**按 cron 排下一次**, interval 只作兜底;
+// 两个都不填还是"每 N 分钟"(老行为不变)。
+// ⚠️ 校验交给后端: 它回 400 并带**中文原因**(第 K 条 —— 代号管红不红, 文案管
+// 哪里红)。前端另写一套解析器, 两套规则迟早不一致, 而"前端说合法、后端说不"
+// 的表现是订阅静默不跑。
+const watchCron = ref("");
 async function addWatch() {
   if (!watchUrl.value.trim()) return;
+  const cron = (watchCron.value || "").trim();
   try {
     await createWatch({
       url: watchUrl.value.trim(),
       collector: "auto",
       interval_minutes: Number(watchEvery.value) || 360,
+      cron: cron || null,
       download_dir: null,
       quality: null,
       media: null,
       album_title: null,
     });
     watchUrl.value = "";
+    watchCron.value = "";
     await loadWatches();
     await load();
   } catch (e) {
     toast(e.response?.data?.detail || String(e), "err");
   }
+}
+// ⚠️ 显示的是**真实排期来源**: 有 cron 就显示 cron。不然用户改了 cron 却看到
+// "每 360 分钟", 会以为没生效 —— 而它其实生效了(第 28 条: 静默回退成默认值)。
+function scheduleText(w) {
+  return w.cron ? `cron ${w.cron}` : `每 ${w.interval_minutes} 分钟`;
 }
 async function toggleW(w) {
   await toggleWatch(w.id);
@@ -384,6 +404,128 @@ async function removeSession(domain) {
   if (!confirm(`删除 ${domain} 的登录态?`)) return;
   await deleteSession(domain);
   await loadSessions();
+}
+
+// ---- V45: Webhook(通知外部系统) ----
+// 后端 V44 就有 webhook, 但界面上一块都没有 —— "配了没动静"和"没配"在 UI 上
+// 完全一样。这里补齐三件事: 看得见列表、手动投一次、看**逐次**投递记录。
+const hooks = ref([]);
+const hookEvents = ref([]); // 事件代号 + 中文名, 由 /system/gates 下发
+const showHooks = ref(false);
+const hookUrl = ref("");
+const hookSecret = ref("");
+const hookPicked = ref([]);
+const hookBusy = ref(false);
+// 展开投递历史的那个 hook。⚠️ 逐次记录**每次尝试一行**: "投了 3 次才成"与
+// "一次就成了"必须数得出来 —— 合并成一行等于把对端的问题藏起来。
+const deliveryOf = ref(null);
+const deliveryItems = ref([]);
+const deliveryBusy = ref(false);
+
+async function loadHooks() {
+  try {
+    hooks.value = await listWebhooks();
+  } catch (e) {
+    hooks.value = [];
+  }
+}
+// 事件清单只在第一次展开面板时拉: 它走 /system/gates(会跑仓库门禁), 不该在
+// 每次进页面时都跑一遍。
+async function toggleHooks() {
+  showHooks.value = !showHooks.value;
+  if (showHooks.value && !hookEvents.value.length) {
+    try {
+      const g = await getSystemGates();
+      hookEvents.value = g.events || [];
+    } catch (e) {
+      hookEvents.value = [];
+    }
+  }
+  if (showHooks.value) loadHooks();
+}
+async function addHook() {
+  if (!hookUrl.value.trim()) return;
+  hookBusy.value = true;
+  try {
+    await createWebhook(hookUrl.value.trim(), hookPicked.value.slice(), hookSecret.value.trim());
+    hookUrl.value = "";
+    hookSecret.value = "";
+    hookPicked.value = [];
+    await loadHooks();
+    toast("已保存。用「投一次」确认对端收得到", "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    hookBusy.value = false;
+  }
+}
+async function removeHook(h) {
+  if (!confirm(`删除 webhook ${h.url}?`)) return;
+  await deleteWebhook(h.id);
+  if (deliveryOf.value === h.id) {
+    deliveryOf.value = null;
+    deliveryItems.value = [];
+  }
+  await loadHooks();
+}
+async function fireHook(h) {
+  try {
+    const r = await testWebhook(h.id);
+    const first = (r.results || [])[0] || {};
+    // ⚠️ 有 status 就报 status, 没有就报 error —— "连不上"和"连上了被拒"是两件事,
+    // 而"什么都没说"会让用户以为按钮没生效。
+    const what = first.status ? `HTTP ${first.status}` : first.error || "无响应";
+    toast(r.delivered ? `投递成功: ${what}` : `投递失败: ${what}`, r.delivered ? "ok" : "warn");
+    await loadHooks();
+    if (deliveryOf.value === h.id) loadDeliveries(h.id);
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+async function loadDeliveries(id) {
+  deliveryBusy.value = true;
+  try {
+    const r = await listWebhookDeliveries(id, 30);
+    deliveryItems.value = r.items || [];
+    deliveryOf.value = id;
+  } catch (e) {
+    deliveryItems.value = [];
+  } finally {
+    deliveryBusy.value = false;
+  }
+}
+function toggleDeliveries(h) {
+  if (deliveryOf.value === h.id) {
+    deliveryOf.value = null;
+    deliveryItems.value = [];
+    return;
+  }
+  loadDeliveries(h.id);
+}
+function pickEvent(key) {
+  const i = hookPicked.value.indexOf(key);
+  if (i >= 0) hookPicked.value.splice(i, 1);
+  else hookPicked.value.push(key);
+}
+// 投递状态 -> 颜色。⚠️ 未知状态显示为中性色而不是"成功" ——
+// 把看不懂的状态画成绿色, 是最容易的一种自我欺骗。
+function dvClass(d) {
+  if (d.status === null || d.status === undefined) return "bad";
+  if (d.status >= 200 && d.status < 300) return "ok";
+  return "bad";
+}
+function dvText(d) {
+  if (d.status === null || d.status === undefined) return d.error || "无响应";
+  return `HTTP ${d.status}`;
+}
+// `created_at` 是 epoch 秒(REAL)。⚠️ 直接把 1753… 那个浮点数画到界面上
+// 等于没给时间 —— 而"什么时候试的"正是看投递记录时唯一想对上的东西。
+function fmtTs(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const d = new Date(n * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 onMounted(async () => {
@@ -557,13 +699,23 @@ onUnmounted(() => {
           <option :value="1440">每天</option>
           <option :value="10080">每周</option>
         </select>
+        <!-- V45 cron。留空 = 用上面的"每 N 分钟"。
+             ⚠️ 提示里必须写明"日与周同时给取或": 那是标准 cron 语义, 与多数人
+             直觉的"且"相反 —— 按"且"理解会让订阅一年只跑一次。 -->
+        <input
+          v-model="watchCron"
+          type="text"
+          class="cron-input"
+          placeholder="cron(可选), 如 0 9 * * 1-5"
+          title="5 段: 分 时 日 月 周。留空则用左边的间隔。日与周同时给时取「或」(标准 cron 语义); 周日=0 或 7。"
+        />
         <button type="button" class="ghost" :disabled="!watchUrl.trim()" @click="addWatch">订阅</button>
       </div>
       <div class="row-list" v-if="watches.length">
         <div class="row-item" v-for="w in watches" :key="w.id">
           <span class="dot" :class="{ off: !w.enabled }"></span>
           <span class="ell grow" :title="w.url">{{ w.url }}</span>
-          <span class="mono">每 {{ w.interval_minutes }} 分钟</span>
+          <span class="mono">{{ scheduleText(w) }}</span>
           <span class="mono">新增 {{ w.hits }}</span>
           <span class="mono dim" :title="w.last_run || '尚未运行'">
             {{ w.last_run ? "上次 " + (w.last_run || "").slice(5, 16) : "未运行" }}
@@ -612,6 +764,85 @@ onUnmounted(() => {
     </div>
   </div>
 
+  <div class="card">
+    <div class="panel-toggle">
+      <button type="button" class="ghost" @click="toggleHooks">
+        {{ showHooks ? "▾" : "▸" }} Webhook
+      </button>
+      <span class="summary muted">任务结束时通知外部系统(带 HMAC 签名)</span>
+      <span class="summary" v-if="hooks.length">已配 {{ hooks.length }} 个</span>
+    </div>
+    <div v-if="showHooks">
+      <div class="dir-row">
+        <span class="lbl">回调 URL</span>
+        <input v-model="hookUrl" type="text" placeholder="https://example.com/hook" />
+        <input
+          v-model="hookSecret"
+          type="text"
+          class="hook-secret"
+          placeholder="签名密钥(可选)"
+          title="留空则不签名。密钥保存后**不再返回**, 界面上只显示是否已设。"
+        />
+        <button type="button" class="ghost" :disabled="hookBusy || !hookUrl.trim()" @click="addHook">
+          保存
+        </button>
+      </div>
+      <!-- 事件代号 + 中文名由 /system/gates 下发, 前端不自带一份。
+           一个都不勾 = 订阅全部事件(后端语义)。 -->
+      <div class="hook-events" v-if="hookEvents.length">
+        <span class="lbl">事件</span>
+        <button
+          v-for="e in hookEvents"
+          :key="e.key"
+          class="ghost mini"
+          :class="{ on: hookPicked.includes(e.key) }"
+          @click="pickEvent(e.key)"
+        >{{ e.label }}</button>
+        <span class="dim small">一个都不选 = 全部事件</span>
+      </div>
+      <div class="row-list" v-if="hooks.length">
+        <div v-for="h in hooks" :key="h.id" class="hk-wrap">
+          <div class="row-item">
+            <span class="dot" :class="{ off: !h.enabled }"></span>
+            <span class="ell grow" :title="h.url">{{ h.url }}</span>
+            <span class="mono dim" v-if="h.has_secret" title="已设签名密钥">已签名</span>
+            <!-- 上一次投递的结果。⚠️ 必须常驻显示: webhook 配错的表现就是
+                 "什么都没发生", 而失败不留痕的话连"它试过没有"都不知道。 -->
+            <span
+              class="mono"
+              :class="h.last_status && h.last_status < 400 ? 'ok-text' : 'bad-text'"
+              :title="h.last_error || ''"
+            >
+              {{ h.last_status ? "上次 " + h.last_status : "未投过" }}
+            </span>
+            <button class="ghost mini" @click="fireHook(h)">投一次</button>
+            <button class="ghost mini" @click="toggleDeliveries(h)">
+              {{ deliveryOf === h.id ? "收起记录" : "投递记录" }}
+            </button>
+            <button class="ghost mini" @click="removeHook(h)">删除</button>
+          </div>
+          <!-- 逐次记录: 重试过的投递在这里是**多行** -->
+          <div v-if="deliveryOf === h.id" class="dv-box">
+            <p v-if="deliveryBusy" class="dim small">加载中…</p>
+            <p v-else-if="!deliveryItems.length" class="dim small">
+              还没有投递记录。点「投一次」试一下对端。
+            </p>
+            <div v-else class="dv-list">
+              <div v-for="(d, i) in deliveryItems" :key="i" class="dv-item">
+                <span class="mono" :class="dvClass(d)">{{ dvText(d) }}</span>
+                <span class="dim small">第 {{ d.attempt }} 次</span>
+                <span class="dim small">{{ d.event }}</span>
+                <span class="grow"></span>
+                <span class="dim small">{{ fmtTs(d.created_at) }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">还没有配置 webhook</div>
+    </div>
+  </div>
+
   <ToastHost />
 </template>
 
@@ -644,4 +875,21 @@ onUnmounted(() => {
 .modal-note { padding: 8px 10px; border: 1px solid #5a3a3a; border-radius: 8px; background: rgba(224, 92, 92, 0.08); color: var(--muted); font-size: 12px; line-height: 1.6; }
 .modal-note b { color: var(--err); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+/* ---- V45: cron / webhook ---- */
+.cron-input { min-width: 190px; font-family: ui-monospace, Consolas, monospace; }
+.hook-secret { min-width: 160px; }
+.hook-events { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.hook-events .lbl { color: var(--muted); font-size: 13px; }
+.hook-events .on { color: var(--accent); border-color: var(--accent); }
+.small { font-size: 11px; }
+.hk-wrap { border-bottom: 1px solid var(--border); }
+.hk-wrap:last-child { border-bottom: none; }
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--err); }
+.dv-box { padding: 6px 10px 10px 28px; background: var(--panel-2); }
+.dv-list { display: flex; flex-direction: column; gap: 4px; }
+.dv-item { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.dv-item .grow { flex: 1; }
+.dv-item .ok { color: var(--ok); }
+.dv-item .bad { color: var(--err); }
 </style>

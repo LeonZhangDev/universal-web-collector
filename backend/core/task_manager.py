@@ -616,7 +616,11 @@ class TaskManager:
         w = db.get_watch(watch_id)
         if not w:
             return None
-        if not db.claim_watch(watch_id, w["interval_minutes"]):
+        # ⚠️ `cron` 是 V45 新加的列, 老库补列之前没有它。用 `keys()` 判而不是
+        # 直接取: 直接取会 KeyError, 而代价是**巡检整个跑不起来**(所有订阅
+        # 一起失效), 比"少一个调度方式"严重得多。
+        cron = w["cron"] if "cron" in w.keys() else None
+        if not db.claim_watch(watch_id, w["interval_minutes"], cron):
             return None  # 已被别的线程抢走, 不重复创建任务
         try:
             opts = json.loads(w["options"] or "{}")
@@ -625,7 +629,10 @@ class TaskManager:
         opts["incremental"] = True
         opts["watch_id"] = watch_id
         task_id = db.create_task(w["url"], w["collector"], opts.get("download_dir"), opts)
-        self._safe_log(task_id, f"watch #{watch_id} 触发巡检 (每 {w['interval_minutes']} 分钟)")
+        # 日志里**说明用的是哪种排期**: 配了 cron 却按间隔跑(或反过来)是最
+        # 难查的一类错 —— 它不报错, 只是每天都在"差不多的时间"跑一次。
+        schedule = "cron %s" % cron if cron else "每 %s 分钟" % w["interval_minutes"]
+        self._safe_log(task_id, f"watch #{watch_id} 触发巡检 ({schedule})")
         self.submit(task_id)
         self._publish_task(task_id)
         return task_id

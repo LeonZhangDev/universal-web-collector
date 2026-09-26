@@ -33,6 +33,17 @@ from core import database as db
 #: 任务收尾, 而用户真正要的是"别挡着我"。失败会留痕, 重试交给外部系统。
 DEFAULT_TIMEOUT = 3.0
 
+#: 最多尝试几次(含第一次)。
+#: ⚠️ **必须有上界**: 投递发生在任务收尾的路径上, 一次卡住 3 秒已经够呛,
+#: 无界重试会把"任务结束"拖成"任务卡住" —— 而那正是最难查的一类问题
+#: (它看起来像下载慢, 不像 webhook 慢)。
+MAX_ATTEMPTS = 3
+
+#: 每次重试前的等待(秒), 与 `MAX_ATTEMPTS` 对齐(第 n 次尝试前等第 n 项)。
+#: 指数退避而不是固定间隔: 对端 500 多半是它自己正在重启, 一秒内连打三次
+#: 既救不了它, 又把它本就吃紧的负载再抬一截。
+RETRY_BACKOFF = (0.0, 0.6, 1.8)
+
 _SIGNATURE_HEADER = "X-UWC-Signature"
 _TIMESTAMP_HEADER = "X-UWC-Timestamp"
 
@@ -70,16 +81,57 @@ def _post(url, body, secret, timeout):
         return None, str(exc)
 
 
-def deliver(hid, url, secret, event, payload, timeout=DEFAULT_TIMEOUT):
-    """投一次, 并**把结果写回库**。返回结果字典(供测试端点回显)。"""
+def _should_retry(status):
+    """这次失败值得再试一次吗。
+
+    ⚠️ 4xx **不重试**: 400/401/404 是对端在说"你这个请求本身不对", 再发三次
+    还是三次 404, 唯一的后果是让用户多等两秒然后看到同一个错。
+    值得重试的是"对方暂时不行": 连不上(status 为 None)、429(限流)、5xx。
+    """
+    if status is None:
+        return True
+    return status == 429 or status >= 500
+
+
+def deliver(hid, url, secret, event, payload, timeout=DEFAULT_TIMEOUT,
+            max_attempts=None, backoff=None):
+    """投一次(失败按策略重试), 并**把每次尝试都写进库**。
+
+    返回结果字典(供测试端点回显), 其中 `attempts` 是**实际发过几次** ——
+    只有它与最终 status 配对看, 才能区分"一次就成了"和"第三次才成"。
+
+    `backoff` 可注入是为了测试: 用例不该为了重试真的睡 2.4 秒(第 25 条:
+    别拿墙钟当判据, 能传就传)。
+    """
     body = json.dumps({
         "event": event,
         "ts": time.time(),
         "data": payload or {},
     }, ensure_ascii=False).encode("utf-8")
-    status, error = _post(url, body, secret, timeout)
-    db.mark_webhook_result(hid, status, error)
-    return {"id": hid, "url": url, "status": status, "error": error}
+
+    waits = tuple(backoff) if backoff is not None else RETRY_BACKOFF
+    tries = max_attempts if max_attempts is not None else MAX_ATTEMPTS
+    tries = max(1, min(int(tries), len(waits)))
+
+    last = {"id": hid, "url": url, "status": None, "error": None, "attempts": 0}
+    for index in range(tries):
+        if index:
+            delay = waits[index]
+            if delay:
+                time.sleep(delay)
+        status, error = _post(url, body, secret, timeout)
+        # ⚠️ 每一次尝试都留一条, 不合并。合并之后"第一次超时第二次成了"
+        # 与"一次就成"长得一模一样, 而前者是在说对端有问题。
+        db.record_webhook_delivery(hid, event, index + 1, status, error)
+        last = {"id": hid, "url": url, "status": status, "error": error,
+                "attempts": index + 1}
+        if status is not None and 200 <= status < 300:
+            break
+        if not _should_retry(status) or index + 1 >= tries:
+            break
+    # 汇总仍写回 webhooks.last_status —— 那是界面上"上一次"那一栏读的地方
+    db.mark_webhook_result(hid, last["status"], last["error"])
+    return last
 
 
 def fire_event(event, payload=None, timeout=DEFAULT_TIMEOUT):

@@ -96,7 +96,35 @@ export function listLibrary(opts = {}) {
   // 会和"本来就是这个顺序"长得一样。
   if (opts.sort) params.sort = opts.sort;
   if (opts.order) params.order = opts.order;
+  // ---- V45: 排除筛选 ----
+  // 语义是「没有这个标签 / 不在这个相册」, 用 NOT EXISTS 实现 —— 与正向筛选不是
+  // 简单取反(资源上标签为 NULL 时, "不等于 X" 在 SQL 里既不是真也不是假)。
+  // ⚠️ 未知 special / color 后端回 400: 排除的"没生效"和"本来就没这类"必须能分开。
+  if (opts.exclude_tag) params.exclude_tag = opts.exclude_tag;
+  if (opts.exclude_tag_children) params.exclude_tag_children = "true";
+  if (opts.exclude_album) params.exclude_album = opts.exclude_album;
+  if (opts.exclude_kind) params.exclude_kind = opts.exclude_kind;
+  if (opts.exclude_special) params.exclude_special = opts.exclude_special;
+  if (opts.exclude_color) params.exclude_color = opts.exclude_color;
+  // ---- V45: 落盘日期区间 ----
+  // 形态必须是 YYYY-MM-DD(后端正则校验, 别的一律 400): 拿到的是"用户随便输的字符串"
+  // 也照样发给后端, 让它在同一处拒绝, 前端不做自己的一套宽松解析。
+  if (opts.date_from) params.date_from = opts.date_from;
+  if (opts.date_to) params.date_to = opts.date_to;
   return api.get("/library", { params }).then((r) => r.data);
+}
+// ---- V45: 「找相似」(感知指纹汉明距离) ----
+// ⚠️ 与"疑似重复"是**两个阈值**: 重复是"就是同一张"(distance ≤ 4), 相似是"看着像"
+// (默认 ≤ 12)。界面上别把两者混成一个"重复"入口 —— 相似里有的是真的不同一张。
+// ⚠️ ok=false 时看 `reason`: no-fingerprint / degenerate / no-decoder / not-found
+// 都是"没法比", 不是"没有相似的" —— 一律显示成空列表会让人以为库里没有。
+export function listLibrarySimilar(id, opts = {}) {
+  const params = {};
+  if (opts.max_distance !== undefined && opts.max_distance !== null) {
+    params.max_distance = opts.max_distance;
+  }
+  if (opts.limit) params.limit = opts.limit;
+  return api.get(`/library/${id}/similar`, { params }).then((r) => r.data);
 }
 // 保存的搜索(智能文件夹)。列表**带命中数**: "配了但一条都不匹配"与"没配"在
 // 界面上必须能分开, 所以 count 是 0 也要显示 0, 不能省略。
@@ -262,6 +290,14 @@ export function deleteWebhook(id) {
 export function testWebhook(id) {
   return api.post(`/webhooks/${id}/test`).then((r) => r.data);
 }
+// ---- V45: 投递历史(每次尝试各一行, 不合并) ----
+// 重试过的投递在这里是**多行**而不是一行: "发了 3 次"和"发了 1 次"必须数得出来,
+// 合并成一行就等于把失败藏起来了。
+export function listWebhookDeliveries(id, limit = 30) {
+  return api
+    .get(`/webhooks/${id}/deliveries`, { params: { limit } })
+    .then((r) => r.data);
+}
 // ---- V44: 自检面板(仓库级门禁当前状态) ----
 // ⚠️ checked=0 的闸是**红**的并且写明为什么没跑 —— "没验到"≠"验过了没问题"。
 export function getSystemGates() {
@@ -347,6 +383,9 @@ export function archiveUrl(id, only = "done") {
 export function listWatches() {
   return api.get("/watches").then((r) => r.data);
 }
+// ⚠️ payload 里给 `cron` 时后端**按 cron 排下一次**, 忽略 interval_minutes;
+// 两个都不给/只给 interval 就还是"每 N 分钟"。cron 不合法时后端回 400 并带上
+// 中文原因(detail) —— 别在前端另写一套校验, 两套规则迟早不一致。
 export function createWatch(payload) {
   return api.post("/watches", payload).then((r) => r.data);
 }

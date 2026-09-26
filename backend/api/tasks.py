@@ -20,6 +20,7 @@ from collectors.gallery_base import (
     QUALITY_KEYS,
     shape_warning,
 )
+from core import cron as _cron
 from core import database as db
 from core import events
 from core import exporter
@@ -839,6 +840,25 @@ def resource_library(
         None,
         description="按主色系筛选(取值见 /library/facets 的 colors); 未知取值回 400",
     ),
+    date_from: Optional[str] = Query(
+        None,
+        description="落盘日期下界(含), YYYY-MM-DD; ⚠️ 口径是**入库时间**不是拍摄时间",
+    ),
+    date_to: Optional[str] = Query(
+        None, description="落盘日期上界(含), YYYY-MM-DD(含当天 23:59:59)"
+    ),
+    exclude_tag: Optional[str] = Query(None, description="排除带这个标签的资源"),
+    exclude_tag_children: bool = Query(False, description="排除时连子标签一起排"),
+    exclude_album: Optional[str] = Query(None, description="排除这个相册"),
+    exclude_kind: Optional[str] = Query(
+        None, description="排除这个类型(image / video / text)"
+    ),
+    exclude_special: Optional[str] = Query(
+        None, description="排除这个体检维度(取值见 /library/facets); 未知取值回 400"
+    ),
+    exclude_color: Optional[str] = Query(
+        None, description="排除这个色系(取值见 /library/facets); 未知取值回 400"
+    ),
 ):
     """跨任务资源库: 按相册 / 类型 / 标签 / 关键词浏览**已落盘**的产物。
 
@@ -849,23 +869,33 @@ def resource_library(
 
     `special` 是 V42 加的整理型筛选(取值见 `/library/facets`)。⚠️ 未知键**报 400**
     而不是静默忽略: 静默忽略的表现是"点了没反应", 那比报错难查得多。
+
+    V45 加了两组长条件:
+      * `date_from` / `date_to` —— 日期区间。**口径是落盘时间**: 我们没有 EXIF
+        (见 `core/imageinfo.py`, 那个模块只解宽高), 所以不存在"拍摄时间"这一说,
+        参数名与文案都照实写, 免得用户拿它去排"哪年拍的"却得到"哪年下的"。
+      * `exclude_*` —— 排除语义。此前条件之间只有"并且", 想表达"除了这个标签
+        之外都要"只能先列全库再手工跳过。⚠️ 未知键同样**报 400**, 理由同上。
     """
+    # ⚠️ 用**一份** dict 同时喂给 count / list / applied, 而不是三处各写一串参数。
+    # 逐项转发时, 每加一个筛选维度就多一次"某处忘了加"的机会, 而漏掉的症状是
+    # "总数对、页内容不对"(或反过来)—— 不报错, 只会让人觉得分页坏了(心法 ①)。
+    filt = dict(
+        q=q, kind=kind, task_id=task_id, album=album,
+        tag=tag, favorite=favorite, tag_children=tag_children,
+        min_rating=min_rating, special=special, color=color,
+        date_from=date_from, date_to=date_to,
+        exclude_tag=exclude_tag, exclude_tag_children=exclude_tag_children,
+        exclude_album=exclude_album, exclude_kind=exclude_kind,
+        exclude_special=exclude_special, exclude_color=exclude_color,
+    )
     try:
-        # ⚠️ color 必须同时传给 count 与 list: 只传一处的话, 总数与页内容口径
-        # 不一致 —— 表现为"翻到最后一页数量对不上", 很难察觉。
-        total = db.library_count(q=q, kind=kind, task_id=task_id, album=album,
-                                 tag=tag, favorite=favorite,
-                                 tag_children=tag_children,
-                                 min_rating=min_rating, special=special,
-                                 color=color)
+        total = db.library_count(**filt)
         offset = (page - 1) * page_size
-        rows = db.library_list(
-            q=q, kind=kind, task_id=task_id, album=album,
-            limit=page_size, offset=offset, tag=tag, favorite=favorite,
-            tag_children=tag_children,
-            min_rating=min_rating, special=special,
-            sort=sort, order=order, color=color,
-        )
+        rows = db.library_list(limit=page_size, offset=offset,
+                               sort=sort, order=order, **filt)
+        # "哪些条件真的生效了"由**生成 SQL 的那一处**回答, 前端不自己猜
+        applied = db.library_applied(**filt)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     # ⚠️ refs 与 tags 都**批量取**。逐行查的话一页 40 条就是 80 次往返, 而这是
@@ -896,6 +926,10 @@ def resource_library(
         # 拿档位再打一次 facets(那会把 9 个 count 也一起算一遍)。
         "sorts": db.library_sorts(),
         "default_sort": db.LIBRARY_DEFAULT_SORT,
+        # V45: 真正生效的筛选键。前端拿它渲染"当前条件"胶囊 —— 自己按参数真假
+        # 去猜的话, `kind="all"` / `color="all"`(都表示**不限**)会被当成一条
+        # 生效的条件显示出来, 于是界面上出现"类型: 全部", 用户以为自己筛过了。
+        "applied": applied,
         "stats": db.library_stats(),
         # 卡片上"缺失 / 疑似损坏 / 名字与内容不符"这几枚徽章的中文。由后端下发:
         # 前端自己维护一份的话, 后端加一类时界面会静默显示成代号(第 9 条)。
@@ -903,6 +937,55 @@ def resource_library(
             k: KIND_LABELS.get(k, k)
             for k in (KIND_MISSING, KIND_CORRUPT, KIND_MISMATCH)
         },
+    }
+
+
+@router.get("/library/{resource_id}/similar")
+def library_similar(
+    resource_id: int,
+    max_distance: Optional[int] = Query(
+        None, ge=0, le=64,
+        description="海明距离上限(0-64); 不传用后端默认档。⚠️ 与「疑似重复」的"
+                    "阈值是**两个**数: 那个判「就是同一张」, 这个判「看着像」",
+    ),
+    limit: int = Query(24, ge=1, le=60, description="最多返回几条"),
+):
+    """以图找图: 给出与这条资源**看着像**的其它资源(按 dHash 距离升序)。
+
+    Immich / PhotoPrism / digiKam / Czkawka 都有这个入口, 因为它回答的是
+    "我记得有这么一张、但记不得它在哪" 这句最常说的话。我们此前**指纹早就
+    算好了**(下载时落的 `resources.phash`), 只是没有一个入口去用它。
+
+    ⚠️ `ok=False` 与 `ok=True 但 items 为空` **必须是两种输出**(第 26 条):
+    前者是"没法比"(没指纹 / 这张是纯色图 / 没这条资源), 后者是"比过了, 没有像的"。
+    合并成空列表的话, 用户会把"这张图没法比对"读成"库里没有像它的"。
+    """
+    result = db.similar_to(resource_id, max_distance=max_distance, limit=limit)
+    if not result.get("ok"):
+        # 404 只给"真没有这条"; 另外两种是"有这条、但比不了", 回 200 + reason
+        if result.get("reason") == "not_found":
+            raise HTTPException(status_code=404, detail="resource not found")
+        return {
+            "ok": False,
+            "reason": result.get("reason"),
+            "reason_label": db.SIMILAR_REASON_LABELS.get(result.get("reason"),
+                                                         "没法比对"),
+            "items": [],
+            "scanned": 0,
+            "truncated": False,
+            "max_distance": result.get("max_distance"),
+        }
+    return {
+        "ok": True,
+        "reason": None,
+        "reason_label": None,
+        "items": result["items"],
+        "scanned": result.get("scanned", 0),
+        # ⚠️ 候选被截断要**报出来**: 默默只比前 N 条的话, "库里有更像的只是没比到"
+        # 会表现成"没有相似的"(同族 J: 不该数的时候不要数, 该说的时候必须说)。
+        "truncated": bool(result.get("truncated")),
+        "max_distance": result.get("max_distance"),
+        "seed": resource_id,
     }
 
 
@@ -1910,6 +1993,10 @@ class WatchIn(BaseModel):
     url: str
     collector: str = AUTO_COLLECTOR
     interval_minutes: int = 360
+    # V45: 可选的 5 段 cron。给了就按它排期, 没给用 interval_minutes。
+    # ⚠️ 空串与 None 都当"没给" —— 前端的下拉常常回一个空串, 而空串进
+    # `cron.parse()` 会被当成"字段数不对"报 400, 用户明明什么都没填。
+    cron: Optional[str] = None
     download_dir: Optional[str] = None
     quality: Optional[str] = None
     media: Optional[str] = None
@@ -1929,6 +2016,13 @@ def create_watch(payload: WatchIn):
     collector, resolved, warning = _pick_collector(payload.url, payload.collector)
     if payload.interval_minutes < 1:
         raise HTTPException(status_code=400, detail="interval_minutes 至少为 1")
+    # ⚠️ cron 必须**在创建时就校验**: 坏表达式一旦入库, 之后没有任何人会报错,
+    # 症状只是"这个订阅再也不跑了"(第 28 条: 静默回退比报错糟得多)。
+    cron = (payload.cron or "").strip() or None
+    if cron:
+        why = _cron.describe(cron)
+        if why:
+            raise HTTPException(status_code=400, detail=f"cron 不合法: {why}")
     # 与创建任务/预览**共用**同一个选项构造器。原先这里手抄了一份校验,
     # 结果是新选项在前端传了却被静默丢掉 —— 订阅会长期反复跑, 悄悄少一个选项
     # 比直接报错难查得多。
@@ -1944,7 +2038,7 @@ def create_watch(payload: WatchIn):
         options["download_dir"] = download_dir
     wid = db.create_watch(
         payload.url, collector, payload.interval_minutes, options,
-        run_now=payload.run_now,
+        run_now=payload.run_now, cron=cron,
     )
     watch = dict(db.get_watch(wid))
     # 订阅会长期反复跑, 识别结论更要回显: 一旦猜错, 每次巡检都会错。
@@ -2383,6 +2477,28 @@ def webhook_delete(hid: int):
     row = db.get_webhook(hid)
     return {"id": int(hid), "deleted": bool(db.delete_webhook(hid)),
             "url": (row or {}).get("url", "")}
+
+
+@router.get("/webhooks/{hid}/deliveries")
+def webhook_deliveries(hid: int, limit: int = Query(20, ge=1, le=100)):
+    """这个 webhook 最近几次投递的**逐次**记录(新的在前)。
+
+    V45 之前只有 `last_status` / `last_error`(最后一次的汇总), 于是"投了三次
+    全失败"和"只投过一次"在界面上长得一模一样 —— 而"它到底试过没有"恰恰是
+    webhook 出问题时唯一想知道的事。
+
+    ⚠️ 一次投递可能留下多行(每次重试一行), 这是**故意**的: 合并之后
+    "第一次超时、第二次成了"就看不见了, 而那句是在说对端有问题。
+    """
+    hook = db.get_webhook(hid)
+    if not hook:
+        raise HTTPException(status_code=404, detail="webhook not found")
+    rows = db.list_webhook_deliveries(hid, limit=limit)
+    return {
+        "webhook_id": int(hid),
+        "items": [dict(r) for r in rows],
+        "total": len(rows),
+    }
 
 
 @router.post("/webhooks/{hid}/test", response_model=WebhookFireOut)

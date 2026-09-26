@@ -4254,3 +4254,90 @@ assert not {'unused-imports': ['unused-import', 'unused-import']}
 **纪律**: 跑门禁之前先 `git add` 新文件 —— 否则本机那句"全绿"不包含它们。
 
 
+## 26. V45: 排除筛选 / 日期区间 / 找相似 / 投递历史 / cron / 幻灯片（2026-09-26）
+
+上一轮做完对标(V41 的四个能力、V42 的五方向、V43 的回代码核)之后, 又按同一套流程
+走了一遍: **先回代码确认这产品有几个方向**, 再去搜同类产品, 最后只吸收"跟我们同一
+契约"的那部分。这一轮落地的六项见 `README.md` 的 V45 一节, 这里只记**踩到的坑与
+为什么那么写**。
+
+### 26.1 五个"以为缺、其实早有"的假阳性
+
+核缺口时用关键词扫过全仓, 命中了五个看着像缺口的词, 打开一看都不是:
+
+| 命中 | 实际 |
+| --- | --- |
+| `core/imageinfo.py` | 名字像 EXIF, 实际**只解宽高** —— 所以"拍摄时间"这一列**根本不存在**, 日期筛选的中文只能写"落盘" |
+| `trash` | 排除表(`SKIP_DIRS`), 不是回收站功能 |
+| `proxy` | 网络代理(`proxy_health.py`), 不是资源代理图 |
+| `map` / `geo` | Python 内置的 `map()` |
+| `face` / `semantic` | 只出现在 `.md` 里(对标笔记), 代码里没有 |
+
+也差点提错一条: 想写"补视频封面帧", 一核 `core/thumbs.py` 早就有了(ffmpeg `-frames:v 1`)。
+**推迟理由会过期** —— V41 的评分、V42 的智能文件夹, 都是被"回代码看要多少活"戳破的。
+
+### 26.2 排除语义: `NOT EXISTS`, 不是 `EXISTS(NOT …)`
+
+```sql
+-- 错: "有任意一条标签不等于 A" —— 有 A 也有 B 的资源会被留下, 等于没筛
+EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id = r.id AND rt.tag <> ?)
+-- 对
+NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id = r.id AND rt.tag = ?)
+```
+
+以及排除时 `NULL` 必须算"不是": `NULL <> 'x'` 在 SQL 里既不是真也不是假, 所以每一条
+排除都写成 `(r.type IS NULL OR r.type <> ?)`。漏掉这半边的表现是"排除了视频却少了一批图"。
+
+### 26.3 相似与重复是**两个阈值**
+
+`phash.DEFAULT_THRESHOLD = 4`("就是同一张")与 `SIMILAR_MAX_DISTANCE = 12`("看着像")必须
+分开: 相似里混着"构图像但不是同一张"的图, 当成重复处理会真丢东西。另外 dHash 只看
+**梯度**, 纯色图的指纹恒为 0、互相距离 0 —— 这类退化指纹要挡在比对之外(同族 I)。
+
+`ok=false` 时一定回 `reason`(`no-fingerprint` / `degenerate` / `no-decoder` / `not-found`)
++ `reason_label`: 那些是"**没法比**", 不是"没有相似的"(第 26 条)。
+
+### 26.4 `applied` 的形状改过一次
+
+第一版 `library_filters` 返回一串**裸键名**, 前端照着渲染就会露出英文键。改成
+`[{"key":…, "label":…}]`, 中文只在 `LIBRARY_FILTER_LABELS` 一处翻译(第 9 条), 并加了一条
+断言: `applied` 里出现的每个键都必须在标签表里有中文名 —— 键名对不上**不报错、测试也绿**,
+只在界面上露一枚英文胶囊, 是典型的静默失效。
+
+### 26.5 cron 三个最容易错的点
+
+* 日与周**同时限定取"或"**(标准 cron 语义)。取"且"的话 `0 9 1 * 1` 要等"既是 1 号又是周一",
+  一年只跑一次。
+* cron 的周日是 `0`, Python `weekday()` 的周日是 `6` —— 必须平移。
+* 周日写 `7` 归一到 `0`, 且必须**在展开之后**做(先归一会把 `7` 当越界值丢掉)。
+
+`next_after` 收字符串会炸(`.replace(second=…)` 要 datetime), 所以加了 `_as_datetime()`
+统一转换 —— 与 `_minutes_later` 是同一个历史坑, 两种入参形态必须在一处归一。
+
+### 26.6 顺带修掉: 灯箱整套 CSS 选择器前缀对不上
+
+`style.css` 写的是 `.lightbox img` / `.lightbox .nav` / `.lightbox .lb-close`, 而组件根元素
+的类名是 **`lightbox-mask`** —— 整套后代选择器一条都没生效, `.lb-tools` / `.lb-btn` /
+`.lb-zoom` 则根本没有样式。
+
+这类错的特征与本项目反复踩的那些一样: **页面照常出来、控制台一个字都没有**, 只会让人
+觉得"这个灯箱比较丑"。它是加幻灯片控件时才被看见的 —— 新按钮没样式才去查。
+
+### 26.7 `sqlite3.Row` 又踩了一次
+
+`similar_to()` 里写了 `row.get("local_path")`, 运行时 `AttributeError`。这个坑仓库里早就
+记过, 但它只在**有真指纹才走到**的路径上发作 —— 平时跑不到。写法统一成
+`row["local_path"] if "local_path" in row.keys() else None`。
+
+### 26.8 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/test_features_v45.py`(新) | **30 项**(相似排序 / 双阈值 / 三种"没法比" / 截断上报 / API 两态 / `NOT EXISTS` 排除 / NULL 保护 / 排除相册 / 未知 special 400 / 日期含端点 / 非法日期 400 / `date` 档位中文含"落盘" / `applied` 不含 `kind=all` / count-list 同口径 / 每个键都有中文名 / 5xx 重试 vs 4xx 不重试 / 逐次记录 / 网络失败重试 / 删 hook 连带删历史 / deliveries 端点 / cron 严格晚于 now / 步长 / 列表 / 日或周 / 周日平移 / 坏表达式 / 订阅用 cron / claim 仍用 cron / interval 不变 / API 拒坏 cron / `next_run_for` 字符串入参不炸) |
+| 全量 pytest | 本机 Windows 收集 **1430** → 1424 passed + 6 skipped; CI/Linux **1431** |
+| 前端 | `npm run build` 通过(92 modules) |
+
+⚠️ 门禁**第五次**在同一条用例上救场: 全量跑完红了, 报"实测收集 1430, README 只写了
+[1400, 1401]" —— 数字必须由门禁算, 不能靠自觉(第 27 条那一类)。
+
+

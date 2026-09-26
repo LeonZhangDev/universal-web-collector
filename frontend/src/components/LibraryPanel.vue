@@ -25,6 +25,7 @@ import {
   listLibraryDuplicates,
   listLibraryFailures,
   listLibrarySearches,
+  listLibrarySimilar,
   listLibraryTags,
   listVirtualAlbumItems,
   replayLibraryFailures,
@@ -68,9 +69,28 @@ const query = ref({
   // 后端加一档时界面自动多一项; 未知代号后端会回 400(不静默忽略)。
   sort: "",
   order: "desc",
+  // ---- V45: 排除筛选 ----
+  // 与正向筛选**各占一个字段**, 不做成"同一个下拉里选 包含/排除" —— 那样
+  // "包含 A 且排除 B"这种最常见组合就没法表达了(那是整理时真正的用法)。
+  exclude_tag: "",
+  exclude_tag_children: false,
+  exclude_album: "",
+  exclude_kind: "",
+  exclude_special: "",
+  exclude_color: "",
+  // ---- V45: 落盘日期区间 ----
+  // ⚠️ 口径是**落盘时间**(created_time), 不是拍摄时间 —— 我们没有 EXIF。
+  // 形态必须 YYYY-MM-DD: 别的一律后端 400, 前端不做自己的宽松解析(两套规则
+  // 迟早不一致, 而"宽松"的那一侧会静默接受 2026-13-40 这种输入)。
+  date_from: "",
+  date_to: "",
   page: 1,
   page_size: 40,
 });
+// 后端回灌的"这次真正生效的条件"(第 27 条: 规则生效要有计数/证据)。
+// ⚠️ 用它来显示而不是拿 query 反推 —— query 里有 kind=all 这种"没筛"的值,
+// 照着显示会让人以为"按类型筛过了"。
+const applied = ref([]);
 const KINDS = [
   { key: "all", label: "全部" },
   { key: "image", label: "图片" },
@@ -350,6 +370,63 @@ function clearOrganize() {
   search();
 }
 
+// ---- V45: 排除筛选 + 落盘日期区间 ----
+// 这两组控件默认收起: 它们不是日常入口, 摊开会把"找东西"那一行挤成两行。
+// 但收起不等于没有 —— 收起时若条件非空, 生效条件条里照样显示(见 org-bar)。
+const advOpen = ref(false);
+function clearAdvanced() {
+  query.value.exclude_tag = "";
+  query.value.exclude_tag_children = false;
+  query.value.exclude_album = "";
+  query.value.exclude_kind = "";
+  query.value.exclude_special = "";
+  query.value.exclude_color = "";
+  query.value.date_from = "";
+  query.value.date_to = "";
+  search();
+}
+// 日期用原生 <input type="date">: 它给的就是 YYYY-MM-DD, 与后端正则同一形态。
+// ⚠️ 不自己写文本框 + 解析 —— 手输的 "2026/3/5" 会被后端 400 拒掉, 而那不算
+// bug(宽松接受输入才是: 今天能被接受、明天换个格式就查不到东西)。
+const hasAdvanced = computed(
+  () =>
+    !!query.value.exclude_tag ||
+    !!query.value.exclude_album ||
+    !!query.value.exclude_kind ||
+    !!query.value.exclude_special ||
+    !!query.value.exclude_color ||
+    !!query.value.date_from ||
+    !!query.value.date_to
+);
+
+// ---- V45: 找相似(感知指纹汉明距离) ----
+// ⚠️ 与"疑似重复"是**两个阈值**(重复 ≤4 / 相似 ≤12), 界面上分成两个入口:
+// 相似里混着"构图像但不是同一张"的图, 当成重复删掉就真丢了东西。
+const similarData = ref(null);
+const similarBusy = ref(false);
+const SIMILAR_DISTANCES = [6, 12, 20];
+async function openSimilar(r, maxDistance = 12) {
+  similarBusy.value = true;
+  try {
+    const d = await listLibrarySimilar(r.id, { max_distance: maxDistance, limit: 24 });
+    // 把"被查的那一张"也带上 —— 结果区里没有它的话, 用户不知道在跟谁比。
+    d.origin = r;
+    similarData.value = d;
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    similarBusy.value = false;
+  }
+}
+function closeSimilar() {
+  similarData.value = null;
+}
+// ⚠️ ok=false 时的 reason 是**代号**, 中文由同一份响应的 reason_label 给。
+// 前端不维护映射表(第 9 条), 也不把"没法比"显示成"没有相似的"。
+function similarReason(d) {
+  return d?.reason_label || d?.reason || "";
+}
+
 // ---- V43: 排序 + 保存的搜索(智能文件夹) ----
 // 排序档位由后端在 `/library` 与 `/library/facets` 两处**同一份定义**下发;
 // 前端只拿 key 与中文名, 不认识任何列名。未知代号后端回 400 而不是静默按默认
@@ -420,6 +497,16 @@ function applySearch(s) {
   query.value.favorite = !!p.favorite;
   query.value.min_rating = p.min_rating || 0;
   query.value.special = p.special || "";
+  // V45: 排除与日期。**整体替换**的一部分 —— 少清一项就会带着上一个搜索的
+  // 排除条件, 列表条数与侧栏命中数对不上而没有任何报错。
+  query.value.exclude_tag = p.exclude_tag || "";
+  query.value.exclude_tag_children = !!p.exclude_tag_children;
+  query.value.exclude_album = p.exclude_album || "";
+  query.value.exclude_kind = p.exclude_kind || "";
+  query.value.exclude_special = p.exclude_special || "";
+  query.value.exclude_color = p.exclude_color || "";
+  query.value.date_from = p.date_from || "";
+  query.value.date_to = p.date_to || "";
   query.value.page = 1;
   activeSearch.value = s.id;
   load();
@@ -806,6 +893,16 @@ function currentParams() {
     min_rating: query.value.min_rating,
     special: query.value.special,
     color: query.value.color,
+    // V45 排除与日期区间。保存搜索时一起带走 —— "排除 A 的那一批"同样是个
+    // 值得存下来的视角, 少带一项就等于存了个不同的搜索。
+    exclude_tag: query.value.exclude_tag,
+    exclude_tag_children: query.value.exclude_tag_children,
+    exclude_album: query.value.exclude_album,
+    exclude_kind: query.value.exclude_kind,
+    exclude_special: query.value.exclude_special,
+    exclude_color: query.value.exclude_color,
+    date_from: query.value.date_from,
+    date_to: query.value.date_to,
   };
 }
 
@@ -825,6 +922,9 @@ async function load() {
     stats.value = r.stats || null;
     // 徽章中文由后端下发(见 api/tasks.py 的 error_kind_labels)
     if (r.error_kind_labels) errorKindLabels.value = r.error_kind_labels;
+    // 生效条件由**生成 SQL 的那一处**回灌(后端 database.library_filters)。
+    // 这里原样显示, 不按本地 query 重算 —— 否则"传了但没生效"会被画成已生效。
+    applied.value = r.applied || [];
     // 排序档位也由后端在 facets 里下发, 这里的回显只用于**校正**本地 state:
     // 未知代号会被后端 400 挡掉, 所以一旦请求成功, 本地值就一定与真实顺序一致。
     if (r.sort) query.value.sort = r.sort === defaultSort.value ? "" : r.sort;
@@ -1025,6 +1125,72 @@ onMounted(() => {
       >
         {{ busyNorm ? "检查中…" : "修正扩展名" }}
       </button>
+      <!-- V45 高级筛选: 排除 + 日期区间。默认收起, 但**非空时强制展开** ——
+           收着的条件是"列表少了大半却说不清为什么"的经典来源。 -->
+      <button
+        class="ghost"
+        :class="{ on: advOpen }"
+        :title="hasAdvanced ? '已设了排除/日期条件' : '排除某些标签/相册, 或按落盘日期筛选'"
+        @click="advOpen = !advOpen"
+      >
+        高级{{ hasAdvanced ? " ●" : "" }} <i class="caret">▾</i>
+      </button>
+    </div>
+
+    <!-- V45 排除 / 日期区间 -->
+    <div v-if="advOpen || hasAdvanced" class="adv-box">
+      <div class="adv-row">
+        <span class="tb-label">排除标签</span>
+        <select v-model="query.exclude_tag" class="lib-sel" @change="search">
+          <option value="">(不排除)</option>
+          <option v-for="t in tags" :key="t.tag" :value="t.tag">{{ t.tag }}</option>
+        </select>
+        <label class="tb-sub" v-if="query.exclude_tag">
+          <input
+            type="checkbox"
+            :checked="query.exclude_tag_children"
+            @change="query.exclude_tag_children = !query.exclude_tag_children; search()"
+          />
+          含子标签
+        </label>
+        <span class="tb-label">排除相册</span>
+        <select v-model="query.exclude_album" class="lib-sel" @change="search">
+          <option value="">(不排除)</option>
+          <option v-for="a in albums" :key="a.album" :value="a.album">{{ a.album }}</option>
+        </select>
+        <span class="tb-label">排除类型</span>
+        <select v-model="query.exclude_kind" class="lib-sel" @change="search">
+          <option value="">(不排除)</option>
+          <option v-for="k in KINDS.filter((x) => x.key !== 'all')" :key="k.key" :value="k.key">
+            {{ k.label }}
+          </option>
+        </select>
+      </div>
+      <div class="adv-row">
+        <span class="tb-label">排除状态</span>
+        <select v-model="query.exclude_special" class="lib-sel" @change="search">
+          <option value="">(不排除)</option>
+          <option v-for="f in facets?.items || []" :key="f.key" :value="f.key">{{ f.label }}</option>
+        </select>
+        <span class="tb-label">排除颜色</span>
+        <select v-model="query.exclude_color" class="lib-sel" @change="search">
+          <option value="">(不排除)</option>
+          <option v-for="c in facets?.colors || []" :key="c.key" :value="c.key">{{ c.label }}</option>
+        </select>
+        <!-- 日期区间。<input type="date"> 给的就是 YYYY-MM-DD, 与后端校验同形态。
+             ⚠️ 标签写"落盘于"不写"拍摄于": 我们没有 EXIF, 这是落盘时间。 -->
+        <span class="tb-label">落盘于</span>
+        <input v-model="query.date_from" class="lib-sel" type="date" @change="search" />
+        <span class="adv-sep">→</span>
+        <input v-model="query.date_to" class="lib-sel" type="date" @change="search" />
+        <span class="grow"></span>
+        <button class="ghost mini" :disabled="!hasAdvanced" @click="clearAdvanced">清除</button>
+      </div>
+      <p class="adv-note">
+        排除是「<b>没有</b>这个标签 / <b>不在</b>这个相册」, 用 NOT EXISTS 实现 ——
+        与正向筛选不是简单取反(标签为 NULL 时"不等于 X"在 SQL 里既不是真也不是假)。
+        日期含两端, 上界自动算到当天 23:59:59。
+      </p>
     </div>
 
     <!-- V43 保存的搜索(智能文件夹)。每条都带**命中数**:
@@ -1128,6 +1294,74 @@ onMounted(() => {
       </span>
       <span class="org-chip on" v-if="query.min_rating">≥ {{ query.min_rating }} 星</span>
       <button class="ghost mini" @click="clearOrganize">清除</button>
+    </div>
+
+    <!-- V45: 后端回灌的"这次真正生效了哪些条件"。
+         ⚠️ 显示这一条的理由是第 27 条: 规则生效要有证据。没有它, "我传了但后端
+         没认"与"条件生效了但就是没东西"长得一模一样 —— 两者都表现为列表空。
+         取值**只来自后端 applied**, 不拿 query 反推: query 里 kind=all 是"没筛",
+         照着画会让人以为筛过了。 -->
+    <div class="org-bar applied-bar" v-if="applied.length">
+      <span class="org-lab">已生效</span>
+      <span v-for="c in applied" :key="c.key" class="org-chip on" :title="c.key">
+        {{ c.label }}
+      </span>
+    </div>
+
+    <!-- V45 找相似: 按 dHash 汉明距离找"看着像"的图。
+         ⚠️ 与"疑似重复"刻意分成两个入口、两个阈值: 重复(≤4)是"就是同一张",
+         相似(默认 ≤12)里混着"构图像但不是同一张" —— 当成重复处理会真丢东西。
+         ⚠️ ok=false 时**必须显示 reason**: no-fingerprint / no-decoder 都是
+         "没法比", 不是"没有相似的"(第 26 条 —— 空列表会把两者混成一个答案)。 -->
+    <div v-if="similarData" class="sim-box">
+      <div class="sm-head">
+        <b>与「{{ baseName(similarData.origin?.local_path) }}」相似</b>
+        <span class="sm-sub" v-if="similarData.ok && !similarBusy">
+          {{ similarData.items.length }} 条 · 距离 ≤ {{ similarData.max_distance }}/64
+        </span>
+        <span class="grow"></span>
+        <span class="sm-seg">
+          <button
+            v-for="d in SIMILAR_DISTANCES"
+            :key="d"
+            class="ghost mini"
+            :class="{ on: similarData.max_distance === d }"
+            :title="`汉明距离 ≤ ${d}/64`"
+            @click="openSimilar(similarData.origin, d)"
+          >≤{{ d }}</button>
+        </span>
+        <button class="ghost mini" @click="closeSimilar">收起</button>
+      </div>
+
+      <!-- 三种"没法比"都在这里说清楚, 而不是给一个空列表 -->
+      <p v-if="similarData && !similarData.ok" class="sm-reason">
+        没法比: {{ similarReason(similarData) }}
+      </p>
+      <p v-else-if="similarBusy" class="sm-note">正在比对…</p>
+      <p v-else-if="!similarData.items.length" class="sm-note">
+        距离 ≤ {{ similarData.max_distance }} 以内没有别的图。可以放宽到 ≤20 再试。
+      </p>
+      <div v-else class="sm-grid">
+        <div class="sm-card" v-for="s in similarData.items" :key="s.id">
+          <img
+            v-if="s.local_path"
+            :src="thumbUrl(s.local_path, 200)"
+            loading="lazy"
+            alt=""
+            @error="(e) => (e.target.style.display = 'none')"
+          />
+          <div class="sm-meta">
+            <span class="sm-d" :title="`汉明距离 ${s.distance}/64`">{{ s.distance }}</span>
+            <span class="sm-nm" :title="s.local_path">{{ baseName(s.local_path) }}</span>
+          </div>
+        </div>
+      </div>
+      <!-- 候选被截断要**报出来**(同族 J): 不报的话"最像的那张没出现在列表里"
+           会被当成功能不准, 而其实是扫描上限到了。 -->
+      <p v-if="similarData.truncated" class="sm-note warn">
+        候选超过扫描上限, 只比了前 {{ similarData.scanned }} 条 —— 可能有更近的没比到。
+      </p>
+      <p class="sm-note">只展示, 不动任何文件。</p>
     </div>
 
     <!-- 体检视图: 每个整理型维度各有多少条。点一下即筛选。
@@ -1430,6 +1664,14 @@ onMounted(() => {
             :title="r.favorite ? '取消收藏' : '收藏'"
             @click.stop="starOne(r)"
           >{{ r.favorite ? "★" : "☆" }}</button>
+          <!-- V45 找相似。⚠️ 只在图片上出现: 指纹只对图片算(见 task_manager 里
+               `type == 'image'` 那一处), 在视频上放这个按钮等于保证它没结果。 -->
+          <button
+            v-if="r.type === 'image'"
+            class="sim"
+            title="找相似(按感知指纹, 与'疑似重复'不是一个阈值)"
+            @click.stop="openSimilar(r)"
+          >⧉</button>
         </div>
         <div class="meta">
           <div class="nm" :title="r.local_path">{{ baseName(r.local_path) }}</div>
@@ -1812,6 +2054,52 @@ onMounted(() => {
   color: var(--accent); border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
+/* 已生效条件(后端 applied)与上面的"整理筛选"是两件事: 那一条是用户点的,
+   这一条是后端**真的写进 SQL 的**。两者不一致时, 以这一条为准。 */
+.applied-bar { margin: -10px 0 12px; opacity: .9; }
+
+/* ---- V45: 排除 / 日期区间 ---- */
+.adv-box {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2);
+  padding: 10px 12px; margin: -6px 0 12px;
+}
+.adv-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.adv-row + .adv-row { margin-top: 8px; }
+.adv-sep { color: var(--muted); font-size: 12px; }
+.adv-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.adv-note b { color: var(--text); font-weight: 600; }
+
+/* ---- V45: 找相似 ---- */
+.sim-box {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2);
+  padding: 10px 12px; margin-bottom: 12px;
+}
+.sm-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.sm-sub { color: var(--muted); font-size: 12px; }
+.sm-seg { display: inline-flex; gap: 2px; }
+.sm-seg .on { color: var(--accent); border-color: var(--accent); }
+.sm-grid { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.sm-card { width: 116px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.sm-card img { width: 100%; height: 86px; object-fit: cover; display: block; background: #000; }
+.sm-meta { display: flex; align-items: center; gap: 4px; padding: 4px 6px; font-size: 11px; }
+.sm-d { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+.sm-nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.sm-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.sm-note.warn { color: var(--warn); }
+/* "没法比"不是错误也不是空结果 —— 用中性偏提示的样式, 别用 err 色
+   (那会让人以为请求失败了, 而请求是成功的, 只是比不了)。 */
+.sm-reason { margin: 8px 0 0; color: var(--warn); font-size: 12px; line-height: 1.6; }
+/* 卡片上的"找相似"按钮。⚠️ 与 `.star` 同一条纪律: 都在右下角那一排, 位置必须
+   让开(星标占 right 32..57), 叠在一起会表现为"这个按钮点不到"。
+   同样平时透明、hover 才亮 —— 一页 40 个图标按钮会很吵。 */
+.sim {
+  position: absolute; right: 62px; bottom: 6px; z-index: 2;
+  background: rgba(0, 0, 0, .42); border: none; border-radius: 6px;
+  color: #d7dde5; font-size: 13px; line-height: 1; padding: 3px 6px;
+  cursor: pointer; opacity: 0; transition: opacity .15s, color .15s;
+}
+.card:hover .sim { opacity: 1; }
+.sim:hover { color: var(--accent); }
 /* 体检面板: 中性色(不是警告色) —— "有多少没打标签"是待办, 不是故障。
    用 warn 色会让人以为库坏了。 */
 .facet-box {

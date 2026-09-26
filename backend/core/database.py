@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from core.config import settings
 from core import colors as _colors
+from core import cron as _cron
 from core import filekind as _filekind
 from core import layout as _layout
 
@@ -150,6 +152,12 @@ CREATE TABLE IF NOT EXISTS watches(
     url TEXT NOT NULL,
     collector TEXT NOT NULL,
     interval_minutes INTEGER NOT NULL DEFAULT 360,
+    -- V45: 可选的 5 段 cron 表达式(`分 时 日 月 周`)。**给了就按 cron 排下一轮,
+    -- 没给才用 interval_minutes** —— 间隔只能表达"每 N 分钟", 表达不了
+    -- "每天凌晨 3 点"或"只在工作日"。NULL 保持旧行为, 迁移零成本。
+    -- ⚠️ 解析失败必须在**创建时**就 400(见 core/cron.py), 不能等到调度时才
+    -- 发现: 那时它只会表现为"这个订阅再也不跑了", 而没有任何人报错。
+    cron TEXT,
     options TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     last_run TEXT,
@@ -271,6 +279,26 @@ CREATE TABLE IF NOT EXISTS webhooks(
     created_at REAL NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhooks_url ON webhooks(url);
+
+-- V45: 投递**历史**。此前只有 webhooks.last_status / last_error(最后一次),
+-- 于是"投了 3 次全失败"和"只投了 1 次"在界面上长得一模一样, 而"它到底试过没有"
+-- 恰恰是 webhook 出问题时唯一想知道的事(第 G 条: 静默降级必须有痕)。
+-- ⚠️ 一次投递**可能留下多行**(每次重试一行): 合并成一行的话, 重试的痕迹就
+-- 没了, 又回到"看不出试过几次"。
+CREATE TABLE IF NOT EXISTS webhook_deliveries(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    webhook_id INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+    event TEXT NOT NULL,
+    -- 第几次尝试(从 1 开始)。与 attempt 的 HTTP 状态码配对看, 才知道
+    -- "是对方一直 500"还是"第一次超时、第二次成了"。
+    attempt INTEGER NOT NULL DEFAULT 1,
+    status INTEGER,
+    error TEXT,
+    -- ⚠️ 新表时刻列一律 `created_at REAL`(epoch 秒), 不用老表的
+    -- `created_time` 字符串: 见 resources.started_at 那条注释(秒级字符串
+    -- 会把"相隔 200 毫秒的两次重试"记成同一件事)。
+    created_at REAL NOT NULL
+);
 """
 
 # 索引在列迁移之后创建(旧库可能缺列)
@@ -286,6 +314,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON resource_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_resources_favorite ON resources(favorite);
 CREATE INDEX IF NOT EXISTS idx_resources_rating ON resources(rating);
+-- 投递历史按 webhook 查(面板里点开一个 webhook 看它最近几次)
+CREATE INDEX IF NOT EXISTS idx_deliveries_hook ON webhook_deliveries(webhook_id, id DESC);
+-- V45: 日期区间筛选直接比 created_time 字符串(定宽 YYYY-MM-DD HH:MM:SS,
+-- 字典序 == 时间序), 这条索引让它不必全表扫。
+CREATE INDEX IF NOT EXISTS idx_resources_created ON resources(created_time);
 """
 
 
@@ -339,6 +372,8 @@ _ADD_COLUMNS = [
     # 走 SQL 等值匹配(能命中索引), 色值则随时可重算。NULL = 还没提过色
     # ("没算出"), 与"提过但归为 gray"是两回事(第 26 条)。
     ("resources", "dominant_color", "TEXT"),
+    # V45: 订阅的 cron 表达式。旧库为 NULL = 沿用 interval_minutes, 行为不变。
+    ("watches", "cron", "TEXT"),
 ]
 
 
@@ -1160,6 +1195,11 @@ LIBRARY_SORTS = {
     "rating": ("COALESCE(r.rating, 0)", "星级"),
     "name": ("COALESCE(r.local_path, '')", "文件名"),
     "type": ("COALESCE(r.type, '')", "类型"),
+    # V45: 日期档位。⚠️ 中文名必须写"**落盘**时间"而不是"拍摄时间" —— 我们没有
+    # EXIF(见 core/imageinfo.py: 那个模块只解宽高), 这一列记的是文件进库的时刻。
+    # 写成"拍摄时间"的话, 用户拿它去排"哪年拍的"会得到"哪年下的", 而且是
+    # **安静地错**(第 28 条: 口径写错比缺一个档位糟得多)。
+    "date": ("COALESCE(r.created_time, '')", "落盘时间"),
 }
 
 #: 默认档位。与 `library_list` 里 `r.id DESC` 的老行为**逐位一致**, 这样不传
@@ -1172,7 +1212,59 @@ LIBRARY_DEFAULT_SORT = "added"
 LIBRARY_QUERY_KEYS = (
     "q", "kind", "album", "task_id", "tag", "tag_children",
     "favorite", "min_rating", "special", "color",
+    # V45: 日期区间(含端点, YYYY-MM-DD)
+    "date_from", "date_to",
+    # V45: 排除语义(NOT)。与上面的键一一对应, 命名对称是为了让"保存的搜索"
+    # 回灌时不必做特例映射。
+    "exclude_tag", "exclude_tag_children", "exclude_album",
+    "exclude_kind", "exclude_special", "exclude_color",
 )
+
+#: 筛选键 -> 界面上显示的中文。**唯一翻译点**: 界面不许自己维护一份映射
+# (第 9 条 —— 自己维护的话, 后端加一个维度时界面会静默显示成英文键名)。
+#: ⚠️ 键必须与 `library_filters` 里 `applied.append(...)` 用的**逐字一致**;
+#: 对不上不会报错, 只会让界面上出现一枚写着英文键名的胶囊。
+LIBRARY_FILTER_LABELS = {
+    "q": "关键词",
+    "kind": "类型",
+    "exclude_kind": "排除类型",
+    "album": "相册",
+    "exclude_album": "排除相册",
+    "task_id": "任务",
+    "tag": "标签",
+    "exclude_tag": "排除标签",
+    "favorite": "只看收藏",
+    "min_rating": "评分下限",
+    "special": "状态",
+    "exclude_special": "排除状态",
+    "color": "主色",
+    "exclude_color": "排除主色",
+    "date_from": "落盘起",
+    "date_to": "落盘止",
+}
+
+#: 日期参数的形态。`created_time` 是定宽字符串(`YYYY-MM-DD HH:MM:SS`), 字典序
+#: 等于时间序, 所以区间筛选可以直接比字符串 —— 前提是**位数固定**。
+#: ⚠️ 因此这里强制 `YYYY-MM-DD`: 传 "2026-9-1" 会被拒(400)而不是"悄悄筛不出东西"。
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: 区间端点补齐。只给日期时, 上界必须补到当天**最后一秒**:
+#: `created_time <= '2026-09-26'` 会把当天 00:00:00 之后落盘的全都排除掉
+#: (因为 '2026-09-26 10:00:00' > '2026-09-26'), 表现为"我选了今天却一条都没有"。
+_DAY_START = " 00:00:00"
+_DAY_END = " 23:59:59"
+
+
+def _day_bound(value, end=False):
+    """校验并补齐一个 `YYYY-MM-DD`, 非法时抛 ValueError(由 API 转 400)。
+
+    ⚠️ 非法值**必须报错**, 不能"当作没传": 静默忽略的表现是"选了日期没反应",
+    而用户会以为库里那段时间没有东西。
+    """
+    s = (value or "").strip()
+    if not _DATE_RE.match(s):
+        raise ValueError(f"bad date (want YYYY-MM-DD): {value!r}")
+    return s + (_DAY_END if end else _DAY_START)
 
 
 def library_order_by(sort=None, order=None):
@@ -1313,7 +1405,11 @@ def delete_search(sid):
 
 def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
                     tag=None, favorite=None, tag_children=False,
-                    min_rating=None, special=None, color=None):
+                    min_rating=None, special=None, color=None,
+                    date_from=None, date_to=None,
+                    exclude_tag=None, exclude_tag_children=False,
+                    exclude_album=None, exclude_kind=None,
+                    exclude_special=None, exclude_color=None):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
     单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
@@ -1332,19 +1428,42 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
     `min_rating` / `special` 是 V42 的整理型筛选: 前者按星级下限, 后者取
     `SPECIAL_FILTERS` 里的键。**未知键直接忽略而不报错**是错的 —— 那会让
     "我点了没反应"变成静默失败, 所以这里抛 ValueError 由 API 层转 400。
+
+    V45 加了两组:
+      * `date_from` / `date_to` —— 日期区间, **含端点**。口径是**落盘时间**
+        (`resources.created_time`), 不是拍摄时间: 我们没有 EXIF。
+      * `exclude_*` —— 排除语义(NOT)。PhotoPrism 有 `NOT` 操作符而我们此前
+        只有"并且", 于是"除了这个标签之外的都给我"得先列全库再手工跳过。
+
+    返回 `(where, args, applied)`:
+      * `applied` 是**真正生效了**的筛选键名列表。⚠️ 这一项是必需的(第 27 条):
+        "配了"和"生效了"必须能分开看。前端拿它去渲染"当前条件"的胶囊 ——
+        自己按参数真假去猜的话, `kind="all"` / `color="all"`(表示不限)会被
+        当成一个生效的条件显示出来, 而界面上出现一个"类型: 全部"的胶囊,
+        用户会以为自己筛过了。
     """
     where = ["1=1"]
     args = []
+    applied = []
 
     if special:
         clause = SPECIAL_FILTERS.get(special)
         if not clause:
             raise ValueError(f"unknown special filter: {special}")
         where.append("(" + clause + ")")
+        applied.append("special")
+
+    if exclude_special:
+        clause = SPECIAL_FILTERS.get(exclude_special)
+        if not clause:
+            raise ValueError(f"unknown special filter: {exclude_special}")
+        where.append("NOT (" + clause + ")")
+        applied.append("exclude_special")
 
     if min_rating:
         where.append("r.rating >= ?")
         args.append(int(min_rating))
+        applied.append("min_rating")
 
     if color and color != "all":
         # 与 special 同款: 未知色系必须**报错**而不是"筛不出东西"。筛出 0 条会
@@ -1353,6 +1472,27 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
             raise ValueError(f"unknown color: {color}")
         where.append("r.dominant_color = ?")
         args.append(color)
+        applied.append("color")
+
+    if exclude_color and exclude_color != "all":
+        if exclude_color not in _colors.COLOR_FAMILIES:
+            raise ValueError(f"unknown color: {exclude_color}")
+        # ⚠️ 必须把 NULL 显式算进"不是这个色系"里。SQL 里 `NULL <> 'blue'` 是
+        # NULL(未知)而不是真, 于是"还没提过色的图"会被一起排掉 —— 而用户要的
+        # 是"不要蓝色的", 不是"只要提过色的"。
+        where.append("(r.dominant_color IS NULL OR r.dominant_color <> ?)")
+        args.append(exclude_color)
+        applied.append("exclude_color")
+
+    if date_from:
+        where.append("r.created_time >= ?")
+        args.append(_day_bound(date_from, end=False))
+        applied.append("date_from")
+
+    if date_to:
+        where.append("r.created_time <= ?")
+        args.append(_day_bound(date_to, end=True))
+        applied.append("date_to")
 
     if status:
         where.append("r.status=?")
@@ -1364,41 +1504,66 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
     if task_id:
         where.append("r.task_id=?")
         args.append(task_id)
+        applied.append("task_id")
 
     if kind and kind not in ("all", ""):
         where.append("r.type=?")
         args.append(kind)
+        applied.append("kind")
+
+    if exclude_kind and exclude_kind not in ("all", ""):
+        where.append("(r.type IS NULL OR r.type <> ?)")
+        args.append(exclude_kind)
+        applied.append("exclude_kind")
 
     if album:
         # 按相册名匹配: 相册名落在 tasks.name, 用精确匹配 —— 模糊匹配会让
         # "ABP-123" 同时命中 "ABP-1234", 用户看到一堆不相干的东西。
         where.append("t.name=?")
         args.append(album)
+        applied.append("album")
 
-    if tag:
+    if exclude_album:
+        # 同理要把 tasks.name IS NULL 算进"不是这个相册"
+        where.append("(t.name IS NULL OR t.name <> ?)")
+        args.append(exclude_album)
+        applied.append("exclude_album")
+
+    for value, children, key, negate in (
+        (tag, tag_children, "tag", False),
+        (exclude_tag, exclude_tag_children, "exclude_tag", True),
+    ):
+        if not value:
+            continue
         # EXISTS 子查询而不是 JOIN resource_tags: JOIN 会让"一个资源带 3 个标签"
         # 变成 3 行, 于是分页数量与总数全错(除非再加 DISTINCT, 而那又会掩盖
         # 真正的重复)。EXISTS 天然只判在不在, 配合 idx_tags_tag 是一次索引探测。
         # ⚠️ 不要手写 `LOWER(tag)=LOWER(?)`: 列的 COLLATE NOCASE 已经在管这件事,
         # 两套写法混用会让"能走索引"变成"函数包住列 → 走不了索引"。
-        clean = normalize_tag(tag)
-        if tag_children:
+        clean = normalize_tag(value)
+        if children:
             # 含子标签: 前缀匹配(`系列/` 开头)。用 ESCAPE 声明转义符, 与 `%`
             # 的语义分开 —— 否则用户起的 `a_b` 会连带命中的东西一起进来。
-            where.append(
+            clause = (
                 "EXISTS (SELECT 1 FROM resource_tags rt "
                 "WHERE rt.resource_id = r.id AND (rt.tag = ? OR rt.tag LIKE ? ESCAPE '\\'))"
             )
             args += [clean, _like_pattern(clean, prefix=TAG_SEP)]
         else:
-            where.append(
+            clause = (
                 "EXISTS (SELECT 1 FROM resource_tags rt "
                 "WHERE rt.resource_id = r.id AND rt.tag = ?)"
             )
             args.append(clean)
+        # ⚠️ 取反时是 `NOT EXISTS`, 不是 `EXISTS(NOT ...)`: 后者在"这个资源有
+        # 别的标签"时会因为那一条满足 NOT 而整体为真 —— 于是"排除 A 标签"
+        # 变成"只要有任意非 A 标签就留下", 等于没筛。
+        where.append(("NOT " if negate else "") + clause)
+        applied.append(key)
 
     if favorite:
         where.append("r.favorite=1")
+        applied.append("favorite")
 
     if q:
         # 同时搜本地路径与来源 URL: 用户有时记得文件名, 有时只记得站点。
@@ -1406,8 +1571,9 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
         pat = _like_pattern(q)
         where.append("(r.local_path LIKE ? ESCAPE '\\' OR r.url LIKE ? ESCAPE '\\')")
         args.extend([pat, pat])
+        applied.append("q")
 
-    return " AND ".join(where), args
+    return " AND ".join(where), args, applied
 
 
 def failure_kinds(include_gone=True, include_corrupt=True):
@@ -1497,14 +1663,26 @@ def failure_count(kinds=None, include_gone=False):
 
 def library_count(q=None, kind=None, task_id=None, album=None, status="done",
                   tag=None, favorite=None, tag_children=False,
-                  min_rating=None, special=None, color=None):
+                  min_rating=None, special=None, color=None,
+                  date_from=None, date_to=None,
+                  exclude_tag=None, exclude_tag_children=False,
+                  exclude_album=None, exclude_kind=None,
+                  exclude_special=None, exclude_color=None):
     """资源库总数(与 library_list 同一口径)。
 
     ⚠️ `color` 必须在这里**显式**往下传: `library_filters` 是按位置被调用的,
     少传一个就表现为"按颜色筛了但没生效" —— 不报错, 只是结果不对。
+    V45 新加的 `date_*` / `exclude_*` 同理, 一个都不能漏(心法 ①: 多一个筛选
+    维度, 就有多处口径要同步)。
     """
-    where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
-                                  tag_children, min_rating, special, color)
+    where, args, _applied = library_filters(
+        q, kind, task_id, album, status, tag, favorite,
+        tag_children, min_rating, special, color,
+        date_from=date_from, date_to=date_to,
+        exclude_tag=exclude_tag, exclude_tag_children=exclude_tag_children,
+        exclude_album=exclude_album, exclude_kind=exclude_kind,
+        exclude_special=exclude_special, exclude_color=exclude_color,
+    )
     row = query_one(
         f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
         f"WHERE {where}",
@@ -1516,14 +1694,28 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
 def library_list(q=None, kind=None, task_id=None, album=None, status="done",
                  limit=50, offset=0, tag=None, favorite=None,
                  tag_children=False, min_rating=None, special=None,
-                 sort=None, order=None, color=None):
+                 sort=None, order=None, color=None,
+                 date_from=None, date_to=None,
+                 exclude_tag=None, exclude_tag_children=False,
+                 exclude_album=None, exclude_kind=None,
+                 exclude_special=None, exclude_color=None):
     """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。
 
-    ⚠️ 与 `library_count` 必须共用**同一份**筛选参数(含 `color`), 否则总数与
-    页内容口径不一致 —— 表现为"翻到最后一页数量对不上", 很难察觉。
+    ⚠️ 与 `library_count` 必须共用**同一份**筛选参数(含 `color` 与 V45 新增的
+    两组), 否则总数与页内容口径不一致 —— 表现为"翻到最后一页数量对不上",
+    很难察觉。
+
+    想知道"哪些条件真的生效了"用 `library_applied()`, 不要在调用方按参数真假
+    自己算 —— 那会把 `kind="all"`(表示不限)当成"筛了某种类型"。
     """
-    where, args = library_filters(q, kind, task_id, album, status, tag, favorite,
-                                  tag_children, min_rating, special, color)
+    where, args, applied = library_filters(
+        q, kind, task_id, album, status, tag, favorite,
+        tag_children, min_rating, special, color,
+        date_from=date_from, date_to=date_to,
+        exclude_tag=exclude_tag, exclude_tag_children=exclude_tag_children,
+        exclude_album=exclude_album, exclude_kind=exclude_kind,
+        exclude_special=exclude_special, exclude_color=exclude_color,
+    )
     # 排序代号在这里翻译(白名单), 结果只可能是 LIBRARY_SORTS 里的列表达式。
     order_by = library_order_by(sort, order)
     rows = query(
@@ -1535,6 +1727,23 @@ def library_list(q=None, kind=None, task_id=None, album=None, status="done",
         tuple(args) + (int(limit), int(offset)),
     )
     return rows
+
+
+def library_applied(**params):
+    """哪些筛选键**真的生效了**(键名列表) —— 供界面渲染"当前条件"。
+
+    ⚠️ 必须与 `library_filters` **同源**, 所以这里直接复用它, 而不是另写一套
+    "这个参数是不是非空"的判断。另写一套的后果是: 两边对 `kind="all"`、
+    `color="all"`(都表示"不限")的理解一旦不一致, 界面上就会显示一个
+    "类型: 全部"的条件胶囊 —— 用户以为自己筛过了(第 27 条的反面)。
+
+    参数与 `library_list` / `library_count` 完全一致, 未知键由它们各自报错。
+
+    返回 `[{"key": ..., "label": ...}]` 而不是一串裸键名: 中文在这里一次翻译完,
+    界面上不再出现第二种映射(第 9 条)。
+    """
+    _where, _args, keys = library_filters(**params)
+    return [{"key": k, "label": LIBRARY_FILTER_LABELS.get(k, k)} for k in keys]
 
 
 def library_albums(limit=200):
@@ -2024,6 +2233,150 @@ def delete_resource(resource_id):
     return execute("DELETE FROM resources WHERE id=?", (resource_id,)).rowcount
 
 
+#: V45: "找相似"的海明距离上限(位, 满值 64)。
+#:
+#: ⚠️ **必须**与 `phash.DEFAULT_THRESHOLD`(=4, 判"疑似重复")分开定义 —— 两条
+#: 语义完全不同: 重复要的是"几乎肯定就是同一张"(宁可漏标, 标错会冤枉文件);
+#: 相似要的是"人眼看着像"(可以多给一些, 因为只是**展示**给用户挑)。
+#: 共用一个常量会两头不讨好: 调高则"疑似重复"一片红, 调低则"找相似"永远 0 条。
+#:
+#: 12 的理由: 同一张图换尺寸/重压缩多为 0~2, 完全不同多在 25 以上; 12 落在
+#: "同一场景/同一版式"那一档, 正好是"像但不是同一张"要找的东西。
+SIMILAR_MAX_DISTANCE = 12
+
+#: 一次"找相似"最多比对多少条指纹。距离是纯 Python 循环, 全库几十万条时会把
+#: 这个"点了立刻要看结果"的接口拖住。
+#: ⚠️ 截断**必须报出来**(见返回值的 `scanned` / `truncated`), 不能默默只比前
+#: N 条 —— 那会让"库里有更像的、只是没被比到"表现成"没有相似的"。
+SIMILAR_SCAN_LIMIT = 20000
+
+
+#: "找相似"比不了时的**原因 → 中文文案**。文案放后端(第 9 条): 让前端自己
+#: 维护一份的话, 后端加一种原因时界面会静默显示成代号。
+SIMILAR_REASON_LABELS = {
+    "not_found": "没有这条资源",
+    "no_phash": "这条没算过指纹(多半是当时没装 ffmpeg, 或它不是图片)",
+    "flat": "这张几乎没有明暗变化, 指纹不携带信息(比了只会出来一堆纯色图)",
+}
+
+
+def _phash_weight(value):
+    """指纹里 1 的个数; 形态不对返回 None。"""
+    try:
+        s = str(value or "").strip().lower()
+        if len(s) != 16:
+            return None
+        return bin(int(s, 16)).count("1")
+    except (TypeError, ValueError):
+        return None
+
+
+def _phash_is_degenerate(value):
+    """这个指纹是不是**不携带梯度信息**(纯色/大块同色的图)。
+
+    dHash 只比较"相邻像素谁更亮", 所以一张纯红和一张纯蓝的指纹**完全相同**
+    (每一位都是"不大于"), 纯色截图、占位图、Logo 同理 —— 它们会一整片互指,
+    距离还是 0, 排在结果最前面。这类"最像的"恰恰是最没用的(同族 I)。
+
+    判据用"1 的个数": 全 0 或全 64 说明整张图没有任何一处明暗变化。
+    ⚠️ 这只挡得住**完全**平的那种; 带噪点的近纯色图要靠 `phash.is_flat_gray`
+    (需要解码, 所以只在文件还在盘上时做)。
+    """
+    w = _phash_weight(value)
+    return w in (0, 64)
+
+
+def similar_to(resource_id, max_distance=None, limit=24):
+    """找出与某条资源**看着像**的其它资源(按 dHash 海明距离升序)。
+
+    数据早就有了(`resources.phash` 在下载时就算好了), 此前只是没被暴露出来 ——
+    Immich / PhotoPrism / digiKam / Czkawka 都有这个入口, 因为它回答的是
+    "我记得有这么一张, 但记不得它在哪" 这句最常说的话。
+
+    返回字典而不是列表, 因为**"没有结果"和"没算出结果"必须是两个值**(第 26 条):
+
+      * `ok=True`  —— 真的比过了, `items` 是结果(可能为空数组);
+      * `ok=False` —— **没法比**, `reason` 说明为什么:
+          - `"not_found"`  没有这条资源;
+          - `"no_phash"`   这条没算过指纹(ffmpeg 不在 / 不是图片 / 当年没算);
+          - `"flat"`       这张几乎没有梯度, 指纹不携带信息(比了也是一堆纯色图)。
+
+    ⚠️ 一律**不抛异常**: 这是"点了看一眼"的功能, 抛异常会让整块面板转菊花;
+    调用方按 `ok` / `reason` 决定显示什么。
+    """
+    from core import phash
+
+    limit = max(1, min(int(limit or 24), 60))
+    dist_cap = SIMILAR_MAX_DISTANCE if max_distance is None else int(max_distance)
+    dist_cap = max(0, min(dist_cap, 64))
+
+    row = get_resource(resource_id)
+    if not row:
+        return {"ok": False, "reason": "not_found", "items": [],
+                "scanned": 0, "truncated": False, "max_distance": dist_cap}
+    mine = row["phash"]
+    if not mine:
+        return {"ok": False, "reason": "no_phash", "items": [],
+                "scanned": 0, "truncated": False, "max_distance": dist_cap}
+
+    # 平图守卫: 先做零成本的"全 0 / 全 1"判断, 文件还在盘上时再用真解码判一次
+    # (带噪点的近纯色图指纹不是全 0, 只有 is_flat_gray 能认出来)。
+    flat = _phash_is_degenerate(mine)
+    if not flat:
+        # ⚠️ sqlite3.Row 没有 `.get()`(老库补列之前也可能没有这一列 → 用
+        # keys() 判)。写成 `row.get(...)` 会在这条**只有真图才走到**的路径上
+        # AttributeError, 平时测不出来。
+        path = row["local_path"] if "local_path" in row.keys() else None
+        if path:
+            try:
+                raw = phash.decode_gray(path)
+                if raw and phash.is_flat_gray(raw):
+                    flat = True
+            except Exception:
+                pass
+    if flat:
+        return {"ok": False, "reason": "flat", "items": [],
+                "scanned": 0, "truncated": False, "max_distance": dist_cap}
+
+    candidates = query(
+        "SELECT r.id, r.phash, r.local_path, r.type, r.width, r.height, r.size,"
+        "       t.name AS task_name"
+        " FROM resources r JOIN tasks t ON t.id = r.task_id"
+        " WHERE r.status='done' AND r.phash IS NOT NULL AND r.phash <> ''"
+        "   AND r.id <> ?"
+        " LIMIT ?",
+        (int(resource_id), SIMILAR_SCAN_LIMIT),
+    )
+    truncated = len(candidates) >= SIMILAR_SCAN_LIMIT
+
+    scored = []
+    for c in candidates:
+        d = phash.distance(mine, c["phash"])
+        if d is None or d > dist_cap:
+            continue
+        if _phash_is_degenerate(c["phash"]):
+            # 同上: 平图不参与比对。放在这里而不是 SQL 里是因为"权重 0/64"
+            # 用 SQL 表达不出来, 而为了它去加一列不值得。
+            continue
+        scored.append((d, c))
+    scored.sort(key=lambda pair: (pair[0], pair[1]["id"]))
+
+    items = []
+    for d, c in scored[:limit]:
+        item = dict(c)
+        item.pop("phash", None)
+        item["distance"] = d
+        items.append(item)
+    return {
+        "ok": True,
+        "reason": None,
+        "items": items,
+        "scanned": len(candidates),
+        "truncated": truncated,
+        "max_distance": dist_cap,
+    }
+
+
 def begin_resource_attempt(resource_id):
     """标记"这一条资源开始下载了", 返回起始时刻。
 
@@ -2106,11 +2459,44 @@ def get_logs(task_id):
 DEFAULT_INTERVAL_MINUTES = 360
 
 
-def create_watch(url, collector, interval_minutes=None, options=None, run_now=True):
+def _as_datetime(now):
+    """把 `_now()` 的字符串或 datetime 统一成 datetime。
+
+    ⚠️ 两种形态都要接住: 调用方常把刚拿到的时间戳(字符串)原样传回来求下一轮。
+    直接丢给 cron 模块会在 `.replace(second=...)` 上炸, 而这条路径**只在真的
+    要顺延时才走到** —— 最容易漏测的那一类(与 `_minutes_later` 同一个坑,
+    那里早期就因此 TypeError 过一次)。
+    """
+    if isinstance(now, str):
+        try:
+            return datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return datetime.now()
+    return now or datetime.now()
+
+
+def next_run_for(minutes=None, cron=None, now=None):
+    """算出下一轮的时刻(字符串), `cron` 优先。
+
+    ⚠️ **优先级的定义只能有这一处**: `create_watch` 与 `claim_watch` 都调它。
+    各写一遍的话, 一旦某处忘了判 cron, 表现是"配了每天 3 点、实际每 6 小时
+    跑一次" —— 不报错, 而且两边的 next_run 看起来都"合理"。
+    """
+    if cron:
+        return _cron.next_after_str(cron, now=_as_datetime(now))
+    return _minutes_later(minutes if minutes else DEFAULT_INTERVAL_MINUTES, now)
+
+
+def create_watch(url, collector, interval_minutes=None, options=None, run_now=True,
+                 cron=None):
     """新增订阅源。
 
     run_now=True 时 next_run 设为当前时刻 —— 订阅后立刻采一轮, 用户不必等到
     第一个周期结束才能确认配置有没有写对。
+
+    `cron` 给了就按 cron 排下一轮(见 `next_run_for`)。⚠️ 它必须在**入库前**
+    已经被 `cron.describe()` 校验过: 一个坏表达式落库之后不会有人报错, 只会
+    让这个订阅悄悄再也不跑(第 28 条: 静默比报错糟)。
     """
     # 注意别写成 `interval_minutes or DEFAULT`: 0 是 falsy, 那样会把用户明确
     # 写的 0 悄悄变成默认 360 分钟 —— 而他期待的是"不合法, 至少给个 1 分钟"。
@@ -2120,15 +2506,16 @@ def create_watch(url, collector, interval_minutes=None, options=None, run_now=Tr
     minutes = max(1, minutes)
     now = _now()
     cur = execute(
-        "INSERT INTO watches(url, collector, interval_minutes, options, enabled,"
-        " next_run, created_time) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO watches(url, collector, interval_minutes, cron, options,"
+        " enabled, next_run, created_time) VALUES(?,?,?,?,?,?,?,?)",
         (
             url,
             collector,
             minutes,
+            (cron or "").strip() or None,
             json.dumps(options or {}, ensure_ascii=False),
             1,
-            now if run_now else _minutes_later(minutes),
+            now if run_now else next_run_for(minutes, cron, now),
             now,
         ),
     )
@@ -2179,18 +2566,22 @@ def due_watches(limit=10):
     )
 
 
-def claim_watch(watch_id, minutes):
+def claim_watch(watch_id, minutes=None, cron=None):
     """抢占到期源并顺延下一轮时间, 返回是否抢到。
 
     用乐观锁(update ... where id=? and next_run<=?)而不是"先查后改":
     调度线程与手动触发可能同时对同一个源下手, 否则会重复创建任务。
+
+    ⚠️ 顺延必须走 `next_run_for`(cron 优先): 这里若只按 minutes 算, 一个配了
+    cron 的源跑完第一轮之后就会退回固定间隔 —— **第一轮看起来是对的**, 于是
+    这个错要等到第二天才被发现。
     """
     now = _now()
     with _lock:
         conn = get_conn()
         cur = conn.execute(
             "UPDATE watches SET last_run=?, next_run=? WHERE id=? AND next_run<=?",
-            (now, _minutes_later(minutes, now), watch_id, _now()),
+            (now, next_run_for(minutes, cron, now), watch_id, _now()),
         )
         conn.commit()
         return cur.rowcount == 1
@@ -2424,6 +2815,12 @@ def get_webhook(hid):
 
 
 def delete_webhook(hid):
+    """删一个 webhook, **连同它的投递历史一起**。
+
+    历史表有 ON DELETE CASCADE, 但 SQLite 的 `PRAGMA foreign_keys` 默认是关的
+    —— 只靠外键的话, 删掉的 webhook 会留下一堆孤儿投递记录。所以显式删。
+    """
+    execute("DELETE FROM webhook_deliveries WHERE webhook_id=?", (hid,))
     return execute("DELETE FROM webhooks WHERE id=?", (hid,)).rowcount
 
 
@@ -2434,3 +2831,33 @@ def mark_webhook_result(hid, status=None, error=None):
     """
     return execute("UPDATE webhooks SET last_status=?, last_error=? WHERE id=?",
                    (status, (error or None) and str(error)[:400], hid)).rowcount
+
+
+def record_webhook_delivery(webhook_id, event, attempt, status=None, error=None):
+    """落一条**单次尝试**的投递记录(V45)。
+
+    ⚠️ 一次投递可能产生多行(每次重试一行)。合并成"最后一次"的话, 重试的痕迹
+    就没了 —— 于是"第一次超时、第二次成了"和"一次就成"在界面上长得一样,
+    而前者恰恰说明对端有问题, 值得看一眼(第 26 条: 过程与结果都要留)。
+    """
+    execute(
+        "INSERT INTO webhook_deliveries(webhook_id, event, attempt, status, error,"
+        " created_at) VALUES(?,?,?,?,?,?)",
+        (
+            int(webhook_id),
+            event,
+            int(attempt),
+            status,
+            str(error)[:400] if error else None,
+            now_ts(),
+        ),
+    )
+
+
+def list_webhook_deliveries(hid, limit=20):
+    """某个 webhook 最近的投递记录(新的在前)。"""
+    return query(
+        "SELECT id, webhook_id, event, attempt, status, error, created_at"
+        " FROM webhook_deliveries WHERE webhook_id=? ORDER BY id DESC LIMIT ?",
+        (int(hid), max(1, min(int(limit or 20), 100))),
+    )

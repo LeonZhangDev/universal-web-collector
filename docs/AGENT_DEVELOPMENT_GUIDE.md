@@ -4334,10 +4334,63 @@ NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id = r.id AND rt.ta
 | 项 | 结果 |
 | --- | --- |
 | `tests/test_features_v45.py`(新) | **30 项**(相似排序 / 双阈值 / 三种"没法比" / 截断上报 / API 两态 / `NOT EXISTS` 排除 / NULL 保护 / 排除相册 / 未知 special 400 / 日期含端点 / 非法日期 400 / `date` 档位中文含"落盘" / `applied` 不含 `kind=all` / count-list 同口径 / 每个键都有中文名 / 5xx 重试 vs 4xx 不重试 / 逐次记录 / 网络失败重试 / 删 hook 连带删历史 / deliveries 端点 / cron 严格晚于 now / 步长 / 列表 / 日或周 / 周日平移 / 坏表达式 / 订阅用 cron / claim 仍用 cron / interval 不变 / API 拒坏 cron / `next_run_for` 字符串入参不炸) |
-| 全量 pytest | 本机 Windows 收集 **1430** → 1424 passed + 6 skipped; CI/Linux **1431** |
+| 全量 pytest | 本机 Windows 收集 **1442** → 1436 passed + 6 skipped; CI/Linux **1443** |
 | 前端 | `npm run build` 通过(92 modules) |
 
 ⚠️ 门禁**第五次**在同一条用例上救场: 全量跑完红了, 报"实测收集 1430, README 只写了
 [1400, 1401]" —— 数字必须由门禁算, 不能靠自觉(第 27 条那一类)。
+
+## 27. V46: 自动化规则 / 可选 OCR / 视频内联 / 嵌套标签树 / 类似剔图（2026-09-26）
+
+对标 V45 之后又搜了一轮 2026 的竞品(Immich 已到 v3.2.0, 把 Workflows 抬成核心卖点),
+挑出"积木已经齐了只差编排"的几样落地。这一轮落地的清单见 `README.md` 的 V46 一节,
+这里只记**关键判据与踩到的坑**。
+
+### 27.1 自动化规则: 条件复用 `library_filters`, 动作复用既有出口
+
+规则 = `条件(JSON, 键 ∈ RULE_CONDITION_KEYS 白名单) → 动作(add_tag / favorite / webhook)`。
+条件回灌时**仍走 `library_filters`**, 所以永远不拼接 SQL(第 7 条: 前端代号不进 SQL)。
+动作只做"已经在别处实现过"的事: 打标签用 `add_tags`、收藏用 `set_favorite`、推 webhook
+用 `webhooks.deliver` —— **不引入通用脚本引擎**(那是 n8n 的活, 不是采集器定位)。
+
+⚠️ 三处"创建时即 400"而不是"存进去静默不触发":
+* 未知条件键 / 未知动作 → 400(否则配置错误永远不报错, 第 27 条反复踩的坑);
+* `add_tag` 不给标签 / `webhook` 指向不存在的 hook → 400。
+
+钩子挂在 `task_manager._publish_resource(status="done")` —— 资源真正落库那一点, 每条
+资源独立判定。整段 try/except 兜底: **规则失败绝不能影响资源发布**(发布是核心链路,
+规则是副作用)。
+
+### 27.2 OCR: 零强制依赖, 没装 tesseract 就如实 409
+
+`core/ocr.py` 只**探测**系统里有没有 `tesseract` 可执行文件, 不引入 pytesseract / easyocr
+(与项目"ffmpeg-only、不引 Pillow"同方向)。无引擎时 `ocr_image` 返回 `None`, 端点
+`POST /library/{id}/ocr` 直接 **409 说清"未启用"**, 而不是返回"识别成功 0 字" —— 那是假绿:
+用户会以为 OCR 跑过了、只是图里没字, 其实根本没装引擎(第 27 条: 能力生效要有证据)。
+
+文字落 `resources.ocr_text`, 并加进 `library_filters` 的 `text=` 子串匹配维度(与 `q` 同款
+转义通配符)。
+
+### 27.3 视频内联播放(不做边下边播)
+
+Lightbox 加 `<video>` 直读已下载 mp4(我们已平铺在 downloads 根)。幻灯片遇到视频条目
+**暂停**自动推进(否则会在视频播到一半时被翻走)。**边下载边播放不做**: mp4 的 `moov` 在
+尾部, 没下完根本播不了, 且流式播放与"先落盘再存储"的契约冲突。
+
+### 27.4 嵌套标签树 / 类似剔图: 纯前端呈现, 不立新表
+
+标签名里的 `/` 表达层级(后端 `tag_parent` 同款), 树是前端对 `tags` 列表的分组呈现, 点父
+节点 = 按前缀收子(`tag_children=true`), 与排除对称。类似剔图(similar + 评分)也是复用
+`similar_to`(V45) + `libraryRate`(V42), 在相似结果里直接打分/收藏。
+
+### 27.5 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/test_features_v46.py`(新) | **12 项**(规则白名单校验 / CRUD 往返 / 命中后真作用到资源 / favorite 动作 / 不命中不作用 / 手动重跑计数 / OCR 无引擎 409 / OCR 文字写入并被 text 过滤命中 / 非图片拒绝) |
+| 全量 pytest | 本机 Windows 收集 **1442** → 1436 passed + 6 skipped; CI/Linux **1443** |
+
+⚠️ 门禁**第六次**救场: doc-counts 报"实测 1442, README 只写了 [1430, 1431]" —— V46 加了
+12 条用例, 数字必须同步。
 
 

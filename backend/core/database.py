@@ -106,7 +106,11 @@ CREATE TABLE IF NOT EXISTS resources(
     -- 分成两堆, 序数是唯一能把结果排出来的东西。
     -- ⚠️ **0 表示"还没评过", 不是"0 分"**: 界面上的"未评分"筛选必须读这一列,
     -- 不能靠"看起来没有星星"去猜。
-    rating INTEGER NOT NULL DEFAULT 0
+    rating INTEGER NOT NULL DEFAULT 0,
+    -- V46: OCR 提取的图中文字(可选能力, 不强制装 tesseract)。无 OCR 引擎时这一列
+    -- 永远是 NULL, 不影响其它功能; 有引擎时也只对"用户主动触发识别"的资源填值,
+    -- 不偷偷全量扫(那会是一次没人知道的 CPU 风暴)。
+    ocr_text TEXT
 );
 
 -- 资源标签(多对多)。⚠️ 用**明细表**而不是 resources 里的一列:
@@ -299,6 +303,27 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries(
     -- 会把"相隔 200 毫秒的两次重试"记成同一件事)。
     created_at REAL NOT NULL
 );
+
+-- V46: 自动化规则(事件驱动的工作流)。条件复用 library_filters 的具名参数(单一
+-- 事实来源, 绝不会变成拼接 SQL); 动作只做"已经在别处实现过"的事(打标签 / 收藏 /
+-- 触发 webhook), 不引入通用脚本引擎(那是 n8n 的活, 不是采集器的定位)。
+-- ⚠️ 时刻列按新表约定 = created_at + REAL(epoch 秒)。
+CREATE TABLE IF NOT EXISTS automation_rules(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    -- 条件(JSON 对象): 键必须是 RULE_CONDITION_KEYS 白名单, 值在 library_filters
+    -- 里有意义。回灌时仍走 library_filters, 所以永远不拼接 SQL(第 7 条)。
+    condition TEXT NOT NULL,
+    -- 动作代号: add_tag | favorite | webhook。未知代号创建时即 400。
+    action TEXT NOT NULL,
+    -- 动作参数: add_tag → 标签名; webhook → webhook id; favorite → 忽略。
+    arg TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    -- 上次运行时刻(epoch 秒)与那一轮命中的资源数。NULL = 从来没跑过。
+    last_run REAL,
+    last_hits INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # 索引在列迁移之后创建(旧库可能缺列)
@@ -368,6 +393,8 @@ _ADD_COLUMNS = [
     ("local_roots", "exclude", "TEXT"),
     # V42: 五星评分(0 = 未评分)。与 favorite 同理, 是资源自身的属性而不是标签。
     ("resources", "rating", "INTEGER NOT NULL DEFAULT 0"),
+    # V46: OCR 文字(可选能力, 默认 NULL)。
+    ("resources", "ocr_text", "TEXT"),
     # V44: 主色所属的**色系代号**(见 core/colors.py)。存代号不存色值 —— 筛选要
     # 走 SQL 等值匹配(能命中索引), 色值则随时可重算。NULL = 还没提过色
     # ("没算出"), 与"提过但归为 gray"是两回事(第 26 条)。
@@ -1409,7 +1436,8 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
                     date_from=None, date_to=None,
                     exclude_tag=None, exclude_tag_children=False,
                     exclude_album=None, exclude_kind=None,
-                    exclude_special=None, exclude_color=None):
+                    exclude_special=None, exclude_color=None,
+                    text=None):
     """跨任务资源库的 WHERE 片段(与 task 联表后才能按采集器/相册筛)。
 
     单独抽出来是为了让 count 与 list 用**完全相同**的条件 —— 两处各写一遍
@@ -1573,6 +1601,14 @@ def library_filters(q=None, kind=None, task_id=None, album=None, status="done",
         args.extend([pat, pat])
         applied.append("q")
 
+    if text:
+        # V46: 在 OCR 提取的图中文字里做子串匹配(可选能力, 未启用 OCR 时
+        # ocr_text 恒为 NULL, 这条自然命中 0 条)。与 q 同款, 转义通配符。
+        pat = _like_pattern(text)
+        where.append("r.ocr_text LIKE ? ESCAPE '\\'")
+        args.append(pat)
+        applied.append("text")
+
     return " AND ".join(where), args, applied
 
 
@@ -1667,7 +1703,7 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
                   date_from=None, date_to=None,
                   exclude_tag=None, exclude_tag_children=False,
                   exclude_album=None, exclude_kind=None,
-                  exclude_special=None, exclude_color=None):
+                  exclude_special=None, exclude_color=None, text=None):
     """资源库总数(与 library_list 同一口径)。
 
     ⚠️ `color` 必须在这里**显式**往下传: `library_filters` 是按位置被调用的,
@@ -1682,6 +1718,7 @@ def library_count(q=None, kind=None, task_id=None, album=None, status="done",
         exclude_tag=exclude_tag, exclude_tag_children=exclude_tag_children,
         exclude_album=exclude_album, exclude_kind=exclude_kind,
         exclude_special=exclude_special, exclude_color=exclude_color,
+        text=text,
     )
     row = query_one(
         f"SELECT COUNT(*) AS n FROM resources r JOIN tasks t ON t.id = r.task_id "
@@ -1698,7 +1735,7 @@ def library_list(q=None, kind=None, task_id=None, album=None, status="done",
                  date_from=None, date_to=None,
                  exclude_tag=None, exclude_tag_children=False,
                  exclude_album=None, exclude_kind=None,
-                 exclude_special=None, exclude_color=None):
+                 exclude_special=None, exclude_color=None, text=None):
     """跨任务资源库列表, 带任务侧的采集器/任务名(供前端分组展示)。
 
     ⚠️ 与 `library_count` 必须共用**同一份**筛选参数(含 `color` 与 V45 新增的
@@ -1715,6 +1752,7 @@ def library_list(q=None, kind=None, task_id=None, album=None, status="done",
         exclude_tag=exclude_tag, exclude_tag_children=exclude_tag_children,
         exclude_album=exclude_album, exclude_kind=exclude_kind,
         exclude_special=exclude_special, exclude_color=exclude_color,
+        text=text,
     )
     # 排序代号在这里翻译(白名单), 结果只可能是 LIBRARY_SORTS 里的列表达式。
     order_by = library_order_by(sort, order)
@@ -1980,6 +2018,14 @@ def set_favorite(resource_ids, value=True):
     )
     n = cur.rowcount or 0
     return n
+
+
+def set_ocr_text(resource_id, text):
+    """写回一条资源的 OCR 文字(可选能力, 无 OCR 时永不调用)。"""
+    return execute(
+        "UPDATE resources SET ocr_text=? WHERE id=?",
+        (text if text else None, int(resource_id)),
+    ).rowcount
 
 
 def set_rating(resource_ids, rating=0):
@@ -2758,6 +2804,10 @@ WEBHOOK_EVENTS = {
     "task.done": "任务完成",
     "task.failed": "任务失败",
     "library.verify": "体检发现异常",
+    # V46: 规则动作触发的 webhook(条件命中资源后投递一次)。与其它事件不同的是,
+    # 订阅它的 webhook 只在某条规则的 webhook 动作**显式指向它**时才被调用,
+    # 而不是"任何资源命中就群发" —— 这样才能让"规则 A 只推送到 hook X"。
+    "rule": "规则触发",
 }
 
 
@@ -2861,3 +2911,182 @@ def list_webhook_deliveries(hid, limit=20):
         " FROM webhook_deliveries WHERE webhook_id=? ORDER BY id DESC LIMIT ?",
         (int(hid), max(1, min(int(limit or 20), 100))),
     )
+
+
+# =====================================================================
+# V46: 自动化规则(事件驱动的工作流)
+# ---------------------------------------------------------------------
+# 规则 = 条件(library_filters 的具名参数) → 动作(已经在别处实现过的事)。
+# 条件里的键必须是 RULE_CONDITION_KEYS 白名单(单一事实来源, 回灌时仍走
+# library_filters, 绝不会变成拼接 SQL); 动作必须是 RULE_ACTIONS 白名单。
+# 不引入通用脚本引擎(那是 n8n 的活)。
+# =====================================================================
+RULE_CONDITION_KEYS = (
+    "q", "kind", "task_id", "album", "status", "tag", "favorite",
+    "tag_children", "min_rating", "special", "color",
+    "date_from", "date_to",
+    "exclude_tag", "exclude_tag_children", "exclude_album",
+    "exclude_kind", "exclude_special", "exclude_color", "text",
+)
+RULE_ACTIONS = ("add_tag", "favorite", "webhook")
+# 手动重跑一次时, 最多作用多少条资源 —— 避免"对一个有 10 万资源的库跑一条规则"
+# 变成一次没人知道的 CPU / 网络风暴(第 27 条: 规则生效要有证据, 但也要有边界)。
+RULE_MANUAL_LIMIT = 500
+
+
+def _rule_row(row):
+    try:
+        cond = json.loads(row["condition"] or "{}")
+    except (ValueError, TypeError):
+        cond = {}
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "condition": cond,
+        "action": row["action"],
+        "arg": row["arg"],
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+        "last_run": row["last_run"],
+        "last_hits": row["last_hits"],
+    }
+
+
+def create_rule(name, condition, action, arg=None, enabled=True):
+    """新建一条规则。
+
+    condition 必须是 dict(键 ∈ RULE_CONDITION_KEYS); action ∈ RULE_ACTIONS。
+    不知道的键/动作**创建时即 400**(而不是存进去再静默不触发 —— 那是第 27 条
+    反复踩的坑: 配错了却永远不报错, 用户以为规则在工作)。
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("rule name is required")
+    if not isinstance(condition, dict):
+        raise ValueError("condition must be an object")
+    for k in condition:
+        if k not in RULE_CONDITION_KEYS:
+            raise ValueError(f"unknown rule condition key: {k}")
+    if action not in RULE_ACTIONS:
+        raise ValueError(f"unknown rule action: {action}")
+    if action == "add_tag" and not (arg or "").strip():
+        raise ValueError("add_tag action requires a non-empty tag in arg")
+    if action == "webhook":
+        # 必须指向一个真实存在的 webhook, 否则这条规则永远哑火。
+        if not (arg or "").strip().isdigit():
+            raise ValueError("webhook action requires a numeric webhook id in arg")
+        if not get_webhook(int(arg)):
+            raise ValueError(f"webhook {arg} does not exist")
+    cur = execute(
+        "INSERT INTO automation_rules(name, condition, action, arg, enabled, "
+        "created_at, last_hits) VALUES(?,?,?,?,?,?,0)",
+        (name, json.dumps(condition, ensure_ascii=False),
+         action, (arg or None), 1 if enabled else 0, time.time()),
+    )
+    return cur.lastrowid
+
+
+def get_rule(rid):
+    row = query_one("SELECT * FROM automation_rules WHERE id=?", (int(rid),))
+    return _rule_row(row) if row else None
+
+
+def list_rules():
+    return [_rule_row(r) for r in query(
+        "SELECT * FROM automation_rules ORDER BY id")]
+
+
+def delete_rule(rid):
+    return execute("DELETE FROM automation_rules WHERE id=?", (int(rid),)).rowcount
+
+
+def set_rule_enabled(rid, enabled):
+    return execute(
+        "UPDATE automation_rules SET enabled=? WHERE id=?",
+        (1 if enabled else 0, int(rid))).rowcount
+
+
+def _rule_matches(cond, resource_id):
+    """这条规则的条件是否命中某个具体资源(走 library_filters, 不拼 SQL)。"""
+    params = {k: v for k, v in cond.items() if k in RULE_CONDITION_KEYS}
+    where, args, _applied = library_filters(**params)
+    row = query_one(
+        f"SELECT 1 FROM resources r JOIN tasks t ON t.id = r.task_id "
+        f"WHERE {where} AND r.id=? LIMIT 1",
+        tuple(args) + (int(resource_id),),
+    )
+    return row is not None
+
+
+def _apply_rule_action(rule, resource_id):
+    """执行一条规则的动作用在某个资源上。失败必须留痕(不吞)。
+
+    ⚠️ webhook 动作的投递走 core.webhooks.deliver —— 那里会自己写投递历史,
+    所以这里只负责"把规则里指名的那个 hook 调起来"。
+    """
+    action = rule["action"]
+    if action == "add_tag":
+        add_tags([resource_id], [rule["arg"]])
+    elif action == "favorite":
+        set_favorite([resource_id], True)
+    elif action == "webhook":
+        from core import webhooks as _webhooks  # 延迟导入, 避开与 webhooks 的环
+        hid = int(rule["arg"])
+        hook = get_webhook(hid)
+        if not hook:
+            raise ValueError(f"webhook {hid} disappeared")
+        row = query_one("SELECT secret FROM webhooks WHERE id=?", (hid,))
+        secret = row["secret"] if row else None
+        _webhooks.deliver(hid, hook["url"], secret, "rule",
+                          {"resource_id": resource_id})
+
+
+def run_rules_for_resource(resource_id):
+    """资源落库后由 task_manager 钩子调用: 把**所有启用规则**里命中它的都执行一遍。
+
+    返回每条应用的动作描述; 任一条规则抛错都不影响其它规则, 也不影响资源落库
+    (钩子挂在 _settle_status 这种"绝不抛"的契约里, 详见 task_manager 那侧)。
+    """
+    applied = []
+    for rule in list_rules():
+        if not rule["enabled"]:
+            continue
+        try:
+            if _rule_matches(rule["condition"], resource_id):
+                _apply_rule_action(rule, resource_id)
+                applied.append(f"[{rule['name']}] {rule['action']}"
+                               + (f" {rule['arg']}" if rule["arg"] else ""))
+        except Exception as e:  # 单条规则失败不能连累资源落库
+            applied.append(f"[{rule['name']}] ERROR {type(e).__name__}: {e}")
+    return applied
+
+
+def run_rule(rid, limit=RULE_MANUAL_LIMIT):
+    """手动重跑一条规则: 把它作用到**当前所有命中条件**的资源上(有上限)。
+
+    返回 (作用条数, 错误条数)。用于"我改了规则, 想立刻让存量资源也生效"。
+    """
+    rule = get_rule(rid)
+    if not rule:
+        raise ValueError(f"rule {rid} not found")
+    params = {k: v for k, v in rule["condition"].items()
+              if k in RULE_CONDITION_KEYS}
+    where, args, _applied = library_filters(**params)
+    rows = query(
+        f"SELECT r.id FROM resources r JOIN tasks t ON t.id = r.task_id "
+        f"WHERE {where} LIMIT ?",
+        tuple(args) + (int(limit),),
+    )
+    hits, errors = 0, 0
+    for r in rows:
+        try:
+            _apply_rule_action(rule, r["id"])
+            hits += 1
+        except Exception:
+            errors += 1
+    now = time.time()
+    execute(
+        "UPDATE automation_rules SET last_run=?, last_hits=? WHERE id=?",
+        (now, hits, int(rid)))
+    return {"hits": hits, "errors": errors, "capped": len(rows) >= int(limit)}
+

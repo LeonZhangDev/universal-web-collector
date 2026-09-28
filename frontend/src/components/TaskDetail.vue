@@ -8,6 +8,7 @@ import {
   getTask,
   getTaskProxy,
   pauseTask,
+  rawFileUrl,
   resumeTask,
   retryFailed,
   retryResource,
@@ -91,11 +92,22 @@ const visible = computed(() => {
       : r.status === view.value
   );
 });
-// 灯箱: 只看 visible 里的图片, 去掉视频/文档
+// 灯箱: 图片与视频都收。图片走 file_url(缩略图同款直链); 视频走 rawFileUrl(local_path)
+// —— 我们已把 mp4 平铺在 downloads 根, 浏览器直读本地文件即可播放(不做 HLS 实时转码,
+// 那与"先落盘再存储"的契约冲突)。
 const lightboxImages = computed(() =>
   visible.value
-    .filter((r) => r.type === "image" && r.file_url)
-    .map((r) => ({ url: r.file_url, name: (r.url || "").split("/").pop() || "" }))
+    .filter(
+      (r) =>
+        (r.type === "image" && r.file_url) ||
+        (r.type === "video" && r.local_path)
+    )
+    .map((r) => ({
+      id: r.id,
+      url: r.type === "video" ? rawFileUrl(r.local_path) : r.file_url,
+      name: (r.url || "").split("/").pop() || "",
+      type: r.type,
+    }))
 );
 const lbIndex = ref(0);
 const showLb = ref(false);
@@ -522,9 +534,16 @@ onUnmounted(() => {
             <div class="resource-item" v-for="(r, i) in visible" :key="r.id" :title="r.url">
               <a
                 v-if="r.file_url && r.type === 'image'"
-                @click.prevent="openLb(lightboxImages.findIndex((x) => x.url === r.file_url))"
+                @click.prevent="openLb(lightboxImages.findIndex((x) => x.id === r.id))"
               >
                 <img :src="r.file_url" loading="lazy" />
+              </a>
+              <a
+                v-else-if="r.type === 'video' && r.local_path"
+                @click.prevent="openLb(lightboxImages.findIndex((x) => x.id === r.id))"
+                title="播放视频"
+              >
+                <video class="res-video" :src="rawFileUrl(r.local_path)" muted preload="metadata"></video>
               </a>
               <div v-else class="video-placeholder">{{ typeIcon[r.type] || "📄" }}</div>
               <div class="meta">
@@ -563,7 +582,7 @@ onUnmounted(() => {
               <tr v-for="r in visible" :key="r.id">
                 <td><span class="badge" :class="badgeClass(r.status)">{{ statusLabel(r.status, "resource") }}</span></td>
                 <td class="nm">
-                  <a v-if="r.file_url && r.type === 'image'" @click.prevent="openLb(lightboxImages.findIndex((x) => x.url === r.file_url))" class="lk">{{ (r.url || '').split('/').pop() || r.url }}</a>
+                  <a v-if="(r.file_url && r.type === 'image') || (r.type === 'video' && r.local_path)" @click.prevent="openLb(lightboxImages.findIndex((x) => x.id === r.id))" class="lk">{{ (r.url || '').split('/').pop() || r.url }}</a>
                   <span v-else>{{ (r.url || '').split('/').pop() || r.url }}</span>
                   <span class="sz dup-hint" v-if="r.duplicate_of" title="感知指纹判定疑似相同, 文件已保留">疑似重复 #{{ r.duplicate_of }}</span>
                   <span

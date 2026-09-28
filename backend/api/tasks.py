@@ -989,6 +989,42 @@ def library_similar(
     }
 
 
+@router.post("/library/{resource_id}/ocr")
+def library_ocr(resource_id: int):
+    """对一条资源跑 OCR(可选能力), 把图中文字写回 `resources.ocr_text`。
+
+    ⚠️ **无 tesseract 时直接 409 说清楚**, 而不是返回"识别成功 0 字" —— 那是假绿:
+    用户会以为 OCR 跑过了、只是图里没字, 其实根本没装引擎(第 27 条:
+    能力生效要有证据, 没装就是没装, 不能假装成功)。
+    """
+    from core import ocr as _ocr
+    if not _ocr.is_available():
+        raise HTTPException(
+            status_code=409,
+            detail="OCR 未启用: 系统未检测到 tesseract, 请先安装后重试",
+        )
+    row = db.query_one(
+        "SELECT id, local_path, type, status FROM resources WHERE id=?",
+        (int(resource_id),),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="resource not found")
+    if row["status"] != "done" or row["type"] != "image":
+        raise HTTPException(
+            status_code=400,
+            detail="OCR 只支持已落盘的图片资源",
+        )
+    path = row["local_path"]
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="resource file missing")
+    text = _ocr.ocr_image(path)
+    if text is None:
+        # 引擎在调用前一刻还能失败(被别的进程删了等), 同样如实报
+        raise HTTPException(status_code=502, detail="OCR 引擎调用失败")
+    db.set_ocr_text(resource_id, text)
+    return {"ok": True, "resource_id": resource_id, "text": text}
+
+
 @router.post("/library/rate", response_model=LibraryRateOut)
 def library_rate(payload: LibraryRateIn):
     """批量打星(0-5)。`rating=0` 表示**清除评分**(回到"未评分")。
@@ -2521,6 +2557,79 @@ def webhook_test(hid: int):
                            event, {"test": True})
     ok = 1 if (res["status"] is not None and 200 <= res["status"] < 300) else 0
     return WebhookFireOut(delivered=ok, attempted=1, results=[res])
+
+
+# ---------------------------------------------------------------------------
+# V46: 自动化规则(事件驱动工作流)的 REST 入口
+# ---------------------------------------------------------------------------
+class RuleIn(BaseModel):
+    name: str
+    # 条件: 键必须是 RULE_CONDITION_KEYS(后端白名单), 值在 library_filters 里有意义。
+    # 结构错误(未知键 / 未知动作)由 create_rule 转成 400, 而不是存进去静默不触发。
+    condition: dict
+    action: str
+    arg: Optional[str] = None
+    enabled: bool = True
+
+
+class RuleOut(BaseModel):
+    id: int
+    name: str
+    condition: dict
+    action: str
+    arg: Optional[str]
+    enabled: bool
+    created_at: float
+    last_run: Optional[float]
+    last_hits: int
+
+
+@router.get("/rules", response_model=List[RuleOut])
+def list_rules():
+    """列出所有自动化规则。"""
+    return [RuleOut(**r) for r in db.list_rules()]
+
+
+@router.post("/rules", response_model=RuleOut)
+def create_rule(payload: RuleIn):
+    """新建一条规则。条件/动作非法时返回 400(不是 200 然后默默不工作)。"""
+    try:
+        rid = db.create_rule(payload.name, payload.condition,
+                             payload.action, payload.arg, payload.enabled)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RuleOut(**db.get_rule(rid))
+
+
+@router.delete("/rules/{rid}")
+def delete_rule(rid: int):
+    n = db.delete_rule(rid)
+    if not n:
+        raise HTTPException(status_code=404, detail="rule not found")
+    return {"ok": True}
+
+
+@router.post("/rules/{rid}/toggle")
+def toggle_rule(rid: int, enabled: bool = Query(True, description="true=启用, false=停用")):
+    """启用 / 停用一条规则。"""
+    if not db.get_rule(rid):
+        raise HTTPException(status_code=404, detail="rule not found")
+    db.set_rule_enabled(rid, enabled)
+    return {"ok": True, "enabled": enabled}
+
+
+@router.post("/rules/{rid}/run")
+def run_rule(rid: int):
+    """手动重跑一条规则, 作用到**当前所有命中条件**的资源(有上限, 见 RULE_MANUAL_LIMIT)。
+
+    返回 (作用条数, 错误条数, 是否触达上限) —— 三个数都要给(第 27 条):
+    只回"成功 N 条"的话, "根本没资源命中" 和 "配错了条件所以 0 命中" 看起来一样。
+    """
+    try:
+        res = db.run_rule(rid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True, **res}
 
 
 #: 这几道闸**不放在 HTTP 请求里跑**, 以及为什么 —— 跳过必须**说出来**, 不能

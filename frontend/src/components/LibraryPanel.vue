@@ -28,12 +28,14 @@ import {
   listLibrarySimilar,
   listLibraryTags,
   listVirtualAlbumItems,
+  ocrResource,
   replayLibraryFailures,
   saveLibrarySearch,
   setTagColor,
   thumbUrl,
 } from "../api";
 import { toast } from "../toast";
+import TagTreeNode from "./TagTreeNode.vue";
 
 const items = ref([]);
 const total = ref(0);
@@ -421,10 +423,52 @@ async function openSimilar(r, maxDistance = 12) {
 function closeSimilar() {
   similarData.value = null;
 }
+
+// V46: OCR(可选能力)。无 tesseract 时后端回 409 —— 必须如实告诉用户"未启用",
+// 不能假装识别过。识别成功把文字写回卡片(r.ocr_text), 用户之后能按它搜。
+const ocrBusy = ref({});
+async function ocrOne(r) {
+  if (ocrBusy.value[r.id]) return;
+  ocrBusy.value = { ...ocrBusy.value, [r.id]: true };
+  try {
+    const d = await ocrResource(r.id);
+    r.ocr_text = d.text;
+    const preview = (d.text || "").replace(/\s+/g, " ").slice(0, 40);
+    toast(preview ? `OCR: ${preview}${d.text.length > 40 ? "…" : ""}` : "OCR 未识别出文字", "ok");
+  } catch (e) {
+    const detail = e.response?.data?.detail || String(e);
+    // 409 是"引擎没装", 这是用户能修的配置问题, 单独说清; 其它当一般错误。
+    if (e.response?.status === 409) toast(`${detail}(需先安装 tesseract)`, "err");
+    else toast(detail, "err");
+  } finally {
+    ocrBusy.value = { ...ocrBusy.value, [r.id]: false };
+  }
+}
 // ⚠️ ok=false 时的 reason 是**代号**, 中文由同一份响应的 reason_label 给。
 // 前端不维护映射表(第 9 条), 也不把"没法比"显示成"没有相似的"。
 function similarReason(d) {
   return d?.reason_label || d?.reason || "";
+}
+// V46 类似剔图(culling): 在相似结果里直接打分/收藏, 不用先回到网格。digiKam 的
+// smart collection + Excire 一键剔图就是这个组合 —— "找相似"拿到一批, 当场挑出最好的。
+// ⚠️ 评分点当前档 = 清除(与卡片上的 rateOne 同一契约, 见那里注释)。
+const RATE_OPTS_SIM = [1, 2, 3, 4, 5];
+async function rateSimilar(s, n) {
+  const target = s.rating === n ? 0 : n;
+  try {
+    await libraryRate([s.id], target);
+    s.rating = target;
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+async function favSimilar(s) {
+  try {
+    await librarySetFavorite([s.id], !s.favorite);
+    s.favorite = !s.favorite;
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
 }
 
 // ---- V43: 排序 + 保存的搜索(智能文件夹) ----
@@ -993,6 +1037,44 @@ const pageList = computed(() => {
   return out.sort((a, b) => a - b);
 });
 
+// V46: 嵌套标签树。标签名里的 `/` 表达层级(后端 tag_parent 同款, 不另立树表),
+// 这里只做**呈现**: 点击父节点 = 按前缀收子(query.tag_children=true), 与排除对称。
+const showTagTree = ref(false);
+const tagTree = computed(() => {
+  const root = {};
+  for (const t of tags.value) {
+    const parts = String(t.tag).split("/");
+    let node = root;
+    let acc = "";
+    for (const p of parts) {
+      acc = acc ? acc + "/" + p : p;
+      if (!node[p]) node[p] = { name: p, full: acc, count: 0, children: {} };
+      node[p].count += t.count || 0;
+      node = node[p].children;
+    }
+  }
+  const toArr = (obj) =>
+    Object.values(obj).map((n) => ({ ...n, children: toArr(n.children) }));
+  return toArr(root);
+});
+// 只有存在层级(出现 `/`)时才展示"树"入口: 平铺标签用现有 tag-bar 就够了, 强行
+// 把单层标签也画成树是噪音。
+const hasTagHierarchy = computed(() =>
+  tags.value.some((t) => String(t.tag).includes("/"))
+);
+function pickTagNode(node) {
+  // 父节点收子, 叶子精确 —— 与现有 tag_children 语义一致。
+  query.value.tag = node.full;
+  query.value.tag_children = node.children.length > 0;
+  search();
+}
+function isTagNodeActive(node) {
+  return (
+    query.value.tag === node.full &&
+    (node.children.length ? query.value.tag_children : !query.value.tag_children)
+  );
+}
+
 onMounted(() => {
   load();
   loadAlbums();
@@ -1239,6 +1321,13 @@ onMounted(() => {
          所以这里按 `parent` 补齐中间层并缩进, 而不是只平铺"有资源的那些"。 -->
     <div class="tag-bar" v-if="tags.length || query.tag">
       <span class="tb-label">标签</span>
+      <button
+        v-if="hasTagHierarchy"
+        class="ghost mini"
+        :class="{ on: showTagTree }"
+        title="按 / 拆出的层级树(点父节点即含子标签)"
+        @click="showTagTree = !showTagTree"
+      >树</button>
       <span class="tb-chips">
         <span class="chip-wrap" v-for="t in tags.slice(0, 24)" :key="t.tag">
           <button
@@ -1283,6 +1372,21 @@ onMounted(() => {
       </label>
       <span v-if="tags.length > 24" class="tb-more">还有 {{ tags.length - 24 }} 个</span>
       <button v-if="query.tag" class="ghost mini" @click="pickTag(query.tag)">清除筛选</button>
+    </div>
+
+    <!-- V46: 嵌套标签树(只在标签名里出现 `/` 时才有意义)。点父节点 = 按前缀收子
+         (query.tag_children=true), 与上面的排除对称; 点叶子 = 精确匹配。
+         ⚠️ 树是标签名的**呈现**, 不引入新表(后端 tag_parent 同款), 所以这里纯前端分组。 -->
+    <div class="tag-tree" v-if="showTagTree && tagTree.length">
+      <TagTreeNode
+        v-for="node in tagTree"
+        :key="node.full"
+        :node="node"
+        :depth="0"
+        :active-tag="query.tag"
+        :active-children="query.tag_children"
+        @pick="pickTagNode"
+      />
     </div>
 
     <!-- 当前生效的整理型筛选。⚠️ 必须常驻显示: 体检面板是可以收起的, 而
@@ -1353,6 +1457,22 @@ onMounted(() => {
           <div class="sm-meta">
             <span class="sm-d" :title="`汉明距离 ${s.distance}/64`">{{ s.distance }}</span>
             <span class="sm-nm" :title="s.local_path">{{ baseName(s.local_path) }}</span>
+            <button
+              class="sm-fav"
+              :class="{ on: s.favorite }"
+              :title="s.favorite ? '取消收藏' : '收藏'"
+              @click="favSimilar(s)"
+            >{{ s.favorite ? "★" : "☆" }}</button>
+          </div>
+          <!-- V46 类似剔图: 当场打分, 不用回网格 -->
+          <div class="sm-rate">
+            <button
+              v-for="n in RATE_OPTS_SIM"
+              :key="n"
+              class="sm-rst"
+              :class="{ on: n <= (s.rating || 0) }"
+              @click="rateSimilar(s, n)"
+            >{{ n <= (s.rating || 0) ? "★" : "☆" }}</button>
           </div>
         </div>
       </div>
@@ -1672,6 +1792,15 @@ onMounted(() => {
             title="找相似(按感知指纹, 与'疑似重复'不是一个阈值)"
             @click.stop="openSimilar(r)"
           >⧉</button>
+          <!-- V46: OCR(可选能力)。无 tesseract 时后端回 409, 这里把"未启用"如实说清,
+               而不是假装跑过了(第 27 条: 能力生效要有证据, 没装就是没装)。 -->
+          <button
+            v-if="r.type === 'image'"
+            class="ocr"
+            :class="{ on: r.ocr_text }"
+            :title="r.ocr_text ? '图中文字已识别(点此重新识别)' : '识别图中文字(OCR)'"
+            @click.stop="ocrOne(r)"
+          >A</button>
         </div>
         <div class="meta">
           <div class="nm" :title="r.local_path">{{ baseName(r.local_path) }}</div>

@@ -20,6 +20,11 @@ import {
   deleteTask,
   deleteWatch,
   deleteWebhook,
+  createRule,
+  deleteRule,
+  listRules,
+  runRule,
+  toggleRule,
   getConfig,
   getCollectors,
   getLoginJob,
@@ -502,6 +507,104 @@ function toggleDeliveries(h) {
   }
   loadDeliveries(h.id);
 }
+
+// ---- V46: 自动化规则(事件驱动工作流) ----
+// 规则 = 条件(资源库筛选) → 动作(打标签 / 收藏 / 触发 webhook)。不建脚本引擎,
+// 动作只做"已经在别处实现过"的事。条件键是白名单(与后端 RULE_CONDITION_KEYS 同源)。
+const rules = ref([]);
+const showRules = ref(false);
+const ruleBusy = ref(false);
+const ruleForm = ref({ name: "", condKey: "tag", condVal: "", action: "add_tag", arg: "" });
+const RULE_COND_KEYS = [
+  { k: "tag", label: "带标签" },
+  { k: "kind", label: "类型(image/video/…)" },
+  { k: "album", label: "相册名" },
+  { k: "min_rating", label: "评分≥(数字)" },
+  { k: "special", label: "整理维度" },
+  { k: "color", label: "主色系" },
+  { k: "date_from", label: "落盘不早于(YYYY-MM-DD)" },
+  { k: "date_to", label: "落盘不晚于(YYYY-MM-DD)" },
+  { k: "exclude_tag", label: "排除标签" },
+  { k: "text", label: "OCR 文字含" },
+];
+const RULE_ACTIONS = [
+  { k: "add_tag", label: "打标签", needArg: true, argHint: "标签名" },
+  { k: "favorite", label: "收藏", needArg: false },
+  { k: "webhook", label: "触发 Webhook", needArg: true, argHint: "Webhook ID" },
+];
+async function loadRules() {
+  try {
+    rules.value = await listRules();
+  } catch (e) {
+    rules.value = [];
+  }
+}
+async function toggleRules() {
+  showRules.value = !showRules.value;
+  if (showRules.value) loadRules();
+}
+function ruleNeedsArg() {
+  const a = RULE_ACTIONS.find((x) => x.k === ruleForm.value.action);
+  return !!(a && a.needArg);
+}
+async function addRule() {
+  if (!ruleForm.value.name.trim()) {
+    toast("请填写规则名", "err");
+    return;
+  }
+  const key = ruleForm.value.condKey;
+  const val = ruleForm.value.condVal.trim();
+  const condition = {};
+  // 条件值为空表示该维度不限; 评分需要数字。后端只认白名单键, 这里先把值转对。
+  if (val) condition[key] = key === "min_rating" ? Number(val) || 0 : val;
+  if (!Object.keys(condition).length) {
+    toast("请至少给条件填一个值", "err");
+    return;
+  }
+  const payload = {
+    name: ruleForm.value.name.trim(),
+    condition,
+    action: ruleForm.value.action,
+    arg: ruleNeedsArg() ? ruleForm.value.arg.trim() : null,
+  };
+  ruleBusy.value = true;
+  try {
+    await createRule(payload);
+    ruleForm.value = { name: "", condKey: "tag", condVal: "", action: "add_tag", arg: "" };
+    await loadRules();
+    toast("已创建规则: 新资源命中条件后自动执行", "ok");
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    ruleBusy.value = false;
+  }
+}
+async function removeRule(rl) {
+  if (!confirm(`删除规则「${rl.name}」?`)) return;
+  await deleteRule(rl.id);
+  await loadRules();
+}
+async function flipRule(rl) {
+  try {
+    await toggleRule(rl.id, !rl.enabled);
+    rl.enabled = !rl.enabled;
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+async function runRuleNow(rl) {
+  try {
+    const r = await runRule(rl.id);
+    toast(
+      `命中 ${r.hits} 条, 失败 ${r.errors} 条${r.capped ? "(触达上限)" : ""}`,
+      "ok"
+    );
+    await loadRules();
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  }
+}
+
 function pickEvent(key) {
   const i = hookPicked.value.indexOf(key);
   if (i >= 0) hookPicked.value.splice(i, 1);
@@ -840,6 +943,55 @@ onUnmounted(() => {
         </div>
       </div>
       <div v-else class="empty">还没有配置 webhook</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="panel-toggle">
+      <button type="button" class="ghost" @click="toggleRules">
+        {{ showRules ? "▾" : "▸" }} 自动化规则
+      </button>
+      <span class="summary muted">资源落库时自动执行: 打标签 / 收藏 / 触发 Webhook</span>
+      <span class="summary" v-if="rules.length">已配 {{ rules.length }} 条</span>
+    </div>
+    <div v-if="showRules">
+      <div class="rule-form">
+        <input v-model="ruleForm.name" type="text" placeholder="规则名" class="rule-name" />
+        <span class="sep">当</span>
+        <select v-model="ruleForm.condKey" class="rule-sel">
+          <option v-for="c in RULE_COND_KEYS" :key="c.k" :value="c.k">{{ c.label }}</option>
+        </select>
+        <input v-model="ruleForm.condVal" type="text" placeholder="条件值" class="rule-val" />
+        <span class="sep">则</span>
+        <select v-model="ruleForm.action" class="rule-sel">
+          <option v-for="a in RULE_ACTIONS" :key="a.k" :value="a.k">{{ a.label }}</option>
+        </select>
+        <input
+          v-if="ruleNeedsArg()"
+          v-model="ruleForm.arg"
+          type="text"
+          :placeholder="(RULE_ACTIONS.find(x => x.k === ruleForm.action) || {}).argHint || ''"
+          class="rule-val"
+        />
+        <button type="button" class="ghost" :disabled="ruleBusy" @click="addRule">添加规则</button>
+      </div>
+      <p class="dim small rule-hint">
+        例: 当「带标签 cosplay」则「打标签 cos」—— 之后任何带 cosplay 标签的资源落库时自动加 cos。
+        条件/动作非法会在保存时直接报错, 不会"存进去但永不触发"。
+      </p>
+      <div class="row-list" v-if="rules.length">
+        <div v-for="rl in rules" :key="rl.id" class="row-item">
+          <span class="dot" :class="{ off: !rl.enabled }"></span>
+          <span class="ell grow" :title="rl.name">{{ rl.name }}</span>
+          <span class="mono dim">条件 {{ Object.keys(rl.condition).join('/') || '无' }}</span>
+          <span class="mono dim">动作 {{ rl.action }}<template v-if="rl.arg"> {{ rl.arg }}</template></span>
+          <span class="mono dim" v-if="rl.last_run">命中 {{ rl.last_hits }}</span>
+          <button class="ghost mini" @click="flipRule(rl)">{{ rl.enabled ? "停用" : "启用" }}</button>
+          <button class="ghost mini" @click="runRuleNow(rl)">重跑</button>
+          <button class="ghost mini" @click="removeRule(rl)">删除</button>
+        </div>
+      </div>
+      <div v-else class="empty">还没有规则。上面加一条试试。</div>
     </div>
   </div>
 

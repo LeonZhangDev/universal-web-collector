@@ -303,6 +303,26 @@ export function listWebhookDeliveries(id, limit = 30) {
 export function getSystemGates() {
   return api.get("/system/gates").then((r) => r.data);
 }
+// ---- V46: OCR(可选能力, 系统未装 tesseract 时后端回 409) ----
+export function ocrResource(id) {
+  return api.post(`/library/${id}/ocr`).then((r) => r.data);
+}
+// ---- 自动化规则(事件驱动工作流) ----
+export function listRules() {
+  return api.get("/rules").then((r) => r.data);
+}
+export function createRule(payload) {
+  return api.post("/rules", payload).then((r) => r.data);
+}
+export function deleteRule(id) {
+  return api.delete(`/rules/${id}`).then((r) => r.data);
+}
+export function toggleRule(id, enabled) {
+  return api.post(`/rules/${id}/toggle?enabled=${enabled}`).then((r) => r.data);
+}
+export function runRule(id) {
+  return api.post(`/rules/${id}/run`).then((r) => r.data);
+}
 // ---- 文件访问 ----
 // 资源库是跨任务视图, 条目上只有 local_path —— 所以走按路径定位的 /files/raw,
 // 而不是按任务定位的 /files/{task_id}/{file}。

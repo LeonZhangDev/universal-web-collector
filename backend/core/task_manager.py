@@ -1787,6 +1787,24 @@ class TaskManager:
             events.publish("task.updated", dict(t))
 
     def _publish_resource(self, task_id, rid, status):
+        # V46: 资源真正落库(done)后触发自动化规则。挂在这个点而不是任务级收口,
+        # 是因为"落库"才是规则的语义入口(条件多半筛的是资源属性);
+        # 且每条资源独立判定, 一次任务里多个资源各自命中不同规则也成立。
+        # ⚠️ 规则失败**绝不能**影响资源发布(发布是核心链路, 规则是副作用),
+        # 所以整段 try/except 兜底 —— 否则一条烂规则会卡住整个下载流程。
+        if status == "done":
+            try:
+                applied = db.run_rules_for_resource(rid)
+                if applied:
+                    self._safe_log(
+                        task_id,
+                        "自动化规则: " + "; ".join(applied),
+                        level="debug",
+                    )
+            except Exception as e:
+                self._safe_log(
+                    task_id, f"自动化规则执行异常(已忽略): {e}", level="error"
+                )
         events.publish(
             "resource.updated", {"task_id": task_id, "id": rid, "status": status}
         )

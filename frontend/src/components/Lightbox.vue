@@ -2,14 +2,16 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 
 // 灯箱: 点击缩略图放大查看, 支持左右切换、缩放、旋转、原图下载、幻灯片播放与 Esc 关闭。
-// 只接收「已经能直接打开的图」(file_url 非空), 视频/文档不在灯箱里展示。
+// 既收图片也收视频: 每个条目可带 `type` 字段, `type==="video"` 时渲染 <video> 直读本地文件。
 const props = defineProps({
-  images: { type: Array, default: () => [] }, // [{ url, name }]
+  images: { type: Array, default: () => [] }, // [{ url, name, type? }]
   index: { type: Number, default: 0 },
 });
 const emit = defineEmits(["close", "update:index"]);
 
 const current = computed(() => props.images[props.index] || null);
+// 视频条目用 <video> 而不是 <img>。type 缺省按图片处理(老调用方不传也没关系)。
+const isVideo = computed(() => current.value && current.value.type === "video");
 const zoom = ref(1);
 const rotate = ref(0);
 
@@ -48,10 +50,13 @@ function setSlideSeconds(v) {
   if (playing.value) startSlide(); // 改间隔要立刻生效, 否则"选了 3s 还是 5s"
 }
 // 换图时重置计时: 手动翻了一张后不该立刻又被定时器翻走。
+// ⚠️ 视频条目停在灯箱里时**暂停**幻灯片推进: 否则定时器会在视频播到一半时把它翻走,
+// 用户看着像"视频自己跳过了"。(img 条目则照常推进。)
 watch(
   () => props.index,
   () => {
-    if (playing.value) startSlide();
+    if (isVideo.value) stopSlide();
+    else if (playing.value) startSlide();
   }
 );
 // 图变少了(比如列表被刷新)就停 —— 留着定时器在 1 张图里空转是"看不见的活跃"。
@@ -169,12 +174,20 @@ onUnmounted(() => {
     <span class="lb-close" @click="emit('close')">✕</span>
     <span v-if="images.length > 1" class="nav prev" @click="go(-1)">‹</span>
     <img
-      v-if="current"
+      v-if="current && !isVideo"
       :src="current.url"
       :alt="current.name"
       :style="imgStyle"
       @click="toggleZoom"
     />
+    <video
+      v-else-if="current && isVideo"
+      :src="current.url"
+      :style="imgStyle"
+      controls
+      autoplay
+      playsinline
+    ></video>
     <span v-if="images.length > 1" class="nav next" @click="go(1)">›</span>
     <span v-if="images.length > 1" class="lb-count">
       {{ index + 1 }} / {{ images.length }}

@@ -1632,3 +1632,38 @@ NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id=r.id AND rt.tag 
 
 全量跑完红了: 实测收集 **1430**，README 只写了 [1400, 1401](V45 新增 30 条)。
 五轮(V42/V43/V44/V45)都是 R-CI-1 抓的 —— **数字必须由门禁算**。
+
+## V46（2026-09-26）：自动化规则 / 可选 OCR / 视频内联 / 嵌套标签树 / 类似剔图
+
+再搜一轮 2026 竞品(Immich v3.2.0 把 Workflows 抬成核心卖点)后，挑出“积木已经齐了只差编排”的几样落地。重点不是“又加了功能”，而是**不引入脚本引擎、不假装有 OCR、不做边下边播**这三条边界。
+
+### 自动化规则：条件复用 library_filters，动作复用既有出口
+
+* 规则 = `条件(JSON, 键 ∈ RULE_CONDITION_KEYS 白名单) → 动作(add_tag / favorite / webhook)`。条件回灌时**仍走 `library_filters`**，永远不拼 SQL(第 7 条: 前端代号不进 SQL)。
+* 动作只做“已经在别处实现过”的事: 打标签 `add_tags`、收藏 `set_favorite`、推 webhook `webhooks.deliver` —— **不建通用脚本引擎**(那是 n8n 的活)。
+* **创建时即 400 而不是存进去静默不触发**: 未知条件键 / 未知动作 / `add_tag` 不给标签 / `webhook` 指向不存在的 hook 全部 400。配置错误最安静的表现就是“存进去了但永远不触发”。
+* 钩子挂 `_publish_resource(status="done")`: 资源真正落库那一点，每条资源独立判定；整段 try/except 兜底 —— **规则失败绝不能影响资源发布**(发布是核心链路，规则是副作用)。
+* `webhooks` 模块 import database(database 持有 `automation_rules` 表)，所以 database 里调 webhooks 必须**延迟 import**(`from core import webhooks as _webhooks` 写在函数内)，否则循环导入。
+
+### 可选 OCR：零强制依赖，无 tesseract 就如实 409
+
+* `core/ocr.py` 只**探测**系统里有没有 `tesseract` 可执行文件，不引入 pytesseract / easyocr(与“ffmpeg-only、不引 Pillow”同方向)。无引擎时 `ocr_image` 返回 `None`。
+* 端点 `POST /library/{id}/ocr` 无引擎时直接 **409 说清“未启用”**，而不是返回“识别成功 0 字” ——那会让用户以为 OCR 跑过了、图里只是没字，其实根本没装引擎(第 27 条: 能力生效要有证据)。
+* 文字落 `resources.ocr_text`，并加进 `library_filters` 的 `text=` 子串匹配维度(与 `q` 同款转义通配符)。
+
+* **边下载边播放不做**: mp4 的 `moov` 原子在文件尾部，没下完根本播不了; 真要“边下边看”得改流式/HLS 播放器，和“先落盘再存储”的契约冲突 —— 属于 HLS 直播那一类，不在此轮。
+
+### 嵌套标签树 / 类似剔图: 纯前端呈现，不立新表
+
+* 标签名里的 `/` 表达层级(后端 `tag_parent` 同款)，树是前端对 `tags` 列表的分组呈现，点父节点 = 按前缀收子(`tag_children=true`)，与排除对称。
+* 类似剔图(similar + 评分)复用 `similar_to`(V45) + `libraryRate`(V42)，在相似结果里直接打分/收藏。
+
+### 门禁第六次在同一个地方救场
+
+doc-counts 报: 实测 **1442**，README 只写了 [1430, 1431](V46 新增 12 条用例)。六轮(V42/V43/V44/V45/V46)都是 R-CI-1 抓的 —— **数字必须由门禁算**。
+
+### 全量重负载下偶发 2 条 timing 测试红（预先存在，非 V46 回归）
+
+- `test_downloaders::test_shutdown_closes_real_hanging_image_socket_within_gate` 与 `test_task_dedup::test_concurrent_deduplicated_creates_produce_one_task` 在 8 分钟 / 1442 条全量跑里偶发失败（前者 `elapsed<10` 门关、后者并发去重竞态），但**单独跑在干净 base 与 V46 都 2 passed**。
+- 判定：预先存在的 timing 不稳定测试，与 V46 无关。V46 对 `task_manager._publish_resource` 只加了一段"跑规则 + 整段 try/except 兜底"的钩子，不碰 socket 关闭 / 去重路径，且测试库无规则时为空循环。
+- 处置：不掩盖、不造假绿，留痕在此；若 CI 因此红，应单独给这两条加确定性（放宽门关 / 串行化去重竞态），与 V46 无关。

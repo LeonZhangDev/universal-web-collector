@@ -1,14 +1,14 @@
 # Universal Web Collector — 长期笔记（索引）
 
 栈：uv + FastAPI + Vue3/Vite + Playwright + SQLite(WAL) + ffmpeg。
-**正文以 `README.md` / `docs/AGENT_DEVELOPMENT_GUIDE.md`（§20–§22 最新）为准；坑的完整清单见 `PITFALLS.md`。**
-本文件只做三件事：**索引 + 本机契约 + 一眼能认出的坑名**；命令与环境变量**都在 README**。
+**正文以 `README.md` / `docs/AGENT_DEVELOPMENT_GUIDE.md` 为准；坑的完整清单见 `PITFALLS.md`。**
+本文件只做三件事：**索引 + 本机契约 + 一眼能认出的坑名**；命令与环境变量都在 README。
 > 维护：**新坑先写 `PITFALLS.md`，这里只加一行索引**（上限约 16.5KB，曾溢四次）。
 
 ## 铁律 / 落盘
 `URL → Browser/HTTP → Extractor → Resource → Downloader → Storage`；站点逻辑不进下载器。
 布局（唯一入口 `core/layout.py`）：`downloads/相册名/图片`；**视频平铺到 downloads 根**（网站原名，m3u8 用 `gid.mp4`）。清单在 `downloads/_meta/任务ID/`。
-⚠️ 采集器的 `album_tags_dir`（标签层）已废弃，别引回来（留着就是"按了没反应"）。
+⚠️ 采集器的 `album_tags_dir`（标签层）已废弃，别引回来。
 本地相册集的缩略图落在 `<库同级>/local_albums/_meta/thumb/`，**不在用户登记的根目录里**（只读承诺）。
 
 ## 关键文件
@@ -19,7 +19,7 @@
 `collectors/gallery_base.py`(声明式契约；`check_site`=验收标准) · `collectors/hls.py` · `core/partials.py`(**按 URL 寻址**) · `core/sessions.py`(浏览器登录态 storage_state) · `api/local.py`(出图只收 `(root_id, rel)`，**不收裸绝对路径**) · `tests/isolation.py` · `tests/conftest.py`(R-CI-3)
 `LIBRARY_SORTS`/`library_order_by` = 排序代号**唯一翻译点**（白名单，未知 400）· `library_searches` 表存**具名参数**不是 SQL
 **`scripts/gate.py`**(`Gate`/`Problem` 唯一定义，`checked` 必填、`==0` 算红) · `scripts/gateguard.py`(六道闸，逐闸报"核了几项") · **`.gitattributes` = 行尾唯一来源**
-`scripts/probe_site.py`(五项探针+声明草稿+证据门禁；回归靶子=假站) · `scripts/probe.py` · `scripts/add_site.py`(`--list`/`--verify`) · `scripts/drift_check.py` · `scripts/probe_feed.py`
+`scripts/probe_site.py`(五项探针+声明草稿+证据门禁) · `scripts/add_site.py`(`--list`/`--verify`) · `scripts/drift_check.py` · `scripts/probe_feed.py`
 
 ## ⚠️ 静默坑索引（1–30 + 同族 A–L；细节见 `PITFALLS.md`）
 **共同特征：不报错，只是结果错 —— 所以会在真实使用中活很久。**
@@ -64,7 +64,7 @@
 | I | 替身覆盖不到**真数据**那层 | 纯色图互指成"全是重复"(dHash 只看梯度) —— 只有真图冒烟能抓 |
 | J | **不该数的时候不要数** | 条件读不出来时空条件=全库条数 → 报 `null`+`broken`，**不许报 0** |
 | K | **判据挂代号 ≠ 报错不能带文案** | **代号管"红不红"，文案管"哪里红"** |
-| L | **追加到"文件末尾"前先读到真末尾** | 追加后 `git diff HEAD` 必须**只有 `+` 没有 `-`** |
+| L | 追加到"文件末尾"前先读到真末尾 | 追加后 `git diff HEAD` 必须**只有 `+` 没有 `-`** |
 | 28 | **静默回退成默认值** | 未知排序档位回退 = 用户读成"排序坏了"而日志安静 → 一律 400 |
 | 29 | **没验到 ≠ 验过了没问题** | 门禁按 `git ls-files` 扫 ⇒ 新文件没 `git add` = 不在名单（**本机全绿/CI 红**）。纪律：**跑门禁前先 `git add`** |
 | 30 | **CSS 选择器前缀对不上 = 整段样式静默失效** | 曾写 `.lightbox X` 而根类是 `.lightbox-mask` ⇒ 一整组后代选择器全不生效、控制台无报错。前缀必须等于**组件根类名** |
@@ -76,39 +76,34 @@
 吞吐由 **`domain_min_interval`** 决定，不由并发决定；令牌桶只改突发。AIMD 只按成功与否，**不看延迟**。站点级并发 `DomainLimiter` 按 `site_key` 分组（默认 3）。枚举快路径：页面给数量 → 抽样校验 → 跳过逐张探测。去重两层都不删文件：sha256 复用；dHash ≤ 4 写 `duplicate_of`。
 
 ## 本机验证
-`~/.workbuddy/binaries/python/envs/uwc-verify`（用户 `.venv` 是 WSL 的）。后端要 `--app-dir backend`；curl 对 127.0.0.1 加 `--noproxy '*'`。别把 Git Bash 的 `$PWD/...` 传给 Windows Python（造影子库）。
-⚠️ **口径 = 收集总数**。本机 Windows **1430**（1424 passed + 6 skipped）；CI(Linux) **1431**（差额恒为 `POSIX_TERMINATION_SIGNALS` 的 SIGHUP 参数×1）。**改文档前先跑数；差分不闭合先怀疑自己。**
+`uv run pytest` / `uv run python scripts/gateguard.py`（项目用 `uv`，`.venv` 在仓库根）。
+⚠️ **口径 = 收集总数**（门禁算，README 是落点）。本机 Windows **1448**；CI(Linux) **1449**（差额恒为 1）。**改文档前先跑数；差分不闭合先怀疑自己。**
 ⚠️ **`img.xchina.io` 本机整段 403**（`text/plain` 非 CF 挑战页）→ **网络**问题，不是改版/回归。
-⚠️ 别前置 `export PATH="/usr/bin:/bin:$PATH"`（裸 `python` 会变成没 pytest 的 3.13.12）。coreutils 全无。
 ⚠️ **`exit 1` ≠ 有失败**：safe-delete 守卫拦"清空大目录"(阈值 50) → 无 `FAILED`、无汇总行。判据：进度行有没有 `F`。脚本要 `python -u`。
 ⚠️ 想拿汇总行：`--basetemp` 指系统临时目录下**不存在**的路径，**绝不进项目目录**。长命令 `MODULE_NOT_FOUND` = 没跑 → `run_in_background=true`。
 ⚠️ **行尾**：`Path.write_text()` 会把 `\n` 翻成 `\r\n`（用 `write_bytes` 或 `newline=""`）；`.gitattributes` 是唯一来源，`downloaders/video.py`、`scripts/verify_output.py` 的 HEAD 本是 CRLF，别"统一"。
 ⚠️ npm"包目录存在"≠"包装好了"：`@rollup/rollup-win32-x64-msvc` 可能是空目录 → `vite build` 报 `Cannot find module`。
 
 ## Git / 远端
-独立建仓（toplevel = 项目目录），分支 `main`。**上级 `C:\Users\admin` 那个仓库绝不能碰**。远端 <https://github.com/LeonZhangDev/universal-web-collector>；本机**无 `gh` CLI** → `printf "protocol=https\nhost=github.com\n\n" | git credential fill` 取 token。
-⚠️ 本机 Bash 极简：`git -C <绝对路径>` 解析失败 → 用默认 cwd；提交用多个 `-m` 或 `git commit -F <文件>`。**会话间"自动提交"会移动 HEAD** → 每轮先 `git rev-parse HEAD` + `git ls-remote`；**CI 跑的是 `origin/main`**，"本地全绿/CI 全红"第一条命令是 `git log --oneline origin/main..HEAD`。
+独立建仓（toplevel = 项目目录），分支 `main`。**上级 `C:\Users\admin` 那个仓库绝不能碰**。远端 <https://github.com/LeonZhangDev/universal-web-collector>；本机**无 `gh` CLI**。
+⚠️ 本机 Bash 极简：`git -C <绝对路径>` 解析失败 → 用默认 cwd；提交用 `git commit -F <文件>`。**会话间"自动提交"会移动 HEAD** → 每轮先 `git rev-parse HEAD` + `git ls-remote`；**CI 跑的是 `origin/main`**，"本地全绿/CI 全红"第一条命令是 `git log --oneline origin/main..HEAD`。
 - 先试 `git push origin main`；只在真报 `502`/`000`/`CONNECT tunnel failed` 时降级 Git Data API。推完与本地 HEAD 对一次。
-- CI `.github/workflows/ci.yml`：`backend`(`uv sync --group dev`+ffmpeg+`pytest`+`gateguard.py`+三个离线守卫) / `frontend`(`npm ci`+`build`+`test:task-query`) / `docker`。（取日志：jobs/{id}/logs 会 302 到 blob storage，重定向时**摘掉 Authorization**，否则 401；本机代理偶发 502，要重试）
+- CI `.github/workflows/ci.yml`：`backend`(`uv sync --group dev`+ffmpeg+`pytest`+`gateguard.py`+三个离线守卫) / `frontend`(`npm ci`+`build`+`test:task-query`) / `docker`。（取日志：jobs/{id}/logs 会 302 到 blob storage，重定向时**摘掉 Authorization**，否则 401）
 - ⚠️⚠️ **CI 绿 ≠ 本地绿**：差额清单见 `PITFALLS.md` V39 六。依赖别漏：`curl-cffi`（主依赖）、`httpx2`（dev 组）—— 漏了 collection 阶段整片红。
-- 相关 skill：`verification-red-triage`（红了怎么定位）· `verification-gate-design`（判据怎么设计）· `github-ci-failure-triage` · `git-push-via-rest-api` · `competitor-feature-absorption`（对标前**先回代码核**）· `downloader-output-layout` · `graceful-cancel-worker` · `gallery-site-probe`。
+- 相关 skill：`verification-red-triage` · `verification-gate-design` · `github-ci-failure-triage` · `git-push-via-rest-api` · `competitor-feature-absorption`（对标前**先回代码核**）· `downloader-output-layout` · `graceful-cancel-worker` · `gallery-site-probe`。
 
 ## 版本史（细节见各版 commit / README / `PITFALLS.md`）
-**V28–V38** 见 `PITFALLS.md` 各节（587→819→880→942→997→1063）。
-- **V39** 站点探针（五项探测 + 真站当靶子 + 三档证据门禁）；抓出 16–19
-- **V39.5** 让"绿/红"不再可能是假的（`Gate.checked`/`Problem.kind`）；抓出 20（1105）
-- **V40** **门禁落地**（`gateguard` 六闸+`.gitattributes`+CI 补 ffmpeg+R-CI-1/2/3）· **本地相册集**（只读、随机池、收藏）；抓出 24/25（**1290**）
-- **V41** 对标 Immich：**排除模式 glob**(命中要计数)/**往年今日**/**重复标记**(只标记不删)/**扫描对账**(`None`≠`{"added":0}`)；抓出 26/27 + 同族 H/I（**1309**）
-- **V42** 五方向各对标：gallery-dl/yt-dlp → **URL 归档**；Eagle/digiKam → **评分**(上限后端硬拦)·**体检视图**(九维)；Czkawka/dupeGuru → **重复分组**·**文件头 sniff**(`core/filekind.py`)（**1341**）
-- **V43** 回代码核"V42 声称推迟的"→ 周期巡检/sidecar/会话登录态**早就有**；真缺两个入口：**资源库排序**(白名单+次级键 `r.id`)·**保存的搜索**(`count` 0 就是 0)；抓出 28 + 同族 J（**1367**）
-- **V44** 落地上一轮清单里"能纯代码完成"的六项：**文件头规范化**(dry_run 默认 + isobmff 不改)·**主色检索**·**打包导出**(不截断)·**虚拟相册**(实时)·**Webhook**(不返 secret/留痕)·**自检面板**；+ 插件 SDK 文档（**1400**）
-  ⚠️ 两个决策点：**图像能力一律走 ffmpeg（项目刻意无 Pillow）**；**加筛选维度时按位置转发 `library_filters` 的调用点都要同步**（不然"筛了没生效"且不报错）
-  ⚠️ 门禁**第四次**救场是个**新机制**：只扫 git 跟踪的文件 ⇒ 新文件没 `git add` = **没验到**（第 29 条）
-- **V45** 六方向对标后落地六项：**相似检索**(dHash，与重复**双阈值** 12/4)·**排除筛选**(`NOT EXISTS`+NULL 保护)·**日期区间**("**落盘**"口径，上界补 23:59:59)·**Webhook 重试+逐次投递历史**(4xx 不重试)·**Watch cron**(零依赖，日/周取"或")·**幻灯片**；+ 修掉灯箱 CSS 前缀(第 30 条) 抓出 30（**1430**）
-  ⚠️ 两个决策点：**后端回灌给界面的结构里不许出现需要界面二次翻译的代号**(`applied` 改过一次形状)；**"相似"与"重复"绝不能共用一个入口**(相似里有真不同的图)
-- **V46** 再搜一轮 2026 竞品(Immich v3.2.0 把 Workflows 抬成核心)后落地五项：**自动化规则**(条件复用 `library_filters` + 动作复用 webhook/标签/收藏，**不建脚本引擎**；创建时白名单校验即 400；钩子挂 `_publish_resource(done)`)·**可选 OCR**(零依赖、只探 tesseract、无引擎 409)·**视频内联**(Lightbox `<video>`，不做边下边播)·**嵌套标签树**(纯前端按 `/` 分组)·**类似剔图**(similar+评分 前端组合)。`ocr_text` 列 + `automation_rules` 表 + `text=` 过滤（**1442**）
-  ⚠️ **S6(人脸/语义/地图)明确推迟**：需向量检索+嵌入模型+人脸聚类+地图合规，与 ffmpeg-only/SQLite 冲突，列为下一专项，**不做假绿**。
-- **三句话**：加站的成本在探测不在写声明；假绿＝判据挂"没报错"、假红＝挂中文子串，修法是**先变成结构**；**"没有结果"与"没算出结果"必须两个值**、**规则生效要有计数**。
-- **V42 一句话**：**先分清"谁跟我们是同一件事"**（Immich External Library = 同一契约）；同类产品的**默认动作**不能照抄（dupeGuru 默认删，我们只标记）。
-- **下一步候选**：更多站点插件（先 `probe_site.py`）/ HLS 直播（缺真站样本）/ 人脸·语义·地图（另一档投入）/ 嵌套规则 —— 全是**"暂时不做"不是"不该做"**。
-- ⚠️ **推迟理由会过期**（V41 评分 / V42 智能文件夹都被"回代码看要多少活"戳破）→ **写在"最小可做版本"旁边**。
+- **V28–V38**：见 `PITFALLS.md`（587→819→880→942→997→1063）
+- **V39** 站点探针(五项+真站靶子+三档证据门禁) → 抓 16–19 (1105)
+- **V39.5** 绿/红不可假(`Gate.checked`/`Problem.kind`) → 抓 20 (1105)
+- **V40** 门禁六闸+`.gitattributes`+CI补ffmpeg+R-CI-1/2/3；本地相册集(只读/随机池/收藏) → 抓 24/25 (1290)
+- **V41** 对标Immich:排除glob(命中计数)/往年今日/重复标记(只标记不删)/扫描对账(`None`≠`{"added":0}`) → 抓 26/27+H/I (1309)
+- **V42** 五方向对标:URL归档(Eagle·digiKam→评分上限后端硬拦·体检九维)/(Czkawka·dupeGuru→重复分组·文件头sniff=`filekind`) (1341)
+- **V43** 回代码核V42"推迟项"→周期巡检/sidecar/登录态早有；真缺:资源库排序(白名单+次级`r.id`)/保存搜索(`count`=0即0) → 抓 28+J (1367)
+- **V44** 落地六项:文件头规范化(dry_run默认+isobmff不改)/主色检索/打包导出(不截断)/虚拟相册(实时)/Webhook(不返secret·留痕)/自检面板 +插件SDK (1400)；⚠️决策:**图像能力一律走ffmpeg(无Pillow)**；**加筛选维度须同步 `library_filters` 所有调用点**(否则"筛了没生效"不报错)；门禁第四救场=只扫git跟踪文件→新文件没`git add`=没验到(第29条)
+- **V45** 对标六项:相似dHash(双阈值12/4)/排除筛选(`NOT EXISTS`+NULL保护)/日期区间("落盘"口径,上界补23:59:59)/Webhook重试+逐次历史(4xx不重试)/Watch cron(零依赖日周取或)/幻灯片 +修灯箱CSS前缀(第30条) (1430)；⚠️决策:**后端回灌结构不许含需界面二次翻译的代号**(`applied`改过形状)；**"相似"与"重复"绝不共用入口**
+- **V46** 再搜2026竞品(Immich v3.2.0 Workflows核心)落地五项:自动化规则(条件复用`library_filters`+动作复用webhook/标签/收藏,**不建脚本引擎**,白名单校验即400,钩子挂`_publish_resource(done)`)/可选OCR(零依赖只探tesseract无引擎409)/视频内联(Lightbox `<video>`,不做边下边播)/嵌套标签树(纯前端按`/`分组)/类似剔图(similar+评分前端组合) +`ocr_text`列+`automation_rules`表+`text=`过滤 (1442)；⚠️**S6(人脸/语义/地图)明确推迟**(需向量+嵌入+聚类+地图合规,与ffmpeg-only/SQLite冲突,**不做假绿**)
+- **V47** 视频播放增强+进度记忆+继续观看+幻灯片过渡:Lightbox静音自动播放修复(V46真bug)/PiP/倍速/键盘快捷键/时长·大小显示/`watch_position`列+续播判据(NULL=没看过,0也有效;判据`IS NOT NULL AND >1 AND (duration IS NULL OR < duration-2)`)/继续观看集合/幻灯片淡入+悬停暂停+随机顺序;6用例落`tests/test_watch_position.py` → 1442→**1448**(本机)/**1449**(CI)
+
+**三句话心法**：加站成本在探测不在写声明；假绿＝判据挂"没报错"、假红＝挂中文子串，修法是**先变成结构**；**"没有结果"与"没算出结果"必须两个值**、**规则生效要有计数**。
+**推迟项都是"暂时不做"不是"不该做"**：更多站点插件(先`probe_site.py`)/HLS直播(缺真站样本)/人脸·语义·地图(另一档投入)/嵌套规则——**推迟理由会过期**(V41评分·V42智能文件夹都被"回代码核"戳破)，写在"最小可做版本"旁边。

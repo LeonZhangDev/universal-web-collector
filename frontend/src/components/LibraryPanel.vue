@@ -28,6 +28,8 @@ import {
   listLibrarySimilar,
   listLibraryTags,
   listVirtualAlbumItems,
+  listContinueWatching,
+  rawFileUrl,
   ocrResource,
   replayLibraryFailures,
   saveLibrarySearch,
@@ -36,6 +38,7 @@ import {
 } from "../api";
 import { toast } from "../toast";
 import TagTreeNode from "./TagTreeNode.vue";
+import Lightbox from "./Lightbox.vue";
 
 const items = ref([]);
 const total = ref(0);
@@ -1075,6 +1078,44 @@ function isTagNodeActive(node) {
   );
 }
 
+// ---- V47? 继续观看: 看过但没看完的视频集合 ----
+// ⚠️ 与"体检/查重复"是同一类"库现在的状态"视图: 它回答"哪些视频我看过一半"。
+// 点开即把这批喂给灯箱, 灯箱会从 watch_position 续播(见 Lightbox.onVideoMeta)。
+const continueData = ref(null);
+const continueBusy = ref(false);
+const cwIndex = ref(0);
+const showCw = ref(false);
+const cwImages = computed(() =>
+  (continueData.value?.items || []).map((r) => ({
+    id: r.id,
+    url: rawFileUrl(r.local_path),
+    name: (r.local_path || "").split(/[\\/]/).pop() || "",
+    type: "video",
+    duration: r.duration,
+    size: r.size,
+    watch_position: r.watch_position,
+  }))
+);
+async function openContinue() {
+  if (continueBusy.value) return;
+  continueBusy.value = true;
+  try {
+    const r = await listContinueWatching(50);
+    if (!r.items || !r.items.length) {
+      toast("没有还没看完的视频", "warn");
+      continueData.value = null;
+      return;
+    }
+    continueData.value = r;
+    cwIndex.value = 0;
+    showCw.value = true;
+  } catch (e) {
+    toast(e.response?.data?.detail || String(e), "err");
+  } finally {
+    continueBusy.value = false;
+  }
+}
+
 onMounted(() => {
   load();
   loadAlbums();
@@ -1097,6 +1138,12 @@ onMounted(() => {
       <button class="ghost mini" :disabled="failBusy" @click="loadFailures">
         {{ failBusy ? "读取中…" : "失败诊断" }}
       </button>
+      <button
+        class="ghost mini"
+        :disabled="continueBusy"
+        title="看过但没看完的视频, 点开从原位置续播"
+        @click="openContinue"
+      >{{ continueBusy ? "读取中…" : "继续观看" }}</button>
       <!-- V42: 三项"库现在怎么样"的视图。它们与"失败诊断"是**两件事**:
            那个问"该拿到却没拿到的是什么", 这些问"已经拿到的里面, 哪些还没整理 /
            哪些互相重复 / 哪些叫错了名字"。 -->
@@ -1863,6 +1910,15 @@ onMounted(() => {
       <button class="ghost" :disabled="query.page === pages" @click="goto(query.page + 1)">下一页</button>
       <span class="ptot">共 {{ total }} 项 / {{ pages }} 页</span>
     </div>
+
+    <!-- 继续观看: 看过一半的视频, 灯箱会从记录的位置续播 -->
+    <Lightbox
+      v-if="showCw && cwImages.length"
+      :images="cwImages"
+      :index="cwIndex"
+      @close="showCw = false"
+      @update:index="cwIndex = $event"
+    />
   </div>
 </template>
 

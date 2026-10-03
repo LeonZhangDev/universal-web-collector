@@ -107,6 +107,10 @@ const lightboxImages = computed(() =>
       url: r.type === "video" ? rawFileUrl(r.local_path) : r.file_url,
       name: (r.url || "").split("/").pop() || "",
       type: r.type,
+      // 视频续播与元信息: 灯箱据此从 watch_position 续播并显示时长/大小。
+      duration: r.duration,
+      size: r.size,
+      watch_position: r.watch_position,
     }))
 );
 const lbIndex = ref(0);

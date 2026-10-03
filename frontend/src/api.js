@@ -214,6 +214,21 @@ export function libraryVerify(payload = {}) {
 export function libraryRate(ids, rating = 0) {
   return api.post("/library/rate", { ids, rating }).then((r) => r.data);
 }
+// 视频续播: 灯箱 timeupdate 节流上报看到第几秒。失败只静默(续播是附件能力,
+// 不该因为上报失败把整个灯箱弄崩)。后端对非法秒数静默忽略, 这里统一不抛。
+export function setWatchPosition(id, seconds) {
+  return api
+    .post(`/library/${id}/watch-position`, { seconds })
+    .then((r) => r.data)
+    .catch(() => null);
+}
+// 「继续观看」集合: 看过但没看完的视频。直接喂灯箱续播。
+export function listContinueWatching(limit = 50) {
+  return api
+    .get("/library/continue", { params: { limit } })
+    .then((r) => r.data)
+    .catch(() => ({ items: [], total: 0 }));
+}
 // 「体检视图」: 每个整理型维度各有多少条。
 // ⚠️ items[].n 是**真数过**的结果 —— 0 就是 0, 不许显示成 "—"(把"没有"画成"未知")。
 export function getLibraryFacets() {

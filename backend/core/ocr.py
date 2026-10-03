@@ -40,7 +40,10 @@ def ocr_image(path):
     try:
         proc = subprocess.run(
             ["tesseract", path, "stdout", "-l", "eng+chi_sim"],
-            capture_output=True, text=True, timeout=30,
+            # tesseract 的 stdout 固定是 UTF-8; text=True 在中文 Windows 上会
+            # 按 cp936 解码, 把中文识别结果变成乱码, 所以显式指定 encoding。
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
         )
         if proc.returncode != 0:
             return None

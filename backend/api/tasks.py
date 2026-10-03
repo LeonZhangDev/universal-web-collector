@@ -1025,6 +1025,35 @@ def library_ocr(resource_id: int):
     return {"ok": True, "resource_id": resource_id, "text": text}
 
 
+class WatchPositionIn(BaseModel):
+    seconds: float
+
+
+@router.post("/library/{resource_id}/watch-position")
+def library_watch_position(resource_id: int, payload: WatchPositionIn):
+    """记录一条视频看到第几秒(续播用)。
+
+    ⚠️ 这是播放路径上的**附件**能力: 上报失败只该"没记下进度", 绝不把接口打成 500。
+    所以非法秒数在 db 层就静默忽略(返回 0), 这里统一回 `{ok, updated}` 而非 400。
+    """
+    row = db.query_one("SELECT id FROM resources WHERE id=?", (int(resource_id),))
+    if not row:
+        raise HTTPException(status_code=404, detail="resource not found")
+    updated = db.set_watch_position(resource_id, payload.seconds)
+    return {"ok": True, "resource_id": resource_id, "updated": updated}
+
+
+@router.get("/library/continue")
+def library_continue(limit: int = Query(50, ge=1, le=500)):
+    """「继续观看」集合: 视频且看过但没看完(见 db.list_continue_watching 的判据)。
+
+    返回结构与 `/library` 一致(原始行, 含 local_path / duration / watch_position),
+    前端按 video 用 `rawFileUrl(local_path)` 拼可播放 URL、从 watch_position 续播。
+    """
+    rows = db.list_continue_watching(limit)
+    return {"items": [dict(r) for r in rows], "total": len(rows)}
+
+
 @router.post("/library/rate", response_model=LibraryRateOut)
 def library_rate(payload: LibraryRateIn):
     """批量打星(0-5)。`rating=0` 表示**清除评分**(回到"未评分")。

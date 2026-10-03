@@ -4334,7 +4334,7 @@ NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id = r.id AND rt.ta
 | 项 | 结果 |
 | --- | --- |
 | `tests/test_features_v45.py`(新) | **30 项**(相似排序 / 双阈值 / 三种"没法比" / 截断上报 / API 两态 / `NOT EXISTS` 排除 / NULL 保护 / 排除相册 / 未知 special 400 / 日期含端点 / 非法日期 400 / `date` 档位中文含"落盘" / `applied` 不含 `kind=all` / count-list 同口径 / 每个键都有中文名 / 5xx 重试 vs 4xx 不重试 / 逐次记录 / 网络失败重试 / 删 hook 连带删历史 / deliveries 端点 / cron 严格晚于 now / 步长 / 列表 / 日或周 / 周日平移 / 坏表达式 / 订阅用 cron / claim 仍用 cron / interval 不变 / API 拒坏 cron / `next_run_for` 字符串入参不炸) |
-| 全量 pytest | 本机 Windows 收集 **1442** → 1436 passed + 6 skipped; CI/Linux **1443** |
+| 全量 pytest | 本机 Windows 收集 **1448** → 1442 passed + 6 skipped; CI/Linux **1449** |
 | 前端 | `npm run build` 通过(92 modules) |
 
 ⚠️ 门禁**第五次**在同一条用例上救场: 全量跑完红了, 报"实测收集 1430, README 只写了
@@ -4388,9 +4388,55 @@ Lightbox 加 `<video>` 直读已下载 mp4(我们已平铺在 downloads 根)。�
 | 项 | 结果 |
 | --- | --- |
 | `tests/test_features_v46.py`(新) | **12 项**(规则白名单校验 / CRUD 往返 / 命中后真作用到资源 / favorite 动作 / 不命中不作用 / 手动重跑计数 / OCR 无引擎 409 / OCR 文字写入并被 text 过滤命中 / 非图片拒绝) |
-| 全量 pytest | 本机 Windows 收集 **1442** → 1436 passed + 6 skipped; CI/Linux **1443** |
+| 全量 pytest | 本机 Windows 收集 **1448** → 1442 passed + 6 skipped; CI/Linux **1449** |
 
 ⚠️ 门禁**第六次**救场: doc-counts 报"实测 1442, README 只写了 [1430, 1431]" —— V46 加了
 12 条用例, 数字必须同步。
+
+## 28. V47: 视频播放增强 / 进度记忆 / 继续观看 / 幻灯片（2026-09-28）
+
+接 V46「视频内联播放」之后, 把"看视频"链路补全。完整清单见 `README.md` 的 V47 一节,
+这里只记**关键判据与坑**。
+
+### 28.1 灯箱视频: 静音自动播放是真 bug 修复
+
+V46 的 `<video autoplay>` 带声音, 浏览器策略一律拦掉 → "下载完打开就播"在多数浏览器下
+**其实没播**(静默不报错的那种)。V47 改成默认 `muted` 自动播 + 点一下"🔊"解锁声音, 这才真的生效。
+
+新增: 画中画(`requestPictureInPicture`) · 倍速(`playbackRate` 0.5~2×) · 键盘快捷键
+(视频态 空格=播放/暂停、←/→=快退快进 5s、`M`=静音、`F`=画中画; 图片态仍 ←/→ 翻页) ·
+底部显示时长 + 文件大小(取自后端落库的 `duration` / `size`)。
+
+### 28.2 进度记忆 `watch_position`: NULL 与 0 是两个意思
+
+新列 `resources.watch_position`(REAL 秒)。灯箱 `timeupdate` **节流 3s** 上报
+`POST /library/{id}/watch-position`, 打开视频从记录位置续播。
+
+⚠️ `NULL` = 没看过, `0` 也是有效值(刚打开) —— 判据用 `IS NOT NULL AND > 1`, **不靠 `=0`
+当未看**。非法秒数(NaN / Inf / 负)在 db 层**静默忽略**(续播是附件能力, 上报失败只该"没记下",
+不该 500)。
+
+### 28.3 「继续观看」集合: 看过但没看完
+
+`GET /library/continue` = 视频且 `0 < watch_position < duration - 2`(差 2 秒算看完);
+`duration IS NULL`(本机缺 ffprobe)时单独放通。资源库「继续观看」按钮一键打开灯箱续播。
+⚠️ 返回**原始行**(与 `/library` 同形, 含 `local_path` / `duration` / `watch_position`),
+不调 `_resource_out`(那需要 `download_dir`)。前端按 video 用 `rawFileUrl(local_path)` 拼 URL ——
+与 `TaskDetail` 既有的视频灯箱一致。
+
+### 28.4 幻灯片: 过渡 + 悬停暂停 + 随机顺序
+
+打开有淡入(`lb-fade`), 鼠标悬停**暂停**自动推进; 间隔 3/5/10/20s。🔀 只改自动播放走向,
+方向键始终是"当前序列相邻移动"。
+
+### 28.5 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/test_watch_position.py`(新) | **6 项**(非法秒数静默忽略 / 合法写入 / 继续观看排除看完&没看过的&非视频 / NULL-duration 仍列入 / API 端到端 / 未知资源 404) |
+| 全量 pytest | 本机 Windows 收集 **1448** → 1442 passed + 6 skipped; CI/Linux **1449** |
+
+⚠️ 门禁**第七次**救场(同型): 加了 6 条用例, doc-counts 必须同步到 1448/1449。
+
 
 

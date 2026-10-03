@@ -110,7 +110,12 @@ CREATE TABLE IF NOT EXISTS resources(
     -- V46: OCR 提取的图中文字(可选能力, 不强制装 tesseract)。无 OCR 引擎时这一列
     -- 永远是 NULL, 不影响其它功能; 有引擎时也只对"用户主动触发识别"的资源填值,
     -- 不偷偷全量扫(那会是一次没人知道的 CPU 风暴)。
-    ocr_text TEXT
+    ocr_text TEXT,
+    -- 视频播放进度(秒, REAL)。用于"继续观看": 灯箱看视频时按 timeupdate 节流上报,
+    -- 下次从这一秒续播。⚠️ NULL = 没看过 / 没记下进度; **0 也是有效值**(刚打开
+    -- 还没开始播), 所以判据用 "IS NOT NULL AND > 小阈值", 不能靠 =0 当未看。
+    -- 落库用 REAL 而不是整秒: 短视频几秒内看完, 秒级精度会把 1.4s 与 2.4s 记成一样。
+    watch_position REAL
 );
 
 -- 资源标签(多对多)。⚠️ 用**明细表**而不是 resources 里的一列:
@@ -395,6 +400,8 @@ _ADD_COLUMNS = [
     ("resources", "rating", "INTEGER NOT NULL DEFAULT 0"),
     # V46: OCR 文字(可选能力, 默认 NULL)。
     ("resources", "ocr_text", "TEXT"),
+    # 视频播放进度(秒, REAL)。见 SCHEMA 注释: NULL=没看过, 0 也是有效值。
+    ("resources", "watch_position", "REAL"),
     # V44: 主色所属的**色系代号**(见 core/colors.py)。存代号不存色值 —— 筛选要
     # 走 SQL 等值匹配(能命中索引), 色值则随时可重算。NULL = 还没提过色
     # ("没算出"), 与"提过但归为 gray"是两回事(第 26 条)。
@@ -2026,6 +2033,49 @@ def set_ocr_text(resource_id, text):
         "UPDATE resources SET ocr_text=? WHERE id=?",
         (text if text else None, int(resource_id)),
     ).rowcount
+
+
+def set_watch_position(resource_id, seconds):
+    """记录一条视频看到第几秒(续播用)。
+
+    ⚠️ `seconds` 来自灯箱的 timeupdate 节流上报, 可能是浮点; 入参非数直接忽略
+    (不抛), 因为上报失败只该"没记下进度", 不该把接口打成 500 —— 它是播放路径上的
+    附件能力, 与缩略图同一定位。
+    ⚠️ 负数/NaN 一律不写; 影片总时长拿不到时(duration 为 NULL, 本机缺 ffprobe)
+    也照常写, 续播判据里对 duration 为 NULL 单独放通。
+    """
+    try:
+        v = float(seconds)
+    except (TypeError, ValueError):
+        return 0
+    # NaN/Inf 都是"不是有限数", 一律不写(避免污染续播判据)。
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        return 0
+    return execute(
+        "UPDATE resources SET watch_position=? WHERE id=?",
+        (v, int(resource_id)),
+    ).rowcount
+
+
+def list_continue_watching(limit=50):
+    """「继续观看」集合: 视频且**看过但没看完**。
+
+    判据: type='video' AND status='done' AND watch_position IS NOT NULL
+          AND watch_position > 1(看了一秒以上才算"看过")
+          AND (duration IS NULL OR watch_position < duration - 2)(差 2 秒算看完)
+    ⚠️ 不带任何分页/筛选参数 —— 它被当成"一个固定视角的集合"(与 V42 的 facets 同款),
+    不是 `/library` 的另一个排序, 所以返回的就是这个筛选下的全部(限量)。
+    """
+    rows = query(
+        """SELECT r.*, t.name AS task_name, t.collector AS collector
+           FROM resources r JOIN tasks t ON t.id = r.task_id
+           WHERE r.type='video' AND r.status='done'
+             AND r.watch_position IS NOT NULL AND r.watch_position > 1
+             AND (r.duration IS NULL OR r.watch_position < r.duration - 2)
+           ORDER BY r.watch_position DESC, r.id DESC LIMIT ?""",
+        (int(limit),),
+    )
+    return rows
 
 
 def set_rating(resource_ids, rating=0):

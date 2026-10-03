@@ -27,8 +27,10 @@ import {
   getLocalRandom,
   listLocalAlbums,
   listLocalFavorites,
+  listLocalMedia,
   listLocalPhotos,
   listLocalRoots,
+  localVideoUrl,
   pruneLocalThumbs,
   removeLocalRoot,
   scanLocalRoot,
@@ -285,6 +287,7 @@ function refreshAll() {
   if (tab.value === "albums") jobs.push(loadAlbums());
   if (tab.value === "memories") jobs.push(loadMemories());
   if (tab.value === "favorites") jobs.push(loadFavorites());
+  if (tab.value === "videos") jobs.push(loadVideos());
   return Promise.all(jobs);
 }
 
@@ -294,6 +297,48 @@ function switchTab(next) {
   dupes.value = null;
   errorMsg.value = "";
   refreshAll();
+}
+
+// ---- 本地视频(独立标签页) ----
+// ⚠️ 为什么视频**不进**「相册/照片」网格: 那条路是"照片"语义 —— 缩略图、收藏、
+// 重复标记(dHash)全都建在 `index["order"]` 上, 而那是**纯图片**的快照。混进视频
+// 会让随机池抽出视频配一张坏缩略图。所以视频走这条平行出口(后端 list_media),
+// 两个池子的判据互不污染。
+const videos = ref([]);
+const videoCounts = ref({ images: 0, videos: 0, unplayable: 0 });
+const videoAlbum = ref(null); // { root_id, name, rel } —— null = 跨全部相册集
+const videoLoading = ref(false);
+const videoLb = ref({ show: false, index: 0 });
+
+async function loadVideos() {
+  videoLoading.value = true;
+  try {
+    // root_id=0 → 后端**跨全部已登记根**遍历(与"随机池"同一约定)。
+    // 不需要用户先挑一个相册集 —— "我登记了三个盘, 一共有哪些视频" 是个合理问题。
+    const data = await listLocalMedia({ root_id: 0, rel: "", include_images: false });
+    videos.value = data.items || [];
+    videoCounts.value = data.counts || { images: 0, videos: 0, unplayable: 0 };
+  } catch (e) {
+    toast("加载本地视频失败: " + (e.message || e), "warn");
+  } finally {
+    videoLoading.value = false;
+  }
+}
+// 灯箱条目: `hls` 标记由后端统一下发(见 core/localalbums.py::classify) —— 前端
+// 不自己 endsWith('.m3u8')。放不了的文件(rmvb 等)也列出来, 但标 playable=false,
+// 点开由灯箱明确提示"这个格式本机放不了", 而不是留一个点不动的黑框。
+const videoLbImages = computed(() =>
+  videos.value.map((p) => ({
+    url: localVideoUrl(p.root_id, p.rel),
+    name: p.name,
+    type: "video",
+    hls: !!p.hls,
+    playable: p.playable !== false,
+    size: p.size,
+  }))
+);
+function openVideoLb(i) {
+  videoLb.value = { show: true, index: i };
 }
 
 // ---- 目录管理 ----
@@ -478,6 +523,13 @@ function fullPath(p) {
   if (!rel) return root;
   return root ? `${root}/${rel}` : rel;
 }
+// 视频条目来自"跨全部根"的聚合接口, 条目上只有 root_id —— 要显示"它在哪个盘里"
+// 就得回查。查不到就退化成 `#id`: 宁可显示一个明显是占位的值, 也不要空白 ——
+// 空白会让人以为"这个视频不属于任何目录"(第 26 条: 没有结果 ≠ 没算出来)。
+function rootName(rootId) {
+  const r = roots.value.find((x) => x.id === rootId);
+  return r ? (r.name || r.path || "") : `#${rootId}`;
+}
 
 </script>
 
@@ -523,6 +575,7 @@ function fullPath(p) {
         往年今日
       </button>
       <button class="vtab" :class="{ on: tab === 'favorites' }" @click="switchTab('favorites')">收藏</button>
+      <button class="vtab" :class="{ on: tab === 'videos' }" @click="switchTab('videos')">视频</button>
     </div>
 
     <div class="error-box" v-if="errorMsg">{{ errorMsg }}</div>
@@ -773,6 +826,45 @@ function fullPath(p) {
       </div>
     </div>
 
+    <!-- ============ 本地视频 ============ -->
+    <!-- 视频**不进**上面的照片网格: 那条路是"照片"语义(缩略图/收藏/重复标记
+         都建在纯图片的索引快照上), 混进视频会让随机池抽出视频配一张坏缩略图。 -->
+    <div v-if="roots.length && tab === 'videos'">
+      <div class="frow">
+        <span class="lbl">本地视频</span>
+        <span class="muted mini">
+          共 {{ videoCounts.videos }} 个
+          <template v-if="videoCounts.unplayable">
+            · 其中 {{ videoCounts.unplayable }} 个是本机放不了的格式(仍会列出, 但点开会说明原因)
+          </template>
+        </span>
+        <span class="grow"></span>
+        <button class="ghost" :disabled="videoLoading" @click="loadVideos">刷新</button>
+      </div>
+      <p class="muted mini">
+        扫描已登记的所有目录(含「此电脑」里选过的盘)。m3u8 这类 HLS 清单会走 hls.js 播放。
+      </p>
+      <div class="resource-grid" v-if="videos.length">
+        <div v-for="(p, i) in videos" :key="`${p.root_id}|${p.rel}`" class="resource-item">
+          <div class="vid-cell" @click="openVideoLb(i)">
+            <span class="vid-ico">▶</span>
+            <span v-if="p.hls" class="vid-tag">HLS</span>
+            <span v-if="!p.playable" class="vid-tag warn">放不了</span>
+          </div>
+          <div class="meta">
+            <div class="name" :title="`${p.name} (${p.rel})`">{{ p.name }}</div>
+            <div>
+              {{ fmtBytes(p.size) }}
+              <span class="mini muted">{{ rootName(p.root_id) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">
+        没有找到视频文件。(本机装了 Tesseract 之类不影响这里; 只认扩展名)
+      </div>
+    </div>
+
     <!-- 取消登记的二次确认 -->
     <div v-if="forgetting" class="modal-mask" @click.self="forgetting = null">
       <div class="modal">
@@ -841,6 +933,17 @@ function fullPath(p) {
       :index="lb.index"
       @close="closeLb"
       @update:index="lb.index = $event"
+    />
+
+    <!-- 本地视频灯箱: 独立的 state, 不与照片灯箱混用 ——
+         视频有播放/续播/倍速, 照片没有; 混在一个数组里会让"上一张/下一张"
+         在两种条目间跳转, 而视频跳转必须先 stop 再 load(见 Lightbox 内部)。 -->
+    <Lightbox
+      v-if="videoLb.show && videoLbImages.length"
+      :images="videoLbImages"
+      :index="videoLb.index"
+      @close="videoLb.show = false"
+      @update:index="videoLb.index = $event"
     />
   </div>
 </template>
@@ -926,4 +1029,22 @@ input.num { flex: 0 0 72px; min-width: 0; }
   background: var(--bg, #0d1117); color: var(--text, #e6edf3);
   border: 1px solid var(--border, #2b3440); border-radius: 6px; padding: 8px;
 }
+
+/* ---- 本地视频格子 ----
+   ⚠️ 刻意**不**给视频出缩略图: 缩略图管线(thumbs.ensure_thumb)是按图片调的,
+   视频走它要么回退原文件(网格里一个 <video src=整段视频>, 40 项就是几百 MB)
+   要么生成一张黑图。所以这里用"播放图标 + 类型标签"的占位, 点开才真加载。
+   —— 与其给一个坏缩略图, 不如明确告诉用户"这是个视频, 点开来播"。 */
+.vid-cell {
+  position: relative; aspect-ratio: 16 / 9; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: #11161d; border: 1px solid var(--border, #2b3440); border-radius: 6px;
+}
+.vid-cell:hover { border-color: #3d7dd8; }
+.vid-ico { font-size: 26px; color: #cfd8e3; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+.vid-tag {
+  position: absolute; top: 5px; left: 5px; font-size: 10px; line-height: 1;
+  padding: 3px 5px; border-radius: 4px; background: rgba(13,17,23,.82); color: #9fb4cc;
+}
+.vid-tag.warn { top: auto; bottom: 5px; left: 5px; color: #ffd9a0; }
 </style>

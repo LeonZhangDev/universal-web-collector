@@ -1,11 +1,11 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { setWatchPosition } from "../api";
 
 // 灯箱: 点击缩略图放大查看, 支持左右切换、缩放、旋转、原图下载、幻灯片播放与 Esc 关闭。
 // 既收图片也收视频: 每个条目可带 `type` 字段, `type==="video"` 时渲染 <video> 直读本地文件。
 const props = defineProps({
-  images: { type: Array, default: () => [] }, // [{ url, name, type?, id?, duration?, size?, watch_position? }]
+  images: { type: Array, default: () => [] }, // [{ url, name, type?, id?, duration?, size?, watch_position?, hls? }]
   index: { type: Number, default: 0 },
 });
 const emit = defineEmits(["close", "update:index"]);
@@ -13,9 +13,65 @@ const emit = defineEmits(["close", "update:index"]);
 const current = computed(() => props.images[props.index] || null);
 // 视频条目用 <video> 而不是 <img>。type 缺省按图片处理(老调用方不传也没关系)。
 const isVideo = computed(() => current.value && current.value.type === "video");
+// HLS 清单(.m3u8)浏览器**原生播不了**(只有 Safari 行), 要 hls.js 在运行时解片段。
+// 条目带 `hls` 标记(后端 core.localalbums.classify 统一下发) —— 前端不自己
+// `endsWith('.m3u8')`: 那是"清单与后端可能不一致"的入口, 而那种不一致的表征是
+// "视频点了没反应", 连报错都没有(本项目第 11 条坑)。
+const isHls = computed(() => !!(isVideo.value && current.value.hls));
+const hlsError = ref("");
+let hls = null;
 const zoom = ref(1);
 const rotate = ref(0);
 const videoEl = ref(null);
+
+// ---- HLS(m3u8) ----
+// ⚠️ 三条纪律, 每条都对应一个"不报错但播不出来"的坑:
+//  1. **必须 destroy**: 每次换条目都要 `hls.destroy()`, 否则上一个实例还在
+//     拉片段, 表现为"翻到第 3 个视频开始卡"(第 12 条同族: 资源不释放)。
+//  2. **原生能播就别用 hls.js**: Safari 原生支持 HLS, 让 hls.js 接管反而多一层
+//     转换、偶发不播。所以 `Hls.isSupported()` 为假(且浏览器原生能播)时直接给 src。
+//  3. **失败必须留痕**: 加载失败要在界面上说出来, 不能只 console.error ——
+//     否则表现就是"这个视频是空的"(第 G 条: 静默降级必须有痕)。
+function destroyHls() {
+  if (hls) {
+    try { hls.destroy(); } catch (e) { /* 已经死了就算了 */ }
+    hls = null;
+  }
+}
+// ⚠️ **动态 import**, 不在模块顶层静态引 hls.js:
+// 静态引入会让它进主 chunk —— 实测主包 286KB → 890KB(gzip 106→292KB),
+// 而 HLS 只在"真的要播一个 m3u8"时才用得上。为了少数场景让**所有人**首屏
+// 多下一整个播放器, 是白付的代价(第 27 条反面: 代价要花在真正受益的人身上)。
+let hlsMod = null; // 懒加载一次后缓存, 换条目时复用同一个类
+async function attachHls(el, url) {
+  destroyHls();
+  hlsError.value = "";
+  if (!el) return;
+  hlsError.value = "正在加载 HLS 播放器…";
+  try {
+    if (!hlsMod) hlsMod = (await import("hls.js")).default;
+  } catch (e) {
+    hlsError.value = "HLS 播放器加载失败(离线? CDN 不可达?)";
+    return;
+  }
+  const Hls = hlsMod;
+  if (!el.isConnected) return; // 加载期间用户已经翻走了
+  if (Hls.isSupported()) {
+    hls = new Hls({ enableWorker: true });
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data || !data.fatal) return; // 非致命(分片 404 之类)不值得打断用户
+      hlsError.value = "HLS 播放失败: " + (data.details || data.type || "未知错误");
+    });
+    hlsError.value = "";
+    hls.loadSource(url);
+    hls.attachMedia(el);
+  } else if (el.canPlayType("application/vnd.apple.mpegurl")) {
+    el.src = url; // Safari 原生路径
+    hlsError.value = "";
+  } else {
+    hlsError.value = "这个浏览器不支持 HLS 播放(m3u8)";
+  }
+}
 
 // ---- 视频控制(只在 isVideo 时启用) ----
 // ⚠️ 浏览器的自动播放策略: 带声音的 autoplay 一律被拦。所以默认**静音自动播放**,
@@ -96,10 +152,46 @@ function fmtSize(n) {
 // ---- 幻灯片自动播放 ----
 // ⚠️ 默认**不播**: 自动翻页是"程序在替你翻", 没点开就自己跑会让人以为界面坏了。
 // ⚠️ 到点调用的就是手动翻页那个 go(1) —— 不另写一套推进逻辑, 否则两条路的边界会分叉。
-const SLIDE_STEPS = [3, 5, 10, 20]; // 秒
+//
+// ⚠️ 间隔是**亚秒也要准**, 所以不能用固定 `setInterval`:
+//   - 浏览器会把 <4ms 的 interval 钳到 4ms, 而更大的间隔在标签页节流/主线程忙时
+//     会**漂移**(标称 5s, 实际可能 7s) ——  slideshow 越快越看得出身;
+//   - `setInterval(go, 300)` 语义还是"每 300ms 翻一页", 与"每 300ms 推进一格
+//     真实时间"的差别在图片加载慢时会累积成整体落后。
+// 所以: `setTimeout` 打**短**间隔做轮询, 用 `performance.now()` 的**真实时间差**
+// 判断是否到点。到点就直接翻页并按真实时间重置基准, 于是慢机器上"至少到点就翻",
+// 而不会因为定时器被拖而少翻/多翻。
+const SLIDE_STEPS = [0.1, 0.2, 0.3, 0.5, 1, 3, 5, 10, 20]; // 秒(含亚秒档)
 const playing = ref(false);
 const slideSeconds = ref(5);
 let slideTimer = null;
+let slideDeadline = 0;
+// 轮询间隔: 取"距到点剩余时间"与一个上限的较小者。亚秒档用它保证到点准时,
+// 长间隔用它避免 20s 档挂着一个 20s 的定时器(改设置时不好中断)。
+const SLIDE_TICK_MAX = 250;
+// 下限: 0.05s。再小就没有意义了(浏览器钳到 4ms, 而且人眼分辨不出),
+// 而且 0 会让"到点就翻"变成"每帧翻" —— 那不是快放, 是把界面点着不放。
+const SLIDE_MIN = 0.05;
+function startSlide() {
+  stopSlide();
+  const stepMs = Math.max(SLIDE_MIN, Number(slideSeconds.value) || SLIDE_MIN) * 1000;
+  slideDeadline = performance.now() + stepMs;
+  const tick = () => {
+    if (!playing.value) return;
+    const remain = slideDeadline - performance.now();
+    if (remain > 0) {
+      // 还没到点: 睡到"差不多到点", 但不睡过 SLIDE_TICK_MAX(长间隔要能被打断)
+      slideTimer = setTimeout(tick, Math.min(remain, SLIDE_TICK_MAX));
+      return;
+    }
+    go(1);
+    // 重新计时。⚠️ 基准用**真实时间**而不是"从现在起再 stepMs" ——
+    // 翻页本身(渲染/解码)耗掉的时间不该累积成越来越落后。
+    slideDeadline = performance.now() + stepMs;
+    slideTimer = setTimeout(tick, Math.min(stepMs, SLIDE_TICK_MAX));
+  };
+  slideTimer = setTimeout(tick, Math.min(stepMs, SLIDE_TICK_MAX));
+}
 // 播放顺序: 默认按传入顺序; 打开"随机"后按打乱的排列走(只影响自动播放的走向,
 // 不影响左右方向键的"上一张/下一张"语义——方向键始终在当前序列里相邻移动)。
 const shuffle = ref(false);
@@ -125,14 +217,12 @@ const canSlide = computed(() => props.images.length > 1);
 
 function stopSlide() {
   if (slideTimer !== null) {
-    clearInterval(slideTimer);
+    // ⚠️ `clearTimeout` 而不是 `clearInterval`: 上面用的是 setTimeout。
+    // 这两者在浏览器里**恰好**都能清掉对方的 id(同一个池), 所以写错也"能跑" ——
+    // 但那是运气不是契约, 一旦换运行时就静默漏清(定时器继续 emit, 组件已销毁)。
+    clearTimeout(slideTimer);
     slideTimer = null;
   }
-}
-function startSlide() {
-  stopSlide();
-  // 间隔至少 1 秒: 0 或负数会让 setInterval 变成"每帧一次", 界面直接卡死。
-  slideTimer = setInterval(() => go(1), Math.max(1, slideSeconds.value) * 1000);
 }
 function togglePlay() {
   if (!canSlide.value) return;
@@ -145,6 +235,10 @@ function setSlideSeconds(v) {
   if (!Number.isFinite(n)) return;
   slideSeconds.value = n;
   if (playing.value) startSlide(); // 改间隔要立刻生效, 否则"选了 3s 还是 5s"
+}
+function slideLabel(s) {
+  // 亚秒档标成"快放": 光写"0.1 秒"用户不知道该选它, 而选它的动机通常就是"想快放"
+  return s < 1 ? `${s} 秒 · 快放` : `${s} 秒`;
 }
 function toggleShuffle() {
   shuffle.value = !shuffle.value;
@@ -207,11 +301,18 @@ function onKey(e) {
 onMounted(() => {
   window.addEventListener("keydown", onKey);
   buildOrder();
+  // ⚠️ 打开时**第一张就是 m3u8** 的情况: index 从 0 起步, 上面那个 watch(index)
+  // 不会触发, 所以必须在这里主动挂一次 —— 否则"打开就是 HLS"必然是黑屏。
+  nextTick(() => {
+    if (isHls.value) attachHls(videoEl.value, current.value.url);
+  });
 });
-// ⚠️ 定时器必须在这里清: 组件销毁后 setInterval 仍会 emit("update:index"),
+// ⚠️ 定时器必须在这里清: 组件销毁后 setTimeout 仍会 emit("update:index"),
 // 那是一个"看不见的东西在翻页" —— 关掉灯箱后列表自己在动。
+// HLS 实例同理: 不 destroy 的话它继续在后台拉片段(灯箱关了还在耗网)。
 onUnmounted(() => {
   stopSlide();
+  destroyHls();
   window.removeEventListener("keydown", onKey);
 });
 
@@ -223,6 +324,13 @@ watch(
   () => {
     if (isVideo.value) stopSlide();
     else if (playing.value) startSlide();
+    // 换条目: 先把上一个 HLS 实例拆掉(否则它还在拉上一集的片段, 见 attachHls 纪律 1)
+    destroyHls();
+    // 下一帧再挂: <video> 元素这时还没被 patch 上 ref(翻页是同一 tick 内改 index,
+    // 模板 ref 要等 patch 之后才赋值)。放 nextTick 里才拿得到元素。
+    nextTick(() => {
+      if (isHls.value) attachHls(videoEl.value, current.value.url);
+    });
     // 同步序列位置 + 复位缩放/旋转
     const at = order.value.indexOf(props.index);
     if (at >= 0) orderPos.value = at;
@@ -284,7 +392,7 @@ watch(canSlide, (ok) => {
         title="每张停留时长"
         @change="setSlideSeconds($event.target.value)"
       >
-        <option v-for="s in SLIDE_STEPS" :key="s" :value="s">{{ s }} 秒</option>
+        <option v-for="s in SLIDE_STEPS" :key="s" :value="s">{{ slideLabel(s) }}</option>
       </select>
       <span class="lb-sep"></span>
       <!-- 视频专属: 开声 / 画中画 / 倍速 -->
@@ -318,7 +426,7 @@ watch(canSlide, (ok) => {
     <video
       v-else-if="current && isVideo"
       ref="videoEl"
-      :src="current.url"
+      :src="isHls ? undefined : current.url"
       :style="imgStyle"
       :muted="muted"
       controls
@@ -327,6 +435,8 @@ watch(canSlide, (ok) => {
       @loadedmetadata="onVideoMeta"
       @timeupdate="onTimeUpdate"
     ></video>
+    <!-- HLS 失败必须**看得见**: 只 console 的话, 表现就是"这个视频是空的"(第 G 条) -->
+    <span v-if="hlsError" class="lb-verr">{{ hlsError }}</span>
     <span v-if="images.length > 1" class="nav next" @click="go(1)">›</span>
     <span v-if="images.length > 1" class="lb-count">
       {{ index + 1 }} / {{ images.length }}
@@ -391,6 +501,13 @@ watch(canSlide, (ok) => {
 .lb-vmeta {
   position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%);
   color: #ddd; font-size: 12px; background: rgba(0,0,0,.5); padding: 3px 10px; border-radius: 999px;
+}
+/* HLS/不可播放的显式提示。⚠️ 选择器前缀必须是**组件根类名** `.lightbox-mask` ——
+   写成 `.lightbox` 会让整段后代选择器静默失效, 控制台还不报错(第 30 条)。*/
+.lightbox-mask .lb-verr {
+  position: absolute; bottom: 84px; left: 50%; transform: translateX(-50%);
+  color: #ffd9d9; font-size: 13px; background: rgba(120,20,20,.72);
+  padding: 6px 14px; border-radius: 6px; max-width: 80vw; text-align: center;
 }
 .lightbox-mask img,
 .lightbox-mask video {

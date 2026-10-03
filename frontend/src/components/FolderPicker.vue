@@ -1,6 +1,6 @@
 <script setup>
 import { ref, watch } from "vue";
-import { browseFs, mkdirFs } from "../api";
+import { browseFs, mkdirFs, DRIVES_VIEW } from "../api";
 
 const props = defineProps({
   show: { type: Boolean, default: false },
@@ -14,6 +14,7 @@ const props = defineProps({
 const emit = defineEmits(["select", "close"]);
 
 const cwd = ref("");
+const manualPath = ref("");
 const parentPath = ref(null);
 const entries = ref([]);
 const selected = ref("");
@@ -28,6 +29,8 @@ async function open(path) {
   try {
     const data = await browseFs(path || "");
     cwd.value = data.cwd;
+    // 手输路径成功跳转后同步输入框; 失败时保留用户输入便于修改
+    manualPath.value = data.cwd;
     parentPath.value = data.parent;
     entries.value = data.entries;
   } catch (e) {
@@ -35,6 +38,13 @@ async function open(path) {
   } finally {
     loading.value = false;
   }
+}
+
+async function go() {
+  // 容错: 去掉从资源管理器"复制文件地址"带来的引号
+  const p = manualPath.value.trim().replace(/^["']+|["']+$/g, "");
+  if (!p) return;
+  if (p !== cwd.value) await open(p);
 }
 
 function up() {
@@ -83,7 +93,15 @@ watch(
 
       <div class="path-bar">
         <button class="ghost" :disabled="!parentPath" @click="up">↑ 上级</button>
-        <input type="text" :value="cwd" readonly />
+        <button class="ghost" @click="open(DRIVES_VIEW)">此电脑</button>
+        <input
+          v-model="manualPath"
+          type="text"
+          spellcheck="false"
+          placeholder="手动输入路径回车跳转, 如 D:\photos"
+          @keyup.enter="go"
+        />
+        <button class="ghost" @click="go">跳转</button>
       </div>
 
       <div class="error-box" v-if="errorMsg">{{ errorMsg }}</div>
@@ -99,13 +117,13 @@ watch(
           @click="toggle(d)"
           @dblclick="enter(d)"
         >
-          <span class="icon">📁</span>
+          <span class="icon">{{ cwd ? "📁" : "💽" }}</span>
           <span class="nm">{{ d.name }}</span>
           <button class="ghost mini" @click.stop="enter(d)">进入</button>
         </div>
       </div>
 
-      <div class="mkdir-row">
+      <div class="mkdir-row" v-if="cwd">
         <input
           v-model="newName"
           type="text"
@@ -124,7 +142,7 @@ watch(
         </div>
         <span style="flex: 1"></span>
         <button class="ghost" @click="emit('close')">取消</button>
-        <button :disabled="!cwd" @click="confirm">选择此文件夹</button>
+        <button :disabled="!cwd && !selected" @click="confirm">选择此文件夹</button>
       </div>
     </div>
   </div>

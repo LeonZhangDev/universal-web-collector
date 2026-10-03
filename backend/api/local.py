@@ -244,6 +244,53 @@ def serve_thumb(
     return resp
 
 
+@router.get("/local/media")
+def list_media(
+    root_id: int = Query(...),
+    rel: str = Query("", description="相册内相对路径; 空 = 根目录"),
+    q: str = Query(None),
+    sort: str = Query("name"),
+    order: str = Query("asc"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=200),
+    include_images: bool = Query(True, description="False = 只列视频"),
+):
+    """一个目录里的**图片 + 视频**混排。
+
+    与 `/local/photos` 的分工: 那个是"照片"语义(缩略图/收藏/重复标记都建在它
+    上面), 所以它**故意**不含视频; 这个是"这个文件夹里有什么都能看见"。
+    """
+    try:
+        return la.list_media(
+            root_id, rel, q=q, sort=sort, order=order,
+            offset=offset, limit=limit, include_images=include_images,
+        )
+    except la.RootError as exc:
+        raise _fail(exc)
+
+
+@router.get("/local/video")
+def serve_video(root_id: int = Query(...), rel: str = Query(...)):
+    """出一个**视频**(或 HLS 清单)文件。
+
+    为什么不用 `/files/raw`: 它要求路径在资源库里有记录且在该任务的下载根内
+    (见 `api/tasks.py::_verify_local_file`)。用户用「此电脑」选中的视频两条都不满足,
+    于是必然 404 —— 界面上表现成"这个视频点不开", 而真正原因是"它不是我们下的"。
+
+    `FileResponse` 自带 Range 支持(Starlette ≥0.37), 所以拖动进度条与断点续看
+    都成立; **别**自己手写 206, 那正是第 A 条坑(条件请求与续传互相打架)。
+    """
+    try:
+        path = la.safe_media(root_id, rel)
+    except la.RootError as exc:
+        raise _fail(exc)
+    resp = FileResponse(path)
+    # m3u8 是"播放列表", 前端 hls.js 靠这个类型决定要不要起解析器。
+    if la.classify(path.name)["hls"]:
+        resp.headers["Content-Type"] = "application/vnd.apple.mpegurl"
+    return resp
+
+
 # ---- 收藏 / 统计 -----------------------------------------------------------
 @router.get("/local/on-this-day")
 def on_this_day(

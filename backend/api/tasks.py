@@ -1,7 +1,9 @@
 import inspect
 import io
 import json
+import os
 import queue
+import string
 import zipfile
 from pathlib import Path
 from typing import List, Optional
@@ -1986,12 +1988,34 @@ def task_proxy(task_id: int):
 
 # ---- 目录选择 ----
 
+# 虚拟层级"此电脑": 列出所有盘符。用 "::" 前缀保证不与真实路径冲突。
+DRIVES_VIEW = "::drives::"
+
+
+def _list_drives():
+    if os.name == "nt":
+        return [
+            {"name": f"{letter}:", "path": f"{letter}:\\"}
+            for letter in string.ascii_uppercase
+            if Path(f"{letter}:\\").exists()
+        ]
+    return [{"name": "/", "path": "/"}]
+
+
 @router.get("/fs/browse")
 def browse_fs(path: str = None):
     """列出本机目录(仅子目录), 供前端目录选择器使用。
 
-    默认从用户主目录开始。无权限或已断链的条目直接跳过, 不让整个列表失败。
+    默认从用户主目录开始; path=DRIVES_VIEW 列出盘符(此电脑)。
+    无权限或已断链的条目直接跳过, 不让整个列表失败。
     """
+    if path == DRIVES_VIEW:
+        return {"cwd": "", "parent": None, "entries": _list_drives()}
+
+    if path:
+        # "D:" 是盘符相对路径, Windows 会解析到该盘的当前目录, 直观上用户想去的其实是盘根
+        if len(path.strip()) == 2 and path.strip()[1] == ":":
+            path = path.strip() + "\\"
     target = Path(path) if path else Path.home()
     try:
         target = target.resolve()
@@ -2018,10 +2042,15 @@ def browse_fs(path: str = None):
             continue
         entries.append({"name": child.name, "path": str(child)})
 
-    parent = target.parent
+    # 盘符根(如 C:\)的上一级是虚拟"此电脑", 否则从 C:\ 就再也到不了 D 盘
+    if os.name == "nt" and target.drive and len(target.parts) == 1:
+        parent_path = DRIVES_VIEW
+    else:
+        p = target.parent
+        parent_path = str(p) if p != target else None
     return {
         "cwd": str(target),
-        "parent": str(parent) if parent != target else None,
+        "parent": parent_path,
         "entries": entries,
     }
 

@@ -393,6 +393,8 @@ export function getCollectors() {
 export function getConfig() {
   return api.get("/config").then((r) => r.data);
 }
+// 虚拟层级"此电脑"(盘符列表), 与后端 tasks.py 的 DRIVES_VIEW 保持一致
+export const DRIVES_VIEW = "::drives::";
 export function browseFs(path) {
   return api.get("/fs/browse", { params: path ? { path } : {} }).then((r) => r.data);
 }
@@ -492,6 +494,23 @@ export function listLocalPhotos(opts = {}) {
   if (opts.offset) params.offset = opts.offset;
   if (opts.limit) params.limit = opts.limit;
   return api.get("/local/photos", { params }).then((r) => r.data);
+}
+// 图片 + 视频混排(本地相册)。`include_images:false` = 只列视频。
+// ⚠️ 与 `listLocalPhotos` **不是**同一个东西: 那个是"照片"语义(缩略图/收藏/重复
+// 都建在它上面), 所以它故意不含视频; 这个只用于"这个文件夹里有什么都能看见"。
+export function listLocalMedia(opts = {}) {
+  const params = { root_id: opts.root_id, rel: opts.rel || "" };
+  if (opts.q) params.q = opts.q;
+  if (opts.offset) params.offset = opts.offset;
+  if (opts.limit) params.limit = opts.limit;
+  if (opts.include_images === false) params.include_images = false;
+  return api.get("/local/media", { params }).then((r) => r.data);
+}
+// 本地视频/图片的直链。**不能**用 rawFileUrl: 那条要求路径在资源库有记录
+// 且在该任务下载根内(见 api/tasks.py::_verify_local_file), 而"此电脑"选的文件
+// 两条都不满足 → 必然 404, 界面上就变成"这个视频点不开"。
+export function localVideoUrl(rootId, rel) {
+  return `/local/video?root_id=${encodeURIComponent(rootId)}&rel=${encodeURIComponent(rel || "")}`;
 }
 // 随机池。⚠️ `seed` + 递增的 `page` 是一副**可以一直往下翻的牌**: 同一个 seed 的各页
 // 不重叠。所以"换一批"换的是 seed, "更多"加的是 page —— 两者语义不同, 不要合并。

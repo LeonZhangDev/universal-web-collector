@@ -101,6 +101,54 @@ IMAGE_SUFFIXES = frozenset({
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".gif", ".webp", ".avif", ".bmp",
 })
 
+#: 能被当成**视频**的扩展名。
+#:
+#: ⚠️ 这份清单**不进 `_stack_scan` 的 order** —— 随机池/往年今日/重复分组都读
+#: 同一个 `order`, 而它们下游是"按图片做缩略图与 dHash"的。把视频混进去,
+#: 随机池就会抽出视频然后给一张坏缩略图。所以视频只从 `list_media()` 这条
+#: **独立**出口走(见该函数)。
+#:
+#: `.m3u8` 在这里但**不是**"能直接播"的意思: 浏览器原生只认 HLS 的 Safari,
+#: Chrome/Firefox 要靠 hls.js(前端已接)。列出来是为了"能看见、能识别",
+#: 播放路径由前端分流 —— 不在清单里的话它就变成了"这个目录里有个视频,
+#: 但界面装看不见"。
+VIDEO_SUFFIXES = frozenset({
+    ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv", ".wmv", ".ts",
+    ".m3u8",
+})
+
+#: 容器是视频、但**能不能在浏览器里播**要再判一次的(HLS 清单不是媒体文件,
+#: 它是一份"去哪儿取分片"的说明书)。前端按这个分流: 走 hls.js 还是走原生 video。
+HLS_SUFFIX = ".m3u8"
+
+#: 容器能装、但**本机放不了**(只能靠转码才看得见)的格式。仍然列出来 ——
+#: "看得见但放不了, 而且界面上明说为什么" 比 "这个目录里没有视频" 可用得多。
+#: 判据是"宁可显式不支持, 也不要假装能播"。
+UNPLAYABLE_SUFFIXES = frozenset({".rm", ".rmvb", ".vob", ".3gp", ".mxf"})
+
+
+def _suffix(name):
+    return Path(str(name)).suffix.lower()
+
+
+def _is_video(name):
+    """是不是**我们认得**的视频容器(含 HLS 清单)。"""
+    suf = _suffix(name)
+    return suf in VIDEO_SUFFIXES or suf in UNPLAYABLE_SUFFIXES
+
+
+def _is_hls(name):
+    return _suffix(name) == HLS_SUFFIX
+
+
+def _is_playable_video(name):
+    """认得、且**能直接交给浏览器**的视频。
+
+    `.m3u8` 算"能播"但要 hls.js 兜底(Safari 原生、其他要 JS), 所以单独
+    标出来而不是混在普通视频里 —— 决定"要不要起 hls.js"的正是这一条。
+    """
+    return _suffix(name) in VIDEO_SUFFIXES
+
 #: 目录名黑名单(小写比较)。这些目录里的图片**不是用户的照片** ——
 #: 缩略图缓存、版本库内部、系统回收站。扫进来会让"这个相册有多少张"变成假数字,
 #: 而且这些目录动辄几千个文件, 扫描成本全花在它们身上。
@@ -795,6 +843,131 @@ def photos(root_id, rel="", q=None, sort="name", order="asc", offset=0, limit=20
     }
 
 
+def list_media(root_id, rel="", q=None, sort="name", order="asc",
+               offset=0, limit=200, include_images=True):
+    """一个目录里的**图片 + 视频**混排(分页), 供「本地相册」界面用。
+
+    ⚠️ **它刻意不去碰 `index["order"]`**, 也不复用 `photos()`:
+
+      - `order` 是随机池 / 往年今日 / 重复分组的**共同**数据源, 下游按图片做
+        缩略图与 dHash。视频混进去 = 随机池抽出视频然后配一张坏缩略图。
+      - `photos()` 是"照片"语义(缩略图、收藏、重复标记都建在它上面), 加视频
+        会让"这个相册有几张照片"变成假数字。
+
+    所以这是一条**平行**出口: 同样的信任锚(`get_root` + `_within`), 同样的
+    排除模式, 但**每次实时 scandir** —— 视频不进索引, 就没有"索引过期"这回事。
+    `include_images=False` 时只回视频(给"我只想看这个文件夹里的视频")。
+
+    `root_id` 传 0/None 时**跨全部已登记根**遍历(与 `random_photos` 同一约定):
+    "我登记了三个盘, 让我看看里面一共有哪些视频" 不该要求先挑一个根。
+    """
+    multi = not root_id
+    root_rows = roots() if multi else [get_root(root_id)]
+    if not root_rows:
+        return {"items": [], "total": 0, "offset": max(0, int(offset or 0)),
+                "limit": limit, "unreadable": 0,
+                "counts": {"images": 0, "videos": 0, "unplayable": 0},
+                "album": None}
+    patterns = []
+    for _row in root_rows:
+        patterns.extend(parse_exclude(_row.get("exclude")))
+    patterns = tuple(patterns[:MAX_EXCLUDE_PATTERNS])
+    items = []
+    unreadable = 0
+    for row in root_rows:
+        root = Path(row["path"]).resolve()
+        rel_n = str(rel or "").replace("\\", "/").strip("/")
+        here = root if not rel_n else root / rel_n
+        try:
+            here = here.resolve()
+        except (OSError, ValueError):
+            unreadable += 1
+            continue
+        if not _within(here, root):
+            # ⚠️ **单根时必须抛, 跨根时才跳过** —— 这两件事外表像, 后果完全不同:
+            #   - 跨根: 登记了 A 盘和 B 盘, 在 A 盘下问 "B 盘/某目录" 不是越界攻击,
+            #     只是那个目录在这根下不存在。跳过, 否则整个列表 403, 而用户
+            #     真正想看的是 A 盘里的东西。
+            #   - 单根: `rel="../../.."` 就是**真的越界**, 必须 403。写成"跳过"
+            #     会让 `list_media` 变成一个"传什么都返回空列表"的函数 ——
+            #     越界探测与"这里没有视频"在界面上完全一样(第 26 条)。
+            if not multi:
+                raise RootError(KIND_ESCAPES_ROOT, "这个相册不在已登记的相册集里")
+            continue
+        if not here.is_dir():
+            if not multi:
+                raise RootError(KIND_NOT_FOUND, "相册目录不存在")
+            continue
+        try:
+            entries = list(os.scandir(here))
+        except OSError:
+            unreadable += 1
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if name.startswith(".") or name.lower() in JUNK_FILE_NAMES:
+                    continue
+                is_img = _is_image(name)
+                is_vid = _is_video(name)
+                if not (is_img or is_vid):
+                    continue
+                if is_img and not include_images:
+                    continue
+                child_rel = "%s/%s" % (rel_n, name) if rel_n else name
+                if _excluded(child_rel, patterns):
+                    continue
+                st = entry.stat()
+                items.append({
+                    "root_id": row["id"],
+                    "name": name,
+                    "rel": child_rel,
+                    "album": rel_n,
+                    "size": int(st.st_size),
+                    "mtime": float(st.st_mtime),
+                    **classify(name),
+                })
+            except OSError:
+                unreadable += 1
+                continue
+
+    if q:
+        needle = str(q).casefold()
+        items = [p for p in items if needle in p["name"].casefold()]
+    items = _sorted(items, sort if sort in _SORT_KEYS else "name", order)
+    total = len(items)
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or 200), MAX_PAGE_SIZE))
+    page = items[offset: offset + limit]
+    counts = {
+        "images": sum(1 for p in items if p["kind"] == "image"),
+        "videos": sum(1 for p in items if p["kind"] == "video"),
+        # 分母给出来是为了让界面能写"共 N 个(其中 V 个放不了)" —— 只报一个
+        # 总数的话, 用户看到的和点进去的对不上, 却没有任何地方说明为什么。
+        "unplayable": sum(1 for p in items if not p["playable"]),
+    }
+    return {
+        "items": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "counts": counts,
+        "unreadable": unreadable,
+        "album": {
+            "root_id": root_id or 0,
+            "rel": str(rel or "").replace("\\", "/").strip("/"),
+            "multi": multi,
+            # 跨根时把参与的根列出来: 用户看到"共 N 个视频"时要知道是从哪几个
+            # 目录来的, 否则同一个名字出现在两个盘里, 他分不清点开的是哪个。
+            "roots": [{"id": r["id"],
+                       "name": r.get("name") or Path(r["path"]).name or r["path"]}
+                      for r in root_rows],
+        },
+    }
+
+
 def safe_photo(root_id, rel):
     """把 `(root_id, rel)` 还原成一个**可信**的本地图片路径。
 
@@ -825,6 +998,56 @@ def safe_photo(root_id, rel):
     if not _is_image(path.name):
         raise RootError(KIND_NOT_IMAGE, "这个接口只提供图片")
     return path
+
+
+def safe_media(root_id, rel):
+    """把 `(root_id, rel)` 还原成一个**可信**的本地图片**或视频**路径。
+
+    与 `safe_photo` 的差别只有最后一条判据(图片 → 图片或视频), 前两条一模一样,
+    而且**必须是同一条**: 唯一信任锚是"用户显式登记过这个根", `resolve()` 之后再
+    判 `is_relative_to`。把这两条抄一遍而不是让 `safe_photo` 传个开关, 是因为
+    一旦变成开关, 迟早有人会用 `media=True` 去出 `.partsrc` 或 `manifest.json` ——
+    那就等于给了任意文件读取权。**能出什么格式, 由扩展名白名单决定, 不由参数决定。**
+
+    存在的理由: 用户用「此电脑」选中的视频**不在资源库里、也不在 `downloads/` 下**,
+    所以 `/files/raw` 的 `_verify_local_file`(要求库里有记录)对它一律 404 ——
+    界面上就变成"这个视频点不开", 而真正的原因是"它压根不是我们下的"。
+    """
+    row = get_root(root_id)
+    root = Path(row["path"]).resolve()
+    raw = str(rel or "").replace("\\", "/").strip()
+    if not raw:
+        raise RootError(KIND_NOT_FOUND, "缺少相对路径")
+    try:
+        path = (root / raw).resolve()
+    except (OSError, ValueError):
+        raise RootError(KIND_NOT_FOUND, "路径无法解析")
+    if not _within(path, root):
+        raise RootError(KIND_ESCAPES_ROOT, "这个路径不在已登记的相册集里")
+    if not path.is_file():
+        raise RootError(KIND_NOT_FOUND, "文件不存在")
+    if not (_is_image(path.name) or _is_video(path.name)):
+        # 415 而不是 404: "传错了格式"与"文件没了"在日志里必须长得不一样。
+        raise RootError(KIND_NOT_IMAGE, "这个接口只提供图片与视频")
+    return path
+
+
+def classify(name):
+    """一个文件名 → 前端要用的 `kind` 与播放能力。
+
+    **单一翻译点**: 界面判断"这条要不要起 hls.js / 能不能播"时只准调它。
+    把 `endswith('.m3u8')` 抄到 Vue 组件里就等于多了一个"清单与后端可能不一致"
+    的地方 —— 而那种不一致的表征是"视频点了没反应", 没有任何报错。
+    """
+    if _is_hls(name):
+        return {"kind": "video", "hls": True, "playable": True}
+    if _is_playable_video(name):
+        return {"kind": "video", "hls": False, "playable": True}
+    if _suffix(name) in UNPLAYABLE_SUFFIXES:
+        return {"kind": "video", "hls": False, "playable": False}
+    if _is_image(name):
+        return {"kind": "image", "hls": False, "playable": True}
+    return {"kind": "other", "hls": False, "playable": False}
 
 
 # ---- 随机池 ----------------------------------------------------------------

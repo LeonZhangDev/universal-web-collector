@@ -1392,6 +1392,7 @@ python scripts/gateguard.py       # 仓库门禁: 文档数字/CI 契约/结构�
 | `python scripts/preview_probe.py` | ❌ | 同上, 真实站点创建前预告 |
 | `python scripts/start.py` | ❌ | 启动器, 不是判据 |
 | `python scripts/gate.py` | ❌ | 共享模块(`Gate` / `Problem` 的唯一定义), 不是可执行脚本; 由上面两个门禁引用 |
+| `python scripts/add_tesseract_to_path.py` | ❌ | 一次性环境配置: 把 Tesseract 注册进用户 PATH(HKCU)以支持 V46 OCR; 写 Windows 注册表, 不能进 CI |
 
 **R-CI-2 数字必须可核对**: README 是**唯一**的"当前口径"落点(历史版本数字留在
 `docs/AGENT_DEVELOPMENT_GUIDE.md` 的版本史里, 那些**不参与核对** —— 它们本来就是"当时是多少",
